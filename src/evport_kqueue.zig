@@ -1,4 +1,4 @@
-// FreeBSD event port: kqueue backend.
+// BSD/macOS event port: kqueue backend.
 //
 // Global-rule discipline:
 //   - Staged changelist: monitor*/unmonitor* accumulate struct kevent into a
@@ -17,54 +17,39 @@
 
 const std = @import("std");
 
-// FreeBSD 12+ struct kevent (sys/event.h): the plain kevent() syscall uses
-// the EXTENDED 64-byte layout — omitting ext[4] corrupts multi-entry
-// changelists (kernel strides 64 bytes per entry).
-const Kevent = extern struct {
-    ident: usize = 0,
-    filter: i16 = 0,
-    flags: u16 = 0,
-    fflags: u32 = 0,
-    data: i64 = 0,
-    udata: ?*anyopaque = null,
-    ext: [4]u64 = .{ 0, 0, 0, 0 },
+// Use the target's struct kevent: FreeBSD 12+ needs its extended 64-byte
+// layout (ext[4]), while NetBSD has wider filter/flags fields. A wrong
+// stride corrupts multi-entry changelists and event buffers.
+const Kevent = std.posix.Kevent;
+const EVFILT_READ = std.posix.system.EVFILT.READ;
+const EVFILT_WRITE = std.posix.system.EVFILT.WRITE;
+
+const EV_ADD = std.posix.system.EV.ADD;
+const EV_DELETE = std.posix.system.EV.DELETE;
+const EV_ONESHOT = std.posix.system.EV.ONESHOT;
+const EV_CLEAR = std.posix.system.EV.CLEAR;
+// Zig 0.15 omits EOF on FreeBSD/NetBSD and ERROR on NetBSD (sys/event.h).
+const EV_EOF = if (@hasDecl(std.posix.system.EV, "EOF")) std.posix.system.EV.EOF else 0x8000;
+const EV_ERROR = if (@hasDecl(std.posix.system.EV, "ERROR")) std.posix.system.EV.ERROR else 0x4000;
+
+// NetBSD's 40-byte kevent ABI uses __kevent50 and size_t counts; Zig 0.15's
+// unversioned std.c.kevent declaration instead uses int counts.
+const netbsd = struct {
+    extern "c" fn __kevent50(
+        kq: c_int,
+        changelist: [*]const Kevent,
+        nchanges: usize,
+        eventlist: [*]Kevent,
+        nevents: usize,
+        timeout: ?*const std.c.timespec,
+    ) c_int;
 };
 
-extern "c" fn kqueue() c_int;
-extern "c" fn kevent(
-    kq: c_int,
-    changelist: ?[*]const Kevent,
-    nchanges: c_int,
-    eventlist: ?[*]Kevent,
-    nevents: c_int,
-    timeout: ?*const std.c.timespec,
-) c_int;
-extern "c" fn pipe2(fds: *[2]c_int, flags: c_int) c_int;
+// Target-native pipe flags; std.posix.pipe2 uses pipe + fcntl on macOS.
+const PIPE2_FLAGS: std.posix.O = .{ .NONBLOCK = true, .CLOEXEC = true };
 
-const EVFILT_READ: i16 = -1;
-const EVFILT_WRITE: i16 = -2;
-
-const EV_ADD: u16 = 0x0001;
-const EV_DELETE: u16 = 0x0002;
-const EV_ONESHOT: u16 = 0x0010;
-const EV_CLEAR: u16 = 0x0020;
-const EV_EOF: u16 = 0x8000;
-const EV_ERROR: u16 = 0x4000;
-
-// O_NONBLOCK | O_CLOEXEC for pipe2 (FreeBSD fcntl.h values, verified
-// against std.posix.O in the std-surface probe).
-const PIPE2_FLAGS: c_int = 0x0004 | 0x00100000;
-
-pub const Event = struct {
-    udata: ?*anyopaque = null,
-    readable: bool = false,
-    writable: bool = false,
-    eof: bool = false,
-    err: bool = false,
-    /// EV_ERROR payload (errno) when err is set.
-    err_no: i64 = 0,
-    wake: bool = false,
-};
+pub const Handle = @import("types.zig").Handle;
+pub const Event = @import("types.zig").Event;
 
 pub const Error = error{
     KqueueFailed,
@@ -90,12 +75,10 @@ pub const EvPort = struct {
     armed_write: std.AutoHashMapUnmanaged(c_int, void) = .empty,
 
     pub fn init(alloc: std.mem.Allocator) Error!EvPort {
-        const kq = kqueue();
-        if (kq < 0) return Error.KqueueFailed;
+        const kq = std.posix.kqueue() catch return Error.KqueueFailed;
         errdefer _ = std.c.close(kq);
 
-        var fds: [2]c_int = undefined;
-        if (pipe2(&fds, PIPE2_FLAGS) != 0) return Error.PipeFailed;
+        const fds = std.posix.pipe2(PIPE2_FLAGS) catch return Error.PipeFailed;
         errdefer {
             _ = std.c.close(fds[0]);
             _ = std.c.close(fds[1]);
@@ -118,34 +101,34 @@ pub const EvPort = struct {
     }
 
     /// Persistent edge-triggered read interest (EV_ADD | EV_CLEAR).
-    pub fn monitorRead(self: *EvPort, fd: c_int, udata: ?*anyopaque) void {
-        self.stage(.{ .ident = @intCast(fd), .filter = EVFILT_READ, .flags = EV_ADD | EV_CLEAR, .udata = udata });
+    pub fn monitorRead(self: *EvPort, fd: Handle, udata: ?*anyopaque) void {
+        self.stage(change(fd, EVFILT_READ, EV_ADD | EV_CLEAR, udata));
     }
 
     /// One-shot write interest (EV_ADD | EV_ONESHOT): connect completion or
     /// send-buffer space after a short write. No-op while already armed.
-    pub fn wantWrite(self: *EvPort, fd: c_int, udata: ?*anyopaque) void {
+    pub fn wantWrite(self: *EvPort, fd: Handle, udata: ?*anyopaque) void {
         if (self.armed_write.contains(fd)) return;
         self.armed_write.put(self.alloc, fd, {}) catch return;
-        self.stage(.{ .ident = @intCast(fd), .filter = EVFILT_WRITE, .flags = EV_ADD | EV_ONESHOT, .udata = udata });
+        self.stage(change(fd, EVFILT_WRITE, EV_ADD | EV_ONESHOT, udata));
     }
 
     /// Drop write interest on an fd that STAYS OPEN (flow control only).
-    pub fn cancelWrite(self: *EvPort, fd: c_int) void {
+    pub fn cancelWrite(self: *EvPort, fd: Handle) void {
         if (!self.armed_write.remove(fd)) return;
-        self.stage(.{ .ident = @intCast(fd), .filter = EVFILT_WRITE, .flags = EV_DELETE });
+        self.stage(change(fd, EVFILT_WRITE, EV_DELETE, null));
     }
 
     /// Drop read interest on an fd that STAYS OPEN (e.g. stdin after EOF).
-    pub fn unmonitorRead(self: *EvPort, fd: c_int) void {
-        self.stage(.{ .ident = @intCast(fd), .filter = EVFILT_READ, .flags = EV_DELETE });
+    pub fn unmonitorRead(self: *EvPort, fd: Handle) void {
+        self.stage(change(fd, EVFILT_READ, EV_DELETE, null));
     }
 
     /// Drop STAGED (unflushed) changelist entries for an fd about to be
     /// closed, plus its armed-write bit. close(2) itself removes the fd's
     /// live filters; this prevents staged entries from applying to a
     /// recycled fd number at the next wait() flush.
-    pub fn purgeFd(self: *EvPort, fd: c_int) void {
+    pub fn purgeFd(self: *EvPort, fd: Handle) void {
         _ = self.armed_write.remove(fd);
         const ident: usize = @intCast(fd);
         var i: usize = 0;
@@ -165,6 +148,15 @@ pub const EvPort = struct {
         _ = std.c.write(self.wake_w, &b, 1);
     }
 
+    fn change(fd: Handle, filter: @FieldType(Kevent, "filter"), flags: @FieldType(Kevent, "flags"), udata: ?*anyopaque) Kevent {
+        var kev = std.mem.zeroes(Kevent);
+        kev.ident = @intCast(fd);
+        kev.filter = filter;
+        kev.flags = flags;
+        kev.udata = @intFromPtr(udata);
+        return kev;
+    }
+
     fn stage(self: *EvPort, kev: Kevent) void {
         self.changes.append(self.alloc, kev) catch {};
     }
@@ -172,6 +164,7 @@ pub const EvPort = struct {
     /// Flush the staged changelist and harvest events in ONE kevent() call.
     /// timeout_ms: null = block until an event; 0 = harvest without blocking.
     pub fn wait(self: *EvPort, events: []Event, timeout_ms: ?i32) Error!usize {
+        if (events.len == 0) return 0;
         var kbuf: [64]Kevent = undefined;
         const cap = @min(events.len, kbuf.len);
 
@@ -182,8 +175,10 @@ pub const EvPort = struct {
             tsp = &ts;
         }
 
-        const changelist: ?[*]const Kevent = if (self.changes.items.len > 0) self.changes.items.ptr else null;
-        const n = kevent(self.kq, changelist, @intCast(self.changes.items.len), &kbuf, @intCast(cap), tsp);
+        const n = if (@import("builtin").os.tag == .netbsd)
+            netbsd.__kevent50(self.kq, self.changes.items.ptr, self.changes.items.len, &kbuf, cap, tsp)
+        else
+            std.c.kevent(self.kq, self.changes.items.ptr, @intCast(self.changes.items.len), &kbuf, @intCast(cap), tsp);
         self.changes.clearRetainingCapacity();
         if (n < 0) {
             const e = std.posix.errno(@as(isize, n));
@@ -194,7 +189,7 @@ pub const EvPort = struct {
         var out: usize = 0;
         var woke = false;
         for (kbuf[0..@intCast(n)]) |kev| {
-            if (kev.udata == @as(?*anyopaque, &wake_sentinel)) {
+            if (kev.udata == @intFromPtr(&wake_sentinel)) {
                 if (!woke) {
                     woke = true;
                     self.drainWake();
@@ -208,12 +203,12 @@ pub const EvPort = struct {
                 _ = self.armed_write.remove(@intCast(kev.ident));
             }
             events[out] = .{
-                .udata = kev.udata,
+                .udata = @ptrFromInt(kev.udata),
                 .readable = kev.filter == EVFILT_READ,
                 .writable = kev.filter == EVFILT_WRITE,
                 .eof = (kev.flags & EV_EOF) != 0,
                 .err = (kev.flags & EV_ERROR) != 0,
-                .err_no = kev.data,
+                .err_no = if ((kev.flags & EV_ERROR) != 0) @intCast(kev.data) else 0,
             };
             out += 1;
         }
@@ -230,15 +225,78 @@ pub const EvPort = struct {
 
 // --------------------------------------------------------------- tests ----
 
+test "kqueue: target-native layout and change encoding" {
+    const os = @import("builtin").os.tag;
+    try std.testing.expect(Kevent == std.posix.Kevent);
+    const expected_size: usize = switch (os) {
+        .freebsd => 64,
+        .netbsd => 40,
+        .macos, .openbsd => 32,
+        else => unreachable,
+    };
+    try std.testing.expectEqual(expected_size, @sizeOf(Kevent));
+    try std.testing.expectEqual(@as(usize, if (os == .netbsd) 4 else 2), @sizeOf(@FieldType(Kevent, "filter")));
+    try std.testing.expectEqual(@as(usize, if (os == .netbsd) 4 else 2), @sizeOf(@FieldType(Kevent, "flags")));
+    try std.testing.expect(@FieldType(Kevent, "udata") == usize);
+    try std.testing.expectEqual(@as(i32, if (os == .netbsd) 0 else -1), EVFILT_READ);
+    try std.testing.expectEqual(@as(i32, if (os == .netbsd) 1 else -2), EVFILT_WRITE);
+    var tag: u8 = 1;
+    const kev = EvPort.change(7, EVFILT_READ, EV_ADD | EV_CLEAR, &tag);
+    try std.testing.expectEqual(@as(usize, 7), kev.ident);
+    try std.testing.expectEqual(std.posix.system.EVFILT.READ, kev.filter);
+    try std.testing.expectEqual(std.posix.system.EV.ADD | std.posix.system.EV.CLEAR, kev.flags);
+    try std.testing.expectEqual(@as(u32, 0), kev.fflags);
+    try std.testing.expectEqual(@as(i64, 0), kev.data);
+    try std.testing.expectEqual(@intFromPtr(&tag), kev.udata);
+    const untagged = EvPort.change(7, EVFILT_WRITE, EV_DELETE, null);
+    try std.testing.expectEqual(@as(usize, 0), untagged.udata);
+    if (@hasField(Kevent, "_ext")) {
+        for (kev._ext) |value| try std.testing.expectEqual(@as(u64, 0), value);
+    }
+}
+
+test "kqueue: wake pipe is nonblocking and close-on-exec on both ends" {
+    var port = try EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    for ([_]Handle{ port.wake_r, port.wake_w }) |fd| {
+        const flags: std.posix.O = @bitCast(@as(u32, @truncate(try std.posix.fcntl(fd, std.posix.F.GETFL, 0))));
+        try std.testing.expect(flags.NONBLOCK);
+        const fd_flags = try std.posix.fcntl(fd, std.posix.F.GETFD, 0);
+        try std.testing.expect(fd_flags & std.posix.FD_CLOEXEC != 0);
+    }
+}
+
+test "kqueue: registration error survives empty wait with errno payload" {
+    var port = try EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const fd = try std.posix.dup(port.wake_r);
+    std.posix.close(fd);
+    var tag: u8 = 1;
+    port.monitorRead(fd, &tag);
+    var empty: [0]Event = .{};
+    const staged = port.changes.items.len;
+    try std.testing.expectEqual(@as(usize, 0), try port.wait(&empty, null));
+    try std.testing.expectEqual(staged, port.changes.items.len);
+    var events: [8]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try port.wait(&events, 0));
+    try std.testing.expect(events[0].err);
+    try std.testing.expectEqual(@as(usize, @intFromEnum(std.posix.E.BADF)), events[0].err_no);
+    try std.testing.expect(events[0].udata == @as(?*anyopaque, &tag));
+}
+
 test "kqueue: socket read readiness + EV_CLEAR edge semantics" {
     const alloc = std.testing.allocator;
     var evp = try EvPort.init(alloc);
     defer evp.deinit();
 
     var fds: [2]c_int = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC, 0, &fds));
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
     defer _ = std.c.close(fds[0]);
     defer _ = std.c.close(fds[1]);
+    for (fds) |fd| {
+        _ = try std.posix.fcntl(fd, std.posix.F.SETFL, @as(u32, @bitCast(@as(std.posix.O, .{ .NONBLOCK = true }))));
+        _ = try std.posix.fcntl(fd, std.posix.F.SETFD, std.posix.FD_CLOEXEC);
+    }
 
     var tag: u8 = 1;
     evp.monitorRead(fds[0], &tag);
@@ -274,8 +332,7 @@ test "kqueue: one-shot write interest re-arms on demand" {
     var evp = try EvPort.init(alloc);
     defer evp.deinit();
 
-    var fds: [2]c_int = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), pipe2(&fds, PIPE2_FLAGS));
+    const fds = try std.posix.pipe2(PIPE2_FLAGS);
     defer _ = std.c.close(fds[0]);
     defer _ = std.c.close(fds[1]);
 
@@ -299,8 +356,7 @@ test "kqueue: peer close delivers eof" {
     var evp = try EvPort.init(alloc);
     defer evp.deinit();
 
-    var fds: [2]c_int = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), pipe2(&fds, PIPE2_FLAGS));
+    const fds = try std.posix.pipe2(PIPE2_FLAGS);
     defer _ = std.c.close(fds[0]);
 
     var tag: u8 = 3;

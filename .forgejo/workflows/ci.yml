@@ -1,0 +1,31 @@
+name: CI
+on:
+  push:
+  pull_request:
+
+jobs:
+  build:
+    runs-on: FreeBSD
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify Zig 0.15.2
+        run: |
+          zig version
+          test "$(zig version)" = "0.15.2"
+
+      - name: Unit tests (native Debug)
+        run: zig build test -Doptimize=Debug --summary all
+
+      - name: Unit tests (native ReleaseSafe)
+        run: zig build test -Doptimize=ReleaseSafe --summary all
+
+      - name: Compile tests for all seven supported targets
+        run: zig build check-targets --summary all
+
+      - name: Build Linux runtime test executable
+        run: zig build test-bin -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe --prefix zig-out/linux --summary all
+
+      - name: Build Windows runtime test executable
+        run: zig build test-bin -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe --prefix zig-out/windows --summary all

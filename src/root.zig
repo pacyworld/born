@@ -8,19 +8,19 @@
 //!   Linux                   epoll + eventfd  (evport_epoll.zig)
 //!   Windows                 IOCP     (evport_iocp.zig)
 //!
-//! ## Contract, common to every backend
+//! ## Programming models (see README for the portable socket companion)
 //!
-//!   - ONE syscall per `wait()` carries staged registrations AND harvests
-//!     events. Registration is never a separate call.
-//!   - Sockets: read interest is persistent and edge-triggered, so handlers
-//!     MUST fully drain. Write interest is one-shot, re-armed on demand via
-//!     `wantWrite`.
-//!   - fds are never deleted while closed or recycled. The caller defers
-//!     `close()` to a reap point immediately after `wait()` has flushed the
-//!     staged changelist. `unmonitorRead`/`cancelWrite` are for fds that STAY
-//!     OPEN.
-//!   - `wake()` posts a loop wakeup from any thread (pipe / eventfd / IOCP
-//!     post) and is delivered as a single `Event{ .wake = true }`.
+//!   - kqueue batches registrations and events in one kevent call; epoll
+//!     applies registrations immediately with epoll_ctl. IOCP harvests completions.
+//!   - POSIX socket reads are persistent and edge-triggered: fully drain.
+//!     kqueue writes are one-shot; epoll writes remain armed until canceled.
+//!     IOCP users submit overlapped operations, not readiness registrations.
+//!   - POSIX: purge staged changes before closing at the end-of-batch reap
+//!     point. unmonitorRead/cancelWrite apply to handles that remain open.
+//!     Windows: cancel/close, then drain every pending completion before
+//!     moving or freeing the stream's OVERLAPPED storage.
+//!   - wake() signals the loop from another thread. POSIX wakeups coalesce;
+//!     IOCP posts a completion per wake. Event.wake identifies either form.
 //!
 //! ## Provenance
 //!
@@ -37,14 +37,14 @@
 //!   freebsd            production (mcp-bridge, since 2026-08)
 //!   linux              production (mcp-bridge, since 2026-08)
 //!   windows            production (mcp-bridge, since 2026-08)
-//!   macos / ios / ...  compiles clean, NOT yet run on hardware
-//!   netbsd / openbsd / dragonfly
-//!                      compiles clean, NOT yet run on hardware
+//!   aarch64/x86_64 macos: compile-only, NOT yet run on hardware
+//!   x86_64 netbsd / openbsd: compile-only, NOT yet run on hardware
+//!   Other selected OS tags are outside the checked target matrix.
 //!
-//! The kqueue backend uses only `std.c` and `std.posix` with no
-//! FreeBSD-specific syscalls or `builtin.os.tag` branching, which is why the
-//! other kqueue platforms come along for free. "Free" here means it builds,
-//! not that anyone has run it. Do not claim otherwise without a test run.
+//! The checked triples are listed in build.zig and README. CI compiles
+//! the actual test bodies rather than relying on lazy library analysis.
+//! Cross-compilation is not runtime verification. Do not claim a platform
+//! has been tested without executing its tests on that platform.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -61,8 +61,10 @@ const impl = switch (builtin.os.tag) {
 };
 
 pub const EvPort = impl.EvPort;
-pub const Event = impl.Event;
+pub const Handle = @import("types.zig").Handle;
+pub const Event = @import("types.zig").Event;
 pub const Error = impl.Error;
+pub const socket = @import("socket.zig");
 
 /// Which backend this build selected. Useful in diagnostics so a program can
 /// report what it is actually running on rather than what it assumes.
@@ -78,4 +80,6 @@ test {
     // Pull in the selected backend's own tests.
     std.testing.refAllDecls(impl);
     _ = impl;
+    _ = @import("api_test.zig");
+    _ = @import("socket_test.zig");
 }

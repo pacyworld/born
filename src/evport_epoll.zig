@@ -23,15 +23,8 @@
 const std = @import("std");
 const linux = std.os.linux;
 
-pub const Event = struct {
-    udata: ?*anyopaque = null,
-    readable: bool = false,
-    writable: bool = false,
-    eof: bool = false,
-    err: bool = false,
-    err_no: i64 = 0,
-    wake: bool = false,
-};
+pub const Handle = @import("types.zig").Handle;
+pub const Event = @import("types.zig").Event;
 
 pub const Error = error{
     InitFailed,
@@ -84,7 +77,7 @@ pub const EvPort = struct {
     // ------------------------------------------------------- interest ----
 
     /// Persistent edge-triggered read interest.
-    pub fn monitorRead(self: *EvPort, fd: i32, udata: ?*anyopaque) void {
+    pub fn monitorRead(self: *EvPort, fd: Handle, udata: ?*anyopaque) void {
         var st = self.fds.get(fd) orelse FdState{};
         st.read = true;
         st.udata = udata;
@@ -93,7 +86,7 @@ pub const EvPort = struct {
 
     /// Arm write interest (connect completion / send-buffer space).
     /// No-op while already armed.
-    pub fn wantWrite(self: *EvPort, fd: i32, udata: ?*anyopaque) void {
+    pub fn wantWrite(self: *EvPort, fd: Handle, udata: ?*anyopaque) void {
         var st = self.fds.get(fd) orelse FdState{};
         if (st.write) return;
         st.write = true;
@@ -102,7 +95,7 @@ pub const EvPort = struct {
     }
 
     /// Disarm write interest on an fd that STAYS OPEN.
-    pub fn cancelWrite(self: *EvPort, fd: i32) void {
+    pub fn cancelWrite(self: *EvPort, fd: Handle) void {
         var st = self.fds.get(fd) orelse return;
         if (!st.write) return;
         st.write = false;
@@ -110,7 +103,7 @@ pub const EvPort = struct {
     }
 
     /// Drop read interest on an fd that STAYS OPEN (e.g. stdin after EOF).
-    pub fn unmonitorRead(self: *EvPort, fd: i32) void {
+    pub fn unmonitorRead(self: *EvPort, fd: Handle) void {
         var st = self.fds.get(fd) orelse return;
         if (!st.read) return;
         st.read = false;
@@ -119,7 +112,7 @@ pub const EvPort = struct {
 
     /// The fd is being closed: drop the port's bookkeeping (the kernel
     /// removes the registration on close(2) itself).
-    pub fn purgeFd(self: *EvPort, fd: i32) void {
+    pub fn purgeFd(self: *EvPort, fd: Handle) void {
         _ = self.fds.remove(fd);
     }
 
@@ -130,7 +123,7 @@ pub const EvPort = struct {
     }
 
     /// Apply the fd's computed mask: ADD / MOD / DEL as needed.
-    fn apply(self: *EvPort, fd: i32, st: FdState) void {
+    fn apply(self: *EvPort, fd: Handle, st: FdState) void {
         const exists = self.fds.contains(fd);
         if (!st.read and !st.write) {
             if (exists) {
@@ -152,7 +145,7 @@ pub const EvPort = struct {
     }
 
     /// register is apply-with-put for init (fd not yet tracked).
-    fn register(self: *EvPort, fd: i32, read: bool, write: bool, udata: ?*anyopaque) void {
+    fn register(self: *EvPort, fd: Handle, read: bool, write: bool, udata: ?*anyopaque) void {
         self.apply(fd, .{ .udata = udata, .read = read, .write = write });
     }
 
@@ -161,6 +154,7 @@ pub const EvPort = struct {
     /// Harvest events in one epoll_wait. timeout_ms: null = block until an
     /// event; 0 = harvest without blocking.
     pub fn wait(self: *EvPort, events: []Event, timeout_ms: ?i32) Error!usize {
+        if (events.len == 0) return 0;
         var ebuf: [64]linux.epoll_event = undefined;
         const cap = @min(events.len, ebuf.len);
         const timeout: i32 = timeout_ms orelse -1;
