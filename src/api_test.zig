@@ -70,6 +70,36 @@ test "reactor interest methods execute with native handles" {
     }
 }
 
+test "registering a regular file is a loud failure, not a hang (issue #4)" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    var port = try backend.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const file = try tmp.dir.createFile("registration-target", .{});
+    defer file.close();
+    var tag: u8 = 1;
+    if (builtin.os.tag == .linux) {
+        // epoll refuses regular files with EPERM. The void registration API
+        // must report that as a hard error from the next non-empty wait —
+        // the exact trap (silent EPERM → wait forever) this issue is about.
+        // Runtimes implementing epoll over kqueue (the FreeBSD Linuxulator)
+        // accept regular files, matching kqueue's branch below instead.
+        port.monitorRead(file.handle, &tag);
+        var events: [8]backend.Event = undefined;
+        const n = port.wait(&events, 0) catch |err| blk: {
+            try std.testing.expectEqual(backend.Error.RegisterFailed, err);
+            break :blk 0;
+        };
+        if (n != 0) try std.testing.expect(events[0].readable);
+    } else {
+        // kqueue accepts regular files; nothing to report.
+        port.monitorRead(file.handle, &tag);
+        port.wantWrite(file.handle, &tag);
+        port.purgeFd(file.handle);
+    }
+}
+
 test "empty wait preserves queued wake" {
     var port = try backend.EvPort.init(std.testing.allocator);
     defer port.deinit();

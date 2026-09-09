@@ -21,6 +21,12 @@
 //!     moving or freeing the stream's OVERLAPPED storage.
 //!   - wake() signals the loop from another thread. POSIX wakeups coalesce;
 //!     IOCP posts a completion per wake. Event.wake identifies either form.
+//!   - A failed registration is never silent: epoll/IOCP return it as an
+//!     error from the next non-empty wait(); kqueue delivers kernel
+//!     rejections as Event.err/err_no and stashes allocation failures the
+//!     same deferred way. Caution: epoll refuses regular files (EPERM)
+//!     while kqueue accepts them as perpetually ready — classify inherited
+//!     stdio before registering it.
 //!
 //! ## Provenance
 //!

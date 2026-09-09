@@ -4,6 +4,10 @@
 //   - Staged changelist: monitor*/unmonitor* accumulate struct kevent into a
 //     local array; the next wait() submits changelist + eventlist in ONE
 //     kevent() call. No kevent() call exists solely to register fds.
+//   - A kernel-rejected change comes back at wait() as Event{ .err, .err_no }.
+//     An ALLOCATION failure never reaches the kernel, so it is stashed and
+//     returned as error.OutOfMemory from the next non-empty wait() instead
+//     (the IOCP backend's shape) — no failure is a silent drop.
 //   - EV_CLEAR (edge-triggered) on EVFILT_READ: read handlers must fully
 //     drain buffered data (plain: read to EAGAIN; TLS: SSL_read to
 //     WANT_READ, which implies the socket hit EAGAIN).
@@ -73,6 +77,10 @@ pub const EvPort = struct {
     /// Deduplicates wantWrite/cancelWrite across the one-shot lifecycle:
     /// delivery clears the bit, so a blocked writer re-arms exactly once.
     armed_write: std.AutoHashMapUnmanaged(c_int, void) = .empty,
+    /// Stashed registration failure (the IOCP backend's shape): an
+    /// allocation failure in monitor*/want*/cancel*/unmonitor* is returned
+    /// by the next non-empty wait() instead of silently dropping the change.
+    pending_error: ?Error = null,
 
     pub fn init(alloc: std.mem.Allocator) Error!EvPort {
         const kq = std.posix.kqueue() catch return Error.KqueueFailed;
@@ -109,7 +117,13 @@ pub const EvPort = struct {
     /// send-buffer space after a short write. No-op while already armed.
     pub fn wantWrite(self: *EvPort, fd: Handle, udata: ?*anyopaque) void {
         if (self.armed_write.contains(fd)) return;
-        self.armed_write.put(self.alloc, fd, {}) catch return;
+        // Reserve the dedup slot before staging so the armed bit and the
+        // staged change agree even when the stage append later fails.
+        self.armed_write.ensureUnusedCapacity(self.alloc, 1) catch {
+            self.pending_error = Error.OutOfMemory;
+            return;
+        };
+        self.armed_write.putAssumeCapacity(fd, {});
         self.stage(change(fd, EVFILT_WRITE, EV_ADD | EV_ONESHOT, udata));
     }
 
@@ -158,13 +172,21 @@ pub const EvPort = struct {
     }
 
     fn stage(self: *EvPort, kev: Kevent) void {
-        self.changes.append(self.alloc, kev) catch {};
+        self.changes.append(self.alloc, kev) catch {
+            self.pending_error = Error.OutOfMemory;
+        };
     }
 
     /// Flush the staged changelist and harvest events in ONE kevent() call.
     /// timeout_ms: null = block until an event; 0 = harvest without blocking.
+    /// A stashed allocation failure is reported here, once, ahead of the
+    /// syscall — an empty wait neither consumes nor reports it.
     pub fn wait(self: *EvPort, events: []Event, timeout_ms: ?i32) Error!usize {
         if (events.len == 0) return 0;
+        if (self.pending_error) |err| {
+            self.pending_error = null;
+            return err;
+        }
         var kbuf: [64]Kevent = undefined;
         const cap = @min(events.len, kbuf.len);
 
@@ -202,13 +224,16 @@ pub const EvPort = struct {
                 // One-shot consumed: the writer must re-arm explicitly.
                 _ = self.armed_write.remove(@intCast(kev.ident));
             }
+            // A failed change (e.g. EV_ADD on a dead fd) must not masquerade
+            // as readiness: keep readable/writable clear when err is set.
+            const is_err = (kev.flags & EV_ERROR) != 0;
             events[out] = .{
                 .udata = @ptrFromInt(kev.udata),
-                .readable = kev.filter == EVFILT_READ,
-                .writable = kev.filter == EVFILT_WRITE,
+                .readable = !is_err and kev.filter == EVFILT_READ,
+                .writable = !is_err and kev.filter == EVFILT_WRITE,
                 .eof = (kev.flags & EV_EOF) != 0,
-                .err = (kev.flags & EV_ERROR) != 0,
-                .err_no = if ((kev.flags & EV_ERROR) != 0) @intCast(kev.data) else 0,
+                .err = is_err,
+                .err_no = if (is_err) @intCast(kev.data) else 0,
             };
             out += 1;
         }
@@ -282,6 +307,23 @@ test "kqueue: registration error survives empty wait with errno payload" {
     try std.testing.expect(events[0].err);
     try std.testing.expectEqual(@as(usize, @intFromEnum(std.posix.E.BADF)), events[0].err_no);
     try std.testing.expect(events[0].udata == @as(?*anyopaque, &tag));
+    // A failed registration is not readiness (issue #4 addendum).
+    try std.testing.expect(!events[0].readable);
+    try std.testing.expect(!events[0].writable);
+}
+
+test "kqueue: allocation failure is reported by the next wait, once" {
+    // fail_index 0 lands inside init's wake-pipe monitorRead stage: the
+    // port constructs, but the changelist append failed.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var port = try EvPort.init(failing.allocator());
+    defer port.deinit();
+    try std.testing.expectEqual(@as(usize, 0), port.changes.items.len);
+    var empty: [0]Event = .{};
+    try std.testing.expectEqual(@as(usize, 0), try port.wait(&empty, null));
+    var events: [1]Event = undefined;
+    try std.testing.expectError(Error.OutOfMemory, port.wait(&events, 0));
+    try std.testing.expectEqual(@as(usize, 0), try port.wait(&events, 0));
 }
 
 test "kqueue: socket read readiness + EV_CLEAR edge semantics" {

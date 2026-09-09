@@ -42,6 +42,24 @@ remove its staged changes/bookkeeping. Never apply stale changes after closing
 or recycling a descriptor. `unmonitorRead` and `cancelWrite` are for descriptors
 that remain open.
 
+**A failed registration is never silent, on any backend.** Because epoll applies
+registrations immediately, a kernel rejection — most notoriously `EPERM` for a
+regular file, or `EBADF` for a closed descriptor — is stashed and returned as
+`error.RegisterFailed` from the next non-empty `wait()` (an empty `wait` neither
+consumes nor reports it). kqueue stages changes: a kernel-rejected change comes
+back as an `Event` with `.err` set and the native errno in `.err_no` (and
+`.readable`/`.writable` stay clear on such events), while an allocation failure
+before the change ever reaches the kernel is stashed and returned as
+`error.OutOfMemory` the same way. IOCP reports a failed association identically,
+as `error.AssociateFailed` from the next non-empty `wait()`.
+
+One divergence deserves emphasis portably: **epoll refuses regular files with
+`EPERM`; kqueue accepts them and reports them perpetually ready.** A program
+that registers inherited stdin/stdout without checking will work on FreeBSD and
+hang on Linux unless it treats `wait()` errors as fatal. Classify such
+descriptors first (`fstat`/`S_ISREG`) and write regular files directly, rather
+than registering them.
+
 ### IOCP: completion
 
 `monitorRead` associates an overlappable handle with the port; **it does not
@@ -186,6 +204,13 @@ tissue to prove it:
 - **kqueue changelist batching.** A single rejected changelist entry makes the
   kernel abandon the rest of the batch — a 128-change batch can be silently
   truncated by one bad fd.
+- **epoll swallowed `epoll_ctl` failures.** A rejected registration returned
+  success and the event loop then waited forever on interest that was never
+  armed — found in practice when a consumer's stdout was redirected to a
+  regular file and `epoll_ctl` refused it with `EPERM` (issue #4). Registration
+  failures are now surfaced on every backend: as a hard error from the next
+  non-empty `wait()` on epoll and IOCP, and as an `err`/`err_no` event on
+  kqueue.
 - **FreeBSD loopback connect** can return `ECONNREFUSED` *synchronously* under
   load, so a non-blocking connect path must handle both refusal modes.
 
