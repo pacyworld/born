@@ -92,6 +92,13 @@ pub const PlainNb = struct {
 
     pub fn writeNb(self: *PlainNb, data: []const u8) Error!NbWrite {
         if (self.sock < 0) return Error.SocketError;
+        // An empty write is a no-op, and must not reach send(2): Linux
+        // answers EFAULT for a zero-length buffer whose pointer is the
+        // dangling one an empty slice carries, and std.posix.send maps
+        // EFAULT to unreachable — a panic, not an error. readNb and the
+        // Windows backend already guard this; POSIX writeNb was the
+        // outlier.
+        if (data.len == 0) return .{ .done = 0 };
         const n = std.posix.send(self.sock, data, MSG_NOSIGNAL) catch |err| switch (err) {
             error.WouldBlock => return .want_write,
             else => return Error.SocketError,
