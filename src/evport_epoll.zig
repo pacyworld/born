@@ -16,9 +16,13 @@
 //     persistent read side.)
 //   - Registrations apply immediately (epoll_ctl has no batching); the
 //     kqueue-side "staged changelist" rule is kqueue-specific. A rejected
-//     registration (e.g. EPERM for a regular file) is NEVER a silent no-op:
-//     like the IOCP backend's, a failure is stashed and returned as
+//     registration (e.g. EBADF for a dead descriptor) is NEVER a silent
+//     no-op: like the IOCP backend's, a failure is stashed and returned as
 //     error.RegisterFailed from the next non-empty wait().
+//   - epoll_ctl refuses regular files with EPERM, but their I/O never
+//     blocks, so "always ready" is the correct — and kqueue-matching —
+//     answer. Regular files are pseudo registrations: detected with fstat,
+//     kept out of the kernel's set, and reported ready by every wait().
 //   - Cross-thread wakeup: eventfd (the pipe trick's Linux twin).
 //   - purgeFd drops only the port's bookkeeping; the kernel removes a
 //     closed fd's registration itself.
@@ -46,6 +50,10 @@ const FdState = struct {
     udata: ?*anyopaque = null,
     read: bool = false,
     write: bool = false, // EPOLLOUT currently in the mask
+    /// Regular file: tracked in the map only, never in epoll. I/O on a
+    /// regular file never blocks, so wait() reports it ready on every call
+    /// — the same observable behaviour kqueue gives natively.
+    pseudo: bool = false,
 };
 
 pub const EvPort = struct {
@@ -57,6 +65,8 @@ pub const EvPort = struct {
     /// epoll_ctl or an allocation failure is returned by the next non-empty
     /// wait() instead of being dropped on the floor.
     pending_error: ?Error = null,
+    /// Live pseudo registrations: wait() must not block while any exist.
+    pseudo_count: usize = 0,
 
     pub fn init(alloc: std.mem.Allocator) Error!EvPort {
         // Raw linux syscalls do not set libc errno; decode the return value
@@ -124,7 +134,8 @@ pub const EvPort = struct {
     /// The fd is being closed: drop the port's bookkeeping (the kernel
     /// removes the registration on close(2) itself).
     pub fn purgeFd(self: *EvPort, fd: Handle) void {
-        _ = self.fds.remove(fd);
+        const kv = self.fds.fetchRemove(fd) orelse return;
+        if (kv.value.pseudo) self.pseudo_count -= 1;
     }
 
     /// Wake a wait() blocked in another thread.
@@ -133,40 +144,78 @@ pub const EvPort = struct {
         _ = std.posix.write(self.wake_fd, std.mem.asBytes(&one)) catch {};
     }
 
-    /// Apply the fd's computed mask: ADD / MOD / DEL as needed.
+    /// Apply the fd's computed mask: ADD / MOD / DEL / pseudo as needed.
     ///
-    /// The map slot is reserved BEFORE epoll_ctl so a successful kernel
+    /// epoll_ctl refuses regular files (EPERM), but "ready" is a true
+    /// statement about them: their I/O never blocks. A regular file is
+    /// therefore a PSEUDO registration — tracked in the map only and
+    /// reported ready by every wait() — the same observable behaviour
+    /// kqueue gives natively (issue #4).
+    ///
+    /// The map slot is reserved BEFORE any kernel call so a successful
     /// registration can never be lost to an allocation failure afterwards
     /// (an untracked live registration turns the next apply() into a CTL_ADD
-    /// that hits EEXIST, stranding the fd). Any failure — OOM before the
-    /// syscall or a kernel rejection at it — is stashed in pending_error
-    /// and leaves the map mirroring the kernel.
+    /// that hits EEXIST, stranding the fd). Any other failure — OOM before
+    /// the syscall, or an fstat/epoll_ctl rejection such as EBADF — is
+    /// stashed in pending_error and leaves the map mirroring reality.
     fn apply(self: *EvPort, fd: Handle, st: FdState) void {
         if (!st.read and !st.write) {
-            if (self.fds.contains(fd)) {
-                _ = linux.epoll_ctl(self.ep, linux.EPOLL.CTL_DEL, fd, null);
+            if (self.fds.getPtr(fd)) |cur| {
+                if (cur.pseudo) {
+                    self.pseudo_count -= 1;
+                } else {
+                    _ = linux.epoll_ctl(self.ep, linux.EPOLL.CTL_DEL, fd, null);
+                }
                 _ = self.fds.remove(fd);
             }
             return;
         }
-        var mask: u32 = 0;
-        if (st.read) mask |= READ_MASK;
-        if (st.write) mask |= WRITE_MASK;
-        var ev = linux.epoll_event{
-            .events = mask,
-            .data = .{ .ptr = @intFromPtr(st.udata) },
-        };
         const gop = self.fds.getOrPut(self.alloc, fd) catch {
             self.pending_error = Error.OutOfMemory;
             return;
         };
-        const op: u32 = if (gop.found_existing) linux.EPOLL.CTL_MOD else linux.EPOLL.CTL_ADD;
-        if (linux.E.init(linux.epoll_ctl(self.ep, op, fd, &ev)) != .SUCCESS) {
-            if (!gop.found_existing) _ = self.fds.remove(fd);
-            self.pending_error = Error.RegisterFailed;
+        if (!gop.found_existing) {
+            // Fresh registration: classify before touching the kernel.
+            // Raw linux.fstat: std.posix.fstat declares EBADF unreachable,
+            // and a possibly-dead fd is exactly what must be classifiable.
+            var stat: linux.Stat = undefined;
+            if (linux.E.init(linux.fstat(fd, &stat)) != .SUCCESS) {
+                _ = self.fds.remove(fd);
+                self.pending_error = Error.RegisterFailed;
+                return;
+            }
+            gop.value_ptr.* = st;
+            if (stat.mode & linux.S.IFMT == linux.S.IFREG) {
+                gop.value_ptr.pseudo = true;
+                self.pseudo_count += 1;
+                return;
+            }
+            var ev = makeEvent(st);
+            if (linux.E.init(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_ADD, fd, &ev)) != .SUCCESS) {
+                _ = self.fds.remove(fd);
+                self.pending_error = Error.RegisterFailed;
+            }
             return;
         }
+        if (!gop.value_ptr.pseudo) {
+            var ev = makeEvent(st);
+            if (linux.E.init(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_MOD, fd, &ev)) != .SUCCESS) {
+                _ = self.fds.remove(fd);
+                self.pending_error = Error.RegisterFailed;
+                return;
+            }
+        }
         gop.value_ptr.* = st;
+    }
+
+    fn makeEvent(st: FdState) linux.epoll_event {
+        var mask: u32 = 0;
+        if (st.read) mask |= READ_MASK;
+        if (st.write) mask |= WRITE_MASK;
+        return .{
+            .events = mask,
+            .data = .{ .ptr = @intFromPtr(st.udata) },
+        };
     }
 
     /// register is apply for init (fd not yet tracked).
@@ -179,7 +228,9 @@ pub const EvPort = struct {
     /// Harvest events in one epoll_wait. timeout_ms: null = block until an
     /// event; 0 = harvest without blocking. A stashed registration failure
     /// is reported here, once, ahead of the syscall — an empty wait neither
-    /// consumes nor reports it.
+    /// consumes nor reports it. Pseudo registrations (regular files) are
+    /// always ready: while any exist the syscall never blocks, and they
+    /// fill whatever space the kernel left.
     pub fn wait(self: *EvPort, events: []Event, timeout_ms: ?i32) Error!usize {
         if (events.len == 0) return 0;
         if (self.pending_error) |err| {
@@ -188,7 +239,7 @@ pub const EvPort = struct {
         }
         var ebuf: [64]linux.epoll_event = undefined;
         const cap = @min(events.len, ebuf.len);
-        const timeout: i32 = timeout_ms orelse -1;
+        const timeout: i32 = if (self.pseudo_count == 0) timeout_ms orelse -1 else 0;
 
         const n_rc = linux.epoll_wait(self.ep, &ebuf, @intCast(cap), timeout);
         const n_err = linux.E.init(n_rc);
@@ -218,6 +269,20 @@ pub const EvPort = struct {
                 .err = (eev.events & linux.EPOLL.ERR) != 0,
             };
             out += 1;
+        }
+        if (self.pseudo_count != 0) {
+            var it = self.fds.iterator();
+            while (out < cap) {
+                const entry = it.next() orelse break;
+                const st = entry.value_ptr;
+                if (!st.pseudo) continue;
+                events[out] = .{
+                    .udata = st.udata,
+                    .readable = st.read,
+                    .writable = st.write,
+                };
+                out += 1;
+            }
         }
         return out;
     }
@@ -328,7 +393,7 @@ test "epoll: wake posts a single coalesced event" {
     try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
 }
 
-test "epoll: refused registration is reported by the next wait, never half-recorded (issue #4)" {
+test "epoll: regular file is an always-ready pseudo registration (issue #4)" {
     const alloc = std.testing.allocator;
     var evp = try EvPort.init(alloc);
     defer evp.deinit();
@@ -337,46 +402,60 @@ test "epoll: refused registration is reported by the next wait, never half-recor
     defer tmp.cleanup();
     const file = try tmp.dir.createFile("plain.txt", .{});
     defer file.close();
-    // Non-empty with the offset rewound, so an accepting kernel
-    // (epoll-over-kqueue runtimes) reports it readable rather than at-EOF.
     try file.writeAll("x");
     try file.seekTo(0);
 
+    // epoll_ctl would refuse this fd with EPERM; born keeps it out of the
+    // kernel set and answers readiness itself, matching kqueue.
     var tag: u8 = 5;
     evp.monitorRead(file.handle, &tag);
+    try std.testing.expect(evp.fds.get(file.handle).?.pseudo);
+    try std.testing.expectEqual(@as(usize, 1), evp.pseudo_count);
+    evp.wantWrite(file.handle, &tag);
+
     var events: [8]Event = undefined;
-    if (evp.fds.contains(file.handle)) {
-        // Runtimes that implement epoll over kqueue (the FreeBSD
-        // Linuxulator) accept the regular files native epoll(7) rejects
-        // with EPERM. The refusal assertions below hold on a faithful
-        // epoll; here, just verify the accepted registration behaves.
-        const n = try evp.wait(&events, 1000);
-        try std.testing.expect(n >= 1);
-        try std.testing.expect(events[0].readable);
-        evp.purgeFd(file.handle);
-    } else {
-        // epoll_ctl refused it: the IOCP-shaped contract — void call, hard
-        // error from the next non-empty wait(), reported exactly once.
-        var empty: [0]Event = .{};
-        try std.testing.expectEqual(@as(usize, 0), try evp.wait(&empty, null));
-        try std.testing.expectError(Error.RegisterFailed, evp.wait(&events, 0));
-        try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
+    const n = try evp.wait(&events, 1000);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expectEqual(@as(?*anyopaque, &tag), events[0].udata);
+    try std.testing.expect(events[0].readable and events[0].writable);
+    try std.testing.expect(!events[0].err and !events[0].eof);
 
-        // Bookkeeping mirrors the kernel — no half-recorded registration,
-        // so a retry reports the same rejection instead of stranding the fd
-        // on EEXIST.
-        evp.wantWrite(file.handle, &tag);
-        try std.testing.expectError(Error.RegisterFailed, evp.wait(&events, 0));
-        try std.testing.expect(!evp.fds.contains(file.handle));
-    }
+    // Always ready: a second, non-blocking wait repeats the report.
+    try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 0));
+    try std.testing.expect(events[0].readable and events[0].writable);
 
-    // An out-of-range descriptor fails through the same channel (EBADF) on
-    // every epoll implementation, emulation included. Deliberately not a
-    // dup'd-then-closed fd: the Linuxulator accepts recycled fd numbers.
+    // Interest changes touch the map only; birth and death leave no kernel
+    // residue behind.
+    evp.unmonitorRead(file.handle);
+    try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 0));
+    try std.testing.expect(events[0].writable and !events[0].readable);
+    evp.purgeFd(file.handle);
+    try std.testing.expectEqual(@as(usize, 0), evp.pseudo_count);
+    try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
+}
+
+test "epoll: rejected descriptor is reported by the next wait, never half-recorded (issue #4)" {
+    const alloc = std.testing.allocator;
+    var evp = try EvPort.init(alloc);
+    defer evp.deinit();
+
+    var events: [8]Event = undefined;
+    var tag: u8 = 6;
+    // fstat fails EBADF before epoll_ctl is ever reached. Deliberately an
+    // out-of-range fd, not dup+close: the Linuxulator accepts recycled fd
+    // numbers.
     const bogus: Handle = 1 << 20;
     evp.monitorRead(bogus, &tag);
     try std.testing.expect(!evp.fds.contains(bogus));
+    var empty: [0]Event = .{};
+    try std.testing.expectEqual(@as(usize, 0), try evp.wait(&empty, null));
     try std.testing.expectError(Error.RegisterFailed, evp.wait(&events, 0));
+    // Reported exactly once, and a retry reports the same rejection — no
+    // half-recorded state to trip over.
+    try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
+    evp.wantWrite(bogus, &tag);
+    try std.testing.expectError(Error.RegisterFailed, evp.wait(&events, 0));
+    try std.testing.expect(!evp.fds.contains(bogus));
 }
 
 test "epoll: allocation failure is reported by the next wait, once" {

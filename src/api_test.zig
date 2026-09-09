@@ -70,7 +70,7 @@ test "reactor interest methods execute with native handles" {
     }
 }
 
-test "registering a regular file is a loud failure, not a hang (issue #4)" {
+test "regular file registration behaves identically on every POSIX backend (issue #4)" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var port = try backend.EvPort.init(std.testing.allocator);
     defer port.deinit();
@@ -78,26 +78,32 @@ test "registering a regular file is a loud failure, not a hang (issue #4)" {
     defer tmp.cleanup();
     const file = try tmp.dir.createFile("registration-target", .{});
     defer file.close();
+    try file.writeAll("x");
+    try file.seekTo(0);
     var tag: u8 = 1;
-    if (builtin.os.tag == .linux) {
-        // epoll refuses regular files with EPERM. The void registration API
-        // must report that as a hard error from the next non-empty wait —
-        // the exact trap (silent EPERM → wait forever) this issue is about.
-        // Runtimes implementing epoll over kqueue (the FreeBSD Linuxulator)
-        // accept regular files, matching kqueue's branch below instead.
-        port.monitorRead(file.handle, &tag);
-        var events: [8]backend.Event = undefined;
-        const n = port.wait(&events, 0) catch |err| blk: {
-            try std.testing.expectEqual(backend.Error.RegisterFailed, err);
-            break :blk 0;
-        };
-        if (n != 0) try std.testing.expect(events[0].readable);
-    } else {
-        // kqueue accepts regular files; nothing to report.
-        port.monitorRead(file.handle, &tag);
-        port.wantWrite(file.handle, &tag);
-        port.purgeFd(file.handle);
+    port.monitorRead(file.handle, &tag);
+    port.wantWrite(file.handle, &tag);
+    // I/O on a regular file never blocks, so every readiness backend must
+    // report it ready: kqueue natively, epoll via its pseudo registrations.
+    // kqueue splits read/write filters into separate kevents while epoll
+    // reports one combined event; accept either framing of identical truth.
+    var readable = false;
+    var writable = false;
+    var attempts: usize = 0;
+    var events: [8]backend.Event = undefined;
+    while (attempts < 2 and !(readable and writable)) : (attempts += 1) {
+        const n = try port.wait(&events, 1000);
+        try std.testing.expect(n >= 1);
+        for (events[0..n]) |event| {
+            if (event.udata == @as(?*anyopaque, &tag)) {
+                try std.testing.expect(!event.err);
+                readable = readable or event.readable;
+                writable = writable or event.writable;
+            }
+        }
     }
+    try std.testing.expect(readable and writable);
+    port.purgeFd(file.handle);
 }
 
 test "empty wait preserves queued wake" {

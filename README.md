@@ -42,23 +42,25 @@ remove its staged changes/bookkeeping. Never apply stale changes after closing
 or recycling a descriptor. `unmonitorRead` and `cancelWrite` are for descriptors
 that remain open.
 
-**A failed registration is never silent, on any backend.** Because epoll applies
-registrations immediately, a kernel rejection — most notoriously `EPERM` for a
-regular file, or `EBADF` for a closed descriptor — is stashed and returned as
-`error.RegisterFailed` from the next non-empty `wait()` (an empty `wait` neither
-consumes nor reports it). kqueue stages changes: a kernel-rejected change comes
+**A failed registration is never silent, on any backend.** A rejected
+registration — `EBADF` for a dead descriptor, or any other refusal epoll or
+kqueue might return — is stashed and returned as `error.RegisterFailed` from
+the next non-empty `wait()` on epoll (an empty `wait` neither consumes nor
+reports it), matching how IOCP reports a failed association as
+`error.AssociateFailed`. kqueue stages changes: a kernel-rejected change comes
 back as an `Event` with `.err` set and the native errno in `.err_no` (and
 `.readable`/`.writable` stay clear on such events), while an allocation failure
 before the change ever reaches the kernel is stashed and returned as
-`error.OutOfMemory` the same way. IOCP reports a failed association identically,
-as `error.AssociateFailed` from the next non-empty `wait()`.
+`error.OutOfMemory` the same way epoll stashes its rejections.
 
-One divergence deserves emphasis portably: **epoll refuses regular files with
-`EPERM`; kqueue accepts them and reports them perpetually ready.** A program
-that registers inherited stdin/stdout without checking will work on FreeBSD and
-hang on Linux unless it treats `wait()` errors as fatal. Classify such
-descriptors first (`fstat`/`S_ISREG`) and write regular files directly, rather
-than registering them.
+**Regular files work identically on every POSIX backend.** I/O on a regular
+file never blocks, so "always ready" is the correct answer. kqueue accepts
+regular files natively; epoll's raw `epoll_ctl` refuses them with `EPERM`, so
+the epoll backend emulates kqueue: a regular file is detected at registration
+(`fstat`/`S_ISREG`), kept out of the kernel's epoll set, and reported ready —
+readable and/or writable per its interest — by every `wait()`. Consumers must
+therefore stop registering a regular file once it reaches EOF, on both
+backends, or `wait()` keeps answering instantly (true under kqueue already).
 
 ### IOCP: completion
 
@@ -208,9 +210,9 @@ tissue to prove it:
   success and the event loop then waited forever on interest that was never
   armed — found in practice when a consumer's stdout was redirected to a
   regular file and `epoll_ctl` refused it with `EPERM` (issue #4). Registration
-  failures are now surfaced on every backend: as a hard error from the next
-  non-empty `wait()` on epoll and IOCP, and as an `err`/`err_no` event on
-  kqueue.
+  rejections are now surfaced as hard errors on every backend, and regular
+  files specifically are carried as always-ready pseudo registrations so the
+  redirected-stdout case works on Linux exactly as under kqueue.
 - **FreeBSD loopback connect** can return `ECONNREFUSED` *synchronously* under
   load, so a non-blocking connect path must handle both refusal modes.
 
