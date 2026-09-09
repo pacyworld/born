@@ -19,10 +19,13 @@
 //     registration (e.g. EBADF for a dead descriptor) is NEVER a silent
 //     no-op: like the IOCP backend's, a failure is stashed and returned as
 //     error.RegisterFailed from the next non-empty wait().
-//   - epoll_ctl refuses regular files with EPERM, but their I/O never
-//     blocks, so "always ready" is the correct — and kqueue-matching —
-//     answer. Regular files are pseudo registrations: detected with fstat,
-//     kept out of the kernel's set, and reported ready by every wait().
+//   - epoll_ctl answers EPERM for any descriptor with no poll
+//     implementation — regular files, character devices such as
+//     /dev/null, directories. Their I/O never blocks, so "always ready"
+//     is the correct — and kqueue-matching — answer. These are pseudo
+//     registrations: kept out of the kernel's set and reported ready by
+//     every wait(). The kernel does the classifying: EPERM from the ADD
+//     is the signal, so no descriptor-type list has to be maintained.
 //   - Cross-thread wakeup: eventfd (the pipe trick's Linux twin).
 //   - purgeFd drops only the port's bookkeeping; the kernel removes a
 //     closed fd's registration itself.
@@ -146,11 +149,17 @@ pub const EvPort = struct {
 
     /// Apply the fd's computed mask: ADD / MOD / DEL / pseudo as needed.
     ///
-    /// epoll_ctl refuses regular files (EPERM), but "ready" is a true
-    /// statement about them: their I/O never blocks. A regular file is
-    /// therefore a PSEUDO registration — tracked in the map only and
-    /// reported ready by every wait() — the same observable behaviour
-    /// kqueue gives natively (issue #4).
+    /// epoll_ctl answers EPERM for a descriptor it cannot poll, and
+    /// "ready" is a true statement about every such descriptor: their I/O
+    /// never blocks. Those become PSEUDO registrations — tracked in the
+    /// map only and reported ready by every wait() — the same observable
+    /// behaviour kqueue gives natively (issue #4).
+    ///
+    /// EPERM from the ADD is what classifies them, rather than an fstat
+    /// against a hand-maintained list of descriptor types: the kernel's
+    /// idea of what it cannot poll is the only authority that stays
+    /// correct, and it covers character devices and directories as well
+    /// as regular files. It also saves a syscall on the common path.
     ///
     /// The map slot is reserved BEFORE any kernel call so a successful
     /// registration can never be lost to an allocation failure afterwards
@@ -175,25 +184,21 @@ pub const EvPort = struct {
             return;
         };
         if (!gop.found_existing) {
-            // Fresh registration: classify before touching the kernel.
-            // Raw linux.fstat: std.posix.fstat declares EBADF unreachable,
-            // and a possibly-dead fd is exactly what must be classifiable.
-            var stat: linux.Stat = undefined;
-            if (linux.E.init(linux.fstat(fd, &stat)) != .SUCCESS) {
-                _ = self.fds.remove(fd);
-                self.pending_error = Error.RegisterFailed;
-                return;
-            }
             gop.value_ptr.* = st;
-            if (stat.mode & linux.S.IFMT == linux.S.IFREG) {
-                gop.value_ptr.pseudo = true;
-                self.pseudo_count += 1;
-                return;
-            }
             var ev = makeEvent(st);
-            if (linux.E.init(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_ADD, fd, &ev)) != .SUCCESS) {
-                _ = self.fds.remove(fd);
-                self.pending_error = Error.RegisterFailed;
+            switch (linux.E.init(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_ADD, fd, &ev))) {
+                .SUCCESS => {},
+                // "I cannot poll this": the pseudo registration above.
+                .PERM => {
+                    gop.value_ptr.pseudo = true;
+                    self.pseudo_count += 1;
+                },
+                // Anything else (EBADF for a dead descriptor, ENOMEM, ...)
+                // is a real rejection and must reach the caller.
+                else => {
+                    _ = self.fds.remove(fd);
+                    self.pending_error = Error.RegisterFailed;
+                },
             }
             return;
         }
@@ -434,6 +439,49 @@ test "epoll: regular file is an always-ready pseudo registration (issue #4)" {
     try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
 }
 
+test "epoll: unpollable descriptors other than regular files are pseudo too (issue #4)" {
+    // epoll_ctl answers EPERM for character devices and directories just as
+    // it does for regular files. Classifying on EPERM rather than on a
+    // descriptor-type test is what keeps these working: `prog < /dev/null`
+    // is an ordinary way to launch a service.
+    const alloc = std.testing.allocator;
+
+    const cases = [_][]const u8{ "/dev/null", "/dev/zero" };
+    for (cases) |path| {
+        var evp = try EvPort.init(alloc);
+        defer evp.deinit();
+        const f = try std.fs.openFileAbsolute(path, .{});
+        defer f.close();
+
+        var tag: u8 = 7;
+        evp.monitorRead(f.handle, &tag);
+
+        var events: [4]Event = undefined;
+        // No pending_error: the descriptor was accepted, not rejected.
+        try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 0));
+        try std.testing.expect(evp.fds.get(f.handle).?.pseudo);
+        try std.testing.expectEqual(@as(usize, 1), evp.pseudo_count);
+        try std.testing.expect(events[0].readable);
+        try std.testing.expect(!events[0].err);
+    }
+
+    // A directory opened for reading is refused the same way. (An O_PATH
+    // directory fd is refused with EBADF instead, and must therefore stay
+    // a hard error — which is exactly why the classification keys on EPERM
+    // and not on "epoll_ctl said no".)
+    var evp = try EvPort.init(alloc);
+    defer evp.deinit();
+    const dfd = try std.posix.open("/tmp", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+    defer std.posix.close(dfd);
+
+    var tag: u8 = 8;
+    evp.monitorRead(dfd, &tag);
+    var events: [4]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 0));
+    try std.testing.expect(evp.fds.get(dfd).?.pseudo);
+    try std.testing.expect(events[0].readable and !events[0].err);
+}
+
 test "epoll: rejected descriptor is reported by the next wait, never half-recorded (issue #4)" {
     const alloc = std.testing.allocator;
     var evp = try EvPort.init(alloc);
@@ -441,7 +489,8 @@ test "epoll: rejected descriptor is reported by the next wait, never half-record
 
     var events: [8]Event = undefined;
     var tag: u8 = 6;
-    // fstat fails EBADF before epoll_ctl is ever reached. Deliberately an
+    // epoll_ctl rejects this with EBADF, which is NOT EPERM and so must
+    // surface rather than becoming a pseudo registration. Deliberately an
     // out-of-range fd, not dup+close: the Linuxulator accepts recycled fd
     // numbers.
     const bogus: Handle = 1 << 20;
