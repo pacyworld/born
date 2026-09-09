@@ -1,6 +1,6 @@
 .{
     .name = .born,
-    .version = "0.2.2",
+    .version = "0.2.3",
     .fingerprint = 0x44e33ba2c0770d62,
     .minimum_zig_version = "0.15.2",
     .paths = .{ "build.zig", "build.zig.zon", "src", "LICENSE", "README.md" },
