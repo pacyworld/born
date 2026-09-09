@@ -17,6 +17,11 @@ const Pair = struct {
     accept_buf: [2 * (@sizeOf(std.net.Address) + 16)]u8 = undefined,
     accept_pending: bool = false,
     connected: bool = false,
+    /// Set by the refusal test. epoll reports a refused connect as
+    /// EPOLLOUT|EPOLLERR|EPOLLHUP, so Event.err is legitimately set there;
+    /// kqueue reports EV_EOF without EV_ERROR. The blanket !event.err
+    /// assertion below is a kqueue-shaped assumption (issue #8).
+    expect_connect_err: bool = false,
 
     fn init(self: *Pair) !void {
         self.* = .{ .port = try born.EvPort.init(alloc) };
@@ -111,8 +116,8 @@ const Pair = struct {
                 try std.testing.expect(kind != .unknown);
                 if (kind == .connect) self.connected = true;
             } else {
-                try std.testing.expect(!event.err);
-                if (event.writable) {
+                if (!self.expect_connect_err) try std.testing.expect(!event.err);
+                if (event.writable or event.err) {
                     self.port.cancelWrite(stream.handle());
                     self.connected = true;
                 }
@@ -274,6 +279,7 @@ test "plain socket connect refusal surfaces at connectDone" {
     try pair.drain();
     pair.client.deinit();
     pair.connected = false;
+    pair.expect_connect_err = true;
     pair.client.startConnectInto(alloc, "127.0.0.1", refused_port, &pair.port, &pair.client) catch |err| {
         try std.testing.expectEqual(error.ConnectFailed, err);
         try std.testing.expectEqual(@as(usize, 0), pair.client.pendingOps());
@@ -281,6 +287,9 @@ test "plain socket connect refusal surfaces at connectDone" {
     };
     if (!is_windows) pair.port.wantWrite(pair.client.handle(), &pair.client);
     while (!pair.connected) try pair.waitOneTimeout(10000);
+    try std.testing.expectError(error.ConnectFailed, pair.client.connectDone());
+    // SO_ERROR is read-and-clear, so without a latch this second call would
+    // report success and a consumer would proceed on a dead socket.
     try std.testing.expectError(error.ConnectFailed, pair.client.connectDone());
 }
 

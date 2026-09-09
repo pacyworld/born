@@ -26,6 +26,12 @@ const MSG_NOSIGNAL: u32 = switch (builtin.os.tag) {
 /// Non-blocking plaintext TCP stream for the event core.
 pub const PlainNb = struct {
     sock: std.posix.fd_t = -1,
+    /// Latched connect outcome. SO_ERROR is READ-AND-CLEAR, so the second
+    /// getsockopt returns 0 and a refused connect would look like success.
+    /// Anything that reads it first — a second connectDone(), or a caller
+    /// doing its own getsockopt — must not be able to erase the verdict
+    /// (issue #8).
+    connect_err: bool = false,
 
     pub const Error = io.IoError;
 
@@ -74,9 +80,13 @@ pub const PlainNb = struct {
     /// Confirm the connect after the first write event (SO_ERROR).
     pub fn connectDone(self: *PlainNb) Error!void {
         if (self.sock < 0) return Error.SocketError;
+        if (self.connect_err) return Error.ConnectFailed; // already latched
         var so_error: c_int = 0;
         std.posix.getsockopt(self.sock, std.posix.SOL.SOCKET, std.posix.SO.ERROR, std.mem.asBytes(&so_error)) catch return Error.SocketError;
-        if (so_error != 0) return Error.ConnectFailed;
+        if (so_error != 0) {
+            self.connect_err = true;
+            return Error.ConnectFailed;
+        }
     }
 
     pub fn readNb(self: *PlainNb, out: []u8) Error!NbRead {
