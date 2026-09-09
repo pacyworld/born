@@ -13,7 +13,11 @@
 //   - wait() harvests a batch in ONE GetQueuedCompletionStatusEx call.
 //   - Cross-thread wakeup: PostQueuedCompletionStatus with the wake key.
 //   - stdio relay threads (libuv pattern for blocking pipes) post their
-//     chunks here via PQCS with the caller-chosen key.
+//     chunks here via PQCS with the caller-chosen key. A FAILED post used
+//     to vanish silently (issue #5); it is now stashed atomically — relay
+//     threads share post() with the owning thread — and returned as
+//     error.PostFailed from the next non-empty wait(), like pending
+//     association failures.
 
 const std = @import("std");
 const windows = std.os.windows;
@@ -34,13 +38,21 @@ pub const Event = @import("types.zig").Event;
 pub const Error = error{
     InitFailed,
     AssociateFailed,
+    PostFailed,
     WaitFailed,
     OutOfMemory,
 };
 
 pub const EvPort = struct {
     iocp: windows.HANDLE = windows.INVALID_HANDLE_VALUE,
+    /// Stashed association failure (owning thread via monitorRead only):
+    /// returned once by the next non-empty wait().
     pending_error: ?Error = null,
+    /// Set by post()/wake() from ANY thread on a failed
+    /// PostQueuedCompletionStatus; the next non-empty wait() reports it
+    /// once as error.PostFailed (issue #5). Atomic because post() may run
+    /// from relay threads while the owning thread is inside wait().
+    post_failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub fn init(alloc: std.mem.Allocator) Error!EvPort {
         _ = alloc;
@@ -99,9 +111,16 @@ pub const EvPort = struct {
     }
 
     /// Post a completion with an arbitrary key (stdio relay threads use
-    /// their sentinel addresses; overlapped may be null).
+    /// their sentinel addresses; overlapped may be null). Callable from
+    /// any thread: a failed post is never silently dropped — the failure
+    /// is stashed atomically and returned as error.PostFailed (issue #5)
+    /// by the next non-empty wait(). NOTE: when the FAILED post is itself
+    /// a wake, nothing wakes the blocked wait, so the error reaches the
+    /// consumer at the next naturally-arriving completion.
     pub fn post(self: *EvPort, key: *anyopaque, overlapped: ?*windows.OVERLAPPED, bytes: usize) void {
-        _ = kernel32.PostQueuedCompletionStatus(self.iocp, @intCast(bytes), @intFromPtr(key), overlapped);
+        if (kernel32.PostQueuedCompletionStatus(self.iocp, @intCast(bytes), @intFromPtr(key), overlapped) == 0) {
+            self.post_failed.store(true, .release);
+        }
     }
 
     pub fn wakeKey() *anyopaque {
@@ -116,6 +135,7 @@ pub const EvPort = struct {
             self.pending_error = null;
             return err;
         }
+        if (self.post_failed.swap(false, .acq_rel)) return Error.PostFailed;
         var entries: [64]CompletionEntry = undefined;
         const cap = @min(events.len, entries.len);
         var removed: u32 = 0;
@@ -164,6 +184,36 @@ test "iocp: association failure is immediate or deferred without consuming compl
     try std.testing.expectEqual(@as(usize, 1), try port.wait(&events, 1000));
     try std.testing.expect(events[0].wake);
     try std.testing.expectEqual(@as(usize, 0), try port.wait(&events, 0));
+}
+
+test "iocp: failed post is stashed and returned by the next wait (issue #5)" {
+    var port = try EvPort.init(std.testing.allocator);
+    defer port.deinit();
+
+    // A working post first: success stashes nothing.
+    var tag: u8 = 1;
+    port.post(&tag, null, 7);
+    var events: [1]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try port.wait(&events, 1000));
+    try std.testing.expect(events[0].udata == @as(?*anyopaque, &tag));
+    try std.testing.expectEqual(@as(usize, 7), events[0].bytes);
+
+    // Invalidate the port: PostQueuedCompletionStatus now fails.
+    const saved = port.iocp;
+    port.iocp = windows.INVALID_HANDLE_VALUE;
+    defer port.iocp = saved;
+
+    // A relay thread lost its chunk — the port must say so at its next
+    // wait instead of letting the loop wait on a completion that never
+    // arrives. An empty wait preserves the stashed error, as elsewhere.
+    port.post(&tag, null, 7);
+    var empty: [0]Event = .{};
+    try std.testing.expectEqual(@as(usize, 0), try port.wait(&empty, null));
+    try std.testing.expectError(Error.PostFailed, port.wait(&events, 0));
+    // Reported once; a repeat post stashes it again.
+    try std.testing.expect(!port.post_failed.load(.acquire));
+    port.wake();
+    try std.testing.expectError(Error.PostFailed, port.wait(&events, 0));
 }
 
 test "iocp: empty wait preserves raw posted completions" {

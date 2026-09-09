@@ -73,7 +73,11 @@ nonempty `wait`, rather than silently dropped.
 Windows operations. `wait()` harvests completions with
 `GetQueuedCompletionStatusEx`. Raw `Event.readable` and `Event.writable` remain
 false. The owning stream must absorb `overlapped`, `bytes` and any error before
-retrying its I/O state machine.
+retrying its I/O state machine. `post()` — including `wake()` — is callable from
+any thread; a failed `PostQueuedCompletionStatus` is never dropped silently: it
+is stashed atomically and returned as `error.PostFailed` from the next non-empty
+`wait()` (when the failed post was itself a wake, the error arrives with the
+next naturally-arriving completion).
 
 The extracted `born.socket.PlainNb` owns the overlapped connect/receive/send
 machinery and receive/send buffers. Construct it **in place**: the stream may

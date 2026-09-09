@@ -24,10 +24,11 @@
 //!   - A failed registration is never silent: epoll/IOCP return it as an
 //!     error from the next non-empty wait(); kqueue delivers kernel
 //!     rejections as Event.err/err_no and stashes allocation failures the
-//!     same deferred way. Regular files are portable readiness sources:
-//!     kqueue reports them perpetually ready natively, and epoll emulates
-//!     exactly that with always-ready pseudo registrations (raw epoll_ctl
-//!     would refuse them with EPERM).
+//!     same deferred way. IOCP post()/wake() failures (error.PostFailed)
+//!     take the same deferred channel. Regular files are portable
+//!     readiness sources: kqueue reports them perpetually ready natively,
+//!     and epoll emulates exactly that with always-ready pseudo
+//!     registrations (raw epoll_ctl would refuse them with EPERM).
 //!
 //! ## Provenance
 //!
