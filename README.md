@@ -98,9 +98,18 @@ overlappable named pipes or a blocking-pipe relay, as mcp-bridge does.
 `std.os.windows.HANDLE`). Every backend uses it for descriptor arguments.
 `born.Event` has the same fields on every backend: `udata`, `readable`,
 `writable`, `eof`, `err`, `err_no: usize`, `wake`,
-`overlapped: ?*std.os.windows.OVERLAPPED`, and `bytes: usize`.
+`overlapped: ?*std.os.windows.OVERLAPPED`, `bytes: usize`, and the 0.3.0
+fields `timer: bool`, `signal: ?born.Signal` and `fired: u32` (see
+[Planned in 0.3.0](#planned-in-030)), which stay false, null and zero for
+every other event.
 Completion fields are null/zero on POSIX. Error numbers are native errno on
 kqueue and NTSTATUS on IOCP, not a portable error enumeration.
+
+Each `EvPort` operation returns its own error set: `born.InitError` from
+`init`, `born.WaitError` from `wait`, `born.TimerError` and
+`born.SignalError` from the 0.3.0 calls. `born.Error` is their union. `wait`
+reports only loop failures (including stashed registration failures), never
+a refused timer or signal.
 
 `wake()` may be called from another thread and produces `Event{ .wake = true }`.
 POSIX wakeups coalesce; IOCP queues one completion per post. All other event-port
@@ -130,8 +139,14 @@ say what it is actually running on rather than what it assumes.
 
 ## Portable TCP companion
 
-`born.socket` exports `PlainNb`, `NbRead`, `NbWrite`, `IoError` and
-`CompletionKind`. It does not depend on OpenSSL, Schannel or mcp-bridge.
+`born.socket` exports `PlainNb`, `NbRead`, `NbWrite`, `CompletionKind` and
+one error set per operation: `ConnectError` (`startConnectInto`),
+`ConnectDoneError` (`connectDone`), `ReadError` (`readNb`) and `WriteError`
+(`writeNb`). Each holds exactly what that call can return, so a consumer can
+switch over it with no `else` prong and a later change in born fails the
+consumer's build instead of reaching `unreachable`. `IoError` (also
+`PlainNb.Error`) is their union, a catch-all that may grow. It does not
+depend on OpenSSL, Schannel or mcp-bridge.
 
 1. Initialize a stable `PlainNb{}` and call
    `startConnectInto(allocator, host, port, &ep, user_data)`.
@@ -159,6 +174,74 @@ asynchronous DNS, TLS, or arbitrary child-process I/O.
 
 `src/socket_test.zig` exercises the same loopback lifecycle on all three backend
 families and is the executable usage reference.
+
+## Planned in 0.3.0
+
+The 0.3.0 workstream ([#24](https://pacyworld.dev/pacyworld/born/issues/24))
+adds four primitives. Their signatures are in place and documented in the
+source, but every backend still returns `error.Unsupported` until the
+implementation issue for that backend lands. The contract tests
+(`src/timer_test.zig`, `src/signal_test.zig`, `src/listener_test.zig`,
+`src/unix_test.zig`) skip until then.
+
+- **Timers:** `EvPort.addTimer(id, udata, after_ms, .once or .repeat)` and
+  `cancelTimer(id)`, delivered as `Event{ .timer = true, .fired = n }`.
+  kqueue ([#12](https://pacyworld.dev/pacyworld/born/issues/12)), epoll
+  ([#13](https://pacyworld.dev/pacyworld/born/issues/13)) and IOCP
+  ([#14](https://pacyworld.dev/pacyworld/born/issues/14)), with a shared
+  deadline heap ([#11](https://pacyworld.dev/pacyworld/born/issues/11)).
+- **Signals:** `EvPort.watchSignal(sig, udata)`, `unwatchSignal(sig)` and
+  `born.blockSignals(sigs)`, delivered as `Event{ .signal = sig, .fired = n }`
+  for `interrupt`, `terminate`, `hangup`, `user1` and `user2`. kqueue
+  ([#15](https://pacyworld.dev/pacyworld/born/issues/15)), epoll
+  ([#16](https://pacyworld.dev/pacyworld/born/issues/16)) and Windows console
+  events ([#17](https://pacyworld.dev/pacyworld/born/issues/17)).
+- **TCP listeners:** `born.socket.Listener.openTcp(addr, opts)`, `register`,
+  `acceptNb(stream, key)` until `.want_accept`, `localAddress` and `close`,
+  with `ListenOptions.reuse_port = .balanced`. POSIX
+  ([#18](https://pacyworld.dev/pacyworld/born/issues/18)) and Windows
+  AcceptEx ([#19](https://pacyworld.dev/pacyworld/born/issues/19)).
+- **Unix domain stream sockets:** `Listener.openUnix(path, opts)` and
+  `PlainNb.startConnectUnixInto(path, ...)`. POSIX
+  ([#20](https://pacyworld.dev/pacyworld/born/issues/20)) and Windows
+  ([#21](https://pacyworld.dev/pacyworld/born/issues/21), may follow 0.3.0).
+
+Rules every implementation follows:
+
+- **Timers are for deadlines, never for driving I/O:** idle timeouts, expiry
+  sweeps, periodic aggregation. Born's rule against timer-driven I/O stands.
+- **Timer and signal events arrive through `wait()` like any other event.**
+  There are no callbacks, and no extra threads on POSIX. On IOCP a thread-pool
+  timer or console handler may only `post()`.
+- **Stale events:** an event already harvested in the current batch can
+  still name a timer or signal that was cancelled or unwatched during that
+  batch. Tolerate it, as for a purged descriptor.
+- **Timer ids** are caller-chosen and unique per port; re-adding a live id
+  replaces it. Cancelling an unknown or expired id is a no-op. A `.once`
+  timer with `after_ms = 0` is due at the next `wait()`; a `.repeat` timer
+  with `after_ms = 0` is `error.InvalidArgument`.
+- **Signals are process-wide.** At most one port watches a given signal; a
+  second gets `error.SignalInUse`. On epoll the signal must be blocked in
+  every thread (signalfd), so call `born.blockSignals` in `main` before
+  spawning threads; `watchSignal` reports `error.SignalNotBlocked` otherwise.
+  On kqueue and Windows `blockSignals` is a no-op, so portable programs call
+  it unconditionally. Unwatching restores the prior disposition.
+- **`.balanced` reuse-port** means the kernel spreads connections across
+  listeners on one port: `SO_REUSEPORT_LB` on FreeBSD, `SO_REUSEPORT` on
+  Linux. Where the platform can only share a port without balancing (macOS,
+  NetBSD, OpenBSD) or not at all (Windows), it is `error.Unsupported`.
+- **Accept drain:** on POSIX, call `acceptNb` until `.want_accept` on every
+  listener event; descriptor exhaustion is `error.ResourceExhausted`, the
+  signal to pause the listener with `unmonitorRead`. On Windows, feed listener
+  completions to `Listener.absorbCompletion` first, and on teardown absorb
+  until `pendingOps() == 0`, as for `PlainNb`.
+- **Unix socket paths** that do not fit `sun_path` are `error.NameTooLong`,
+  never truncated. `unlink_stale` replaces a socket file that refuses
+  connections and never unlinks a live listener (`error.AddressInUse`) or a
+  non-socket file (`error.PathNotASocket`). The mode is applied before
+  `listen`, so there is no window with wider permissions.
+- **Nothing fails silently:** every refusal reaches the caller as an error
+  from the call, or from the next `wait()` for deferred registrations.
 
 ## Use
 

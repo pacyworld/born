@@ -9,6 +9,7 @@ const NbRead = io.NbRead;
 const NbWrite = io.NbWrite;
 const IoError = io.IoError;
 const CompletionKind = io.CompletionKind;
+const unix_windows = @import("unix_windows.zig");
 
 const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xC8000006;
 const SO_UPDATE_CONNECT_CONTEXT: i32 = 0x7010;
@@ -31,12 +32,12 @@ const WSAID_CONNECTEX: windows.GUID = .{
     .Data4 = .{ 0x8e, 0xe9, 0x76, 0xe5, 0x8c, 0x74, 0x06, 0x3e },
 };
 
-fn ensureWsa() IoError!void {
+fn ensureWsa() error{SocketError}!void {
     var wsa: ws2.WSADATA = undefined;
-    if (ws2.WSAStartup(0x0202, &wsa) != 0) return IoError.SocketError;
+    if (ws2.WSAStartup(0x0202, &wsa) != 0) return error.SocketError;
 }
 
-fn connectEx(sock: ws2.SOCKET) IoError!ConnectExFn {
+fn connectEx(sock: ws2.SOCKET) error{SocketError}!ConnectExFn {
     var connect_ex_ptr: ?ConnectExFn = null; // resolved for this socket
     var ret: u32 = 0;
     const rc = ws2.WSAIoctl(
@@ -50,12 +51,13 @@ fn connectEx(sock: ws2.SOCKET) IoError!ConnectExFn {
         null,
         null,
     );
-    if (rc != 0 or connect_ex_ptr == null) return IoError.SocketError;
+    if (rc != 0 or connect_ex_ptr == null) return error.SocketError;
     return connect_ex_ptr.?;
 }
 
 /// Non-blocking TCP stream over overlapped WSA sockets. Owns the socket.
 pub const PlainNb = struct {
+    /// Every stream error; each method returns its own narrower set.
     pub const Error = IoError;
 
     sock: ws2.SOCKET = ws2.INVALID_SOCKET,
@@ -95,20 +97,20 @@ pub const PlainNb = struct {
     /// by-value return would orphan the connect completion's address).
     /// The socket is associated with the event port (`key` = the conn)
     /// before ConnectEx posts.
-    pub fn startConnectInto(self: *PlainNb, alloc: std.mem.Allocator, host: []const u8, port: u16, evp: *evport.EvPort, key: ?*anyopaque) IoError!void {
+    pub fn startConnectInto(self: *PlainNb, alloc: std.mem.Allocator, host: []const u8, port: u16, evp: *evport.EvPort, key: ?*anyopaque) io.ConnectError!void {
         std.debug.assert(self.sock == ws2.INVALID_SOCKET and self.pendingOps() == 0 and !self.wsa_started);
         self.* = .{};
         try ensureWsa();
         self.wsa_started = true;
         errdefer self.deinit();
         const addr_list = std.net.getAddressList(alloc, host, port) catch |err| return switch (err) {
-            error.OutOfMemory => IoError.OutOfMemory,
-            else => IoError.ConnectFailed,
+            error.OutOfMemory => error.OutOfMemory,
+            else => error.ConnectFailed,
         };
         defer addr_list.deinit();
-        if (addr_list.addrs.len == 0) return IoError.ConnectFailed;
+        if (addr_list.addrs.len == 0) return error.ConnectFailed;
 
-        var last_err: IoError = IoError.ConnectFailed;
+        var last_err: io.ConnectError = error.ConnectFailed;
         for (addr_list.addrs) |addr| {
             const s = ws2.WSASocketW(addr.any.family, ws2.SOCK.STREAM, 0, null, 0, ws2.WSA_FLAG_OVERLAPPED | ws2.WSA_FLAG_NO_HANDLE_INHERIT);
             if (s == ws2.INVALID_SOCKET) continue;
@@ -126,12 +128,12 @@ pub const PlainNb = struct {
             }
 
             self.sock = s;
-            evp.associate(self.handle(), key) catch return IoError.SocketError; // associate with the port
+            evp.associate(self.handle(), key) catch return error.SocketError; // associate with the port
 
             const cx = connectEx(s) catch {
                 _ = ws2.closesocket(s);
                 self.sock = ws2.INVALID_SOCKET;
-                last_err = IoError.SocketError;
+                last_err = error.SocketError;
                 continue;
             };
             self.conn_ov = std.mem.zeroes(windows.OVERLAPPED);
@@ -145,7 +147,7 @@ pub const PlainNb = struct {
             if (e != .WSA_IO_PENDING) {
                 _ = ws2.closesocket(s);
                 self.sock = ws2.INVALID_SOCKET;
-                last_err = IoError.ConnectFailed;
+                last_err = error.ConnectFailed;
                 continue;
             }
             self.connect_pending = true;
@@ -154,14 +156,22 @@ pub const PlainNb = struct {
         return last_err;
     }
 
-    fn postConnectSetup(self: *PlainNb) IoError!void {
-        if (ws2.setsockopt(self.sock, ws2.SOL.SOCKET, SO_UPDATE_CONNECT_CONTEXT, null, 0) != 0) return IoError.SocketError;
+    fn postConnectSetup(self: *PlainNb) error{SocketError}!void {
+        if (ws2.setsockopt(self.sock, ws2.SOL.SOCKET, SO_UPDATE_CONNECT_CONTEXT, null, 0) != 0) return error.SocketError;
+    }
+
+    /// Non-blocking connect to a Unix stream socket at `path`, completed
+    /// through the same absorbCompletion + connectDone contract as TCP.
+    /// `self` is left untouched on failure. Implemented in unix_windows.zig
+    /// (born#21).
+    pub fn startConnectUnixInto(self: *PlainNb, alloc: std.mem.Allocator, path: []const u8, evp: *evport.EvPort, key: ?*anyopaque) io.ConnectUnixError!void {
+        return unix_windows.connectInto(self, alloc, path, evp, key);
     }
 
     /// Confirm the connect after its completion (or inline completion).
-    pub fn connectDone(self: *PlainNb) IoError!void {
-        if (self.connect_err != null or !self.connect_done or self.connect_pending) return IoError.ConnectFailed;
-        if (self.sock == ws2.INVALID_SOCKET) return IoError.SocketError;
+    pub fn connectDone(self: *PlainNb) io.ConnectDoneError!void {
+        if (self.connect_err != null or !self.connect_done or self.connect_pending) return error.ConnectFailed;
+        if (self.sock == ws2.INVALID_SOCKET) return error.SocketError;
         try self.postConnectSetup();
     }
 
@@ -203,8 +213,8 @@ pub const PlainNb = struct {
         return .unknown;
     }
 
-    pub fn readNb(self: *PlainNb, out: []u8) IoError!NbRead {
-        if (self.sock == ws2.INVALID_SOCKET or self.recv_err != null) return IoError.SocketError;
+    pub fn readNb(self: *PlainNb, out: []u8) io.ReadError!NbRead {
+        if (self.sock == ws2.INVALID_SOCKET or self.recv_err != null) return error.SocketError;
         if (out.len == 0) return .{ .data = 0 };
         // Serve buffered bytes first (they arrived via completion).
         if (self.recv_have > 0) {
@@ -226,11 +236,11 @@ pub const PlainNb = struct {
             self.recv_pending = true;
             return .want_read;
         }
-        return IoError.SocketError;
+        return error.SocketError;
     }
 
-    pub fn writeNb(self: *PlainNb, data: []const u8) IoError!NbWrite {
-        if (self.sock == ws2.INVALID_SOCKET or self.send_err != null) return IoError.SocketError;
+    pub fn writeNb(self: *PlainNb, data: []const u8) io.WriteError!NbWrite {
+        if (self.sock == ws2.INVALID_SOCKET or self.send_err != null) return error.SocketError;
         // Account for a completed pending send first (completions carry the
         // byte count — inline WSASend success still queues a completion).
         if (self.send_just_done) |n| {
@@ -249,7 +259,7 @@ pub const PlainNb = struct {
             self.send_pending = true;
             return .want_write;
         }
-        return IoError.SocketError;
+        return error.SocketError;
     }
 
     /// In-flight op count (for the core's deferred reap).
