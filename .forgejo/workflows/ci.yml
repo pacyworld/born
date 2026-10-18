@@ -3,8 +3,54 @@ on:
   push:
   pull_request:
 
+env:
+  # Pacy World Root CA, the root of the pacyworld.dev chain. The artifact
+  # actions run under Node, which neither reads the runner02 Windows store
+  # nor finds this root in the runner03 container, so the runtime jobs hand
+  # it to Node through NODE_EXTRA_CA_CERTS after checking its fingerprint.
+  PACYWORLD_ROOT_CA_SHA256: F6:56:80:C5:A0:CC:7C:AC:7E:73:CA:3C:FA:45:3E:7E:81:D9:59:40:0C:92:3B:AA:EA:F9:9D:CF:F4:0D:28:A8
+  PACYWORLD_ROOT_CA: |
+    -----BEGIN CERTIFICATE-----
+    MIIGDDCCA/SgAwIBAgIJAPjlE9EKnbAtMA0GCSqGSIb3DQEBCwUAMIGSMQswCQYD
+    VQQGEwJVUzEQMA4GA1UECAwHRmxvcmlkYTEPMA0GA1UEBwwGTmFwbGVzMSkwJwYD
+    VQQKDCBUaGUgRGFuaWVsIE1vcmFudGUgQ29tcGFueSwgSW5jLjEYMBYGA1UECwwP
+    UGFjeSBXb3JsZCwgTExDMRswGQYDVQQDDBJQYWN5IFdvcmxkIFJvb3QgQ0EwHhcN
+    MTgwNzA3MTczNDAxWhcNMzgwNzAyMTczNDAxWjCBkjELMAkGA1UEBhMCVVMxEDAO
+    BgNVBAgMB0Zsb3JpZGExDzANBgNVBAcMBk5hcGxlczEpMCcGA1UECgwgVGhlIERh
+    bmllbCBNb3JhbnRlIENvbXBhbnksIEluYy4xGDAWBgNVBAsMD1BhY3kgV29ybGQs
+    IExMQzEbMBkGA1UEAwwSUGFjeSBXb3JsZCBSb290IENBMIICIjANBgkqhkiG9w0B
+    AQEFAAOCAg8AMIICCgKCAgEAxcG5VqHdWQ00Av5k8qQRtYit6ihHNCRBrOQqvrNV
+    V2pTaDgTc3HjgDhb3KtZpV/63EwTGkg2M+amm4XkCcwI2STiTLzKZ+wmuYf9/udQ
+    tjw5Br0p3T2c9HvZauNqzZ9L3e0HiI5+F4GI7rAjuRNU5oxD8MrfGXap6JgV8V8o
+    1bNkRI9xCYg2ZGCvJLWGBJK0fKxbl6N7A2Vh4FM4VzjMBxElUBYn4iazsyqsmfY0
+    eN1Ln6Yg64n34xYSPuJyEzhSbxLS0wMQO5N3d7UrYcK7REE/PR3lM8naqb/MWN6l
+    AeEB2cH138x1tPQywAk4BGWNaPndrCRnCFXkoianMgj2PztDKa5gk6l9WqSmwo8M
+    FlNhKknYWoaQ75Wz16goG3w1bkWDB/Wc5G+5GC2LD/WZNHAR6rA0tOK785pE/Lmb
+    aWhyqhndMTfRlaAlzEblzAoZX+sSB5ocs0AXf3e1EwV22E3UH+cghORp7z1CfbQI
+    vGF7fNG8c8tTzrgV9ifEphmZtDRrmtcbYYXJubdEKZmxahDN7QjVEnkXrdsuc8b7
+    Egz+KetGjj6n0tIRWCCxrIz9kOf652TBlJc/AWCnzDLgqv+CSw+Wrmm92dGfSgI4
+    W3todx0BW1XdMldbmB3Afo5o5gfc77QIcwSVSYJByiZDvkj9OPC48Hf1/1uGoe+r
+    4FsCAwEAAaNjMGEwHQYDVR0OBBYEFHoERjvfovVsJyua3AVoSD3edl25MB8GA1Ud
+    IwQYMBaAFHoERjvfovVsJyua3AVoSD3edl25MA8GA1UdEwEB/wQFMAMBAf8wDgYD
+    VR0PAQH/BAQDAgGGMA0GCSqGSIb3DQEBCwUAA4ICAQAe3IsTEblRYEGY/MICG8cg
+    l2SfqxYx0t9qvhCz/gLqvA8fiCijneAG3gR2trrHwTAQC5+arWUYs9yy8HilWTul
+    6HempVgguoz/XPqHsAonBW8vaImnSSVOsXIQkqkEX7g+HAAe4RMz71ykIXiWC345
+    LCjBVA3XGFNSIuQKchtzpchJGyVqqQxfbmeQt8rGvHkDkpCH3I8cO/J2xZW4n3bC
+    HUDj0oXuyW7zlKv4ytHK/TN+HYgMwXCd1LITK87OCmf4izLLdNxBwsQnWeaTNWS9
+    7wUGa0E9mWvuKONxx/JMVpUD+ewJQOD/JIYZumzNGBH3k0vl9pNtRAqeE03HmRCy
+    fgxWv8uJ/wz8mo3W8BRFnAd1AyJy6GPyLtMKa1yr11ITY0dJ/BTADmdO/6VKmlk5
+    sla/THr8mR4QYCUWE+zfU8nRGKLmJADg3lQJg0oC8HDTDyxZnAlM+0cFLanc5gDx
+    Q2/u+Z3fKyKGBaOzdruG5hKEWZ1E6bmNH2ttl/nkhiDl1tNFF4FWpC30N6PG1u1/
+    iJC/kgtEf2bSkfbm8xyrznWAygcinPSiH36C46M7y4GKp2+Aq6r95Q8b2YO69Opr
+    I/pDB/oQiCQ78Dp7e4yxY+GLR71QWf/wA5Tw1FbzqPvGnZ+tK//ZKGDeqmuDBCRF
+    3NDrfSHlK+Nk91FpLogS9g==
+    -----END CERTIFICATE-----
+
 jobs:
+  # runner01 (FreeBSD): kqueue runtime tests, the seven-target compile gate,
+  # and the Linux and Windows test executables for the runtime jobs below.
   build:
+    name: FreeBSD tests and cross-builds (runner01)
     runs-on: FreeBSD
     steps:
       - name: Checkout
@@ -12,6 +58,7 @@ jobs:
 
       - name: Verify Zig 0.15.2
         run: |
+          echo "host: $(uname -srm), commit $GITHUB_SHA"
           zig version
           test "$(zig version)" = "0.15.2"
 
@@ -25,7 +72,103 @@ jobs:
         run: zig build check-targets --summary all
 
       - name: Build Linux runtime test executable
-        run: zig build test-bin -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe --prefix zig-out/linux --summary all
+        run: |
+          zig build test-bin -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe --prefix zig-out/linux --summary all
+          cd zig-out/linux/bin && sha256sum born-tests | tee born-tests.sha256
 
       - name: Build Windows runtime test executable
-        run: zig build test-bin -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe --prefix zig-out/windows --summary all
+        run: |
+          zig build test-bin -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe --prefix zig-out/windows --summary all
+          cd zig-out/windows/bin && sha256sum born-tests.exe | tee born-tests.exe.sha256
+
+      - name: Upload Linux test executable
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: born-tests-x86_64-linux-gnu
+          path: |
+            zig-out/linux/bin/born-tests
+            zig-out/linux/bin/born-tests.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Windows test executable
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: born-tests-x86_64-windows-gnu
+          path: |
+            zig-out/windows/bin/born-tests.exe
+            zig-out/windows/bin/born-tests.exe.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  # runner03 (Ubuntu 24.04): epoll runtime tests. The job container shares
+  # the runner's kernel, so the syscalls under test are real Linux ones.
+  linux-runtime:
+    name: Linux runtime tests (runner03, ubuntu-24.04)
+    runs-on: ubuntu-24.04
+    container: node:24-bookworm
+    needs: build
+    timeout-minutes: 15
+    steps:
+      - name: Trust the Pacy World Root CA for Node
+        run: |
+          pem="$RUNNER_TEMP/pacyworld-root.pem"
+          printf '%s' "$PACYWORLD_ROOT_CA" > "$pem"
+          node -e 'const c = new (require("crypto").X509Certificate)(require("fs").readFileSync(process.argv[1])); if (c.fingerprint256 !== process.argv[2]) { console.error("root CA fingerprint mismatch: " + c.fingerprint256); process.exit(1); }' "$pem" "$PACYWORLD_ROOT_CA_SHA256"
+          echo "NODE_EXTRA_CA_CERTS=$pem" >> "$GITHUB_ENV"
+
+      - name: Download Linux test executable
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: born-tests-x86_64-linux-gnu
+          path: born-tests
+
+      - name: Run born-tests
+        run: |
+          cd born-tests
+          sha256sum -c born-tests.sha256
+          chmod +x born-tests
+          echo "host: $(uname -srm), $(. /etc/os-release && echo "$PRETTY_NAME") container, commit $GITHUB_SHA"
+          ./born-tests 2>&1 | tee born-tests.log
+          summary=$(grep -E '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$' born-tests.log) || { echo "born-tests printed no passing summary line"; exit 1; }
+          echo "runtime evidence (x86_64-linux-gnu, epoll): $summary"
+
+  # runner02 (Windows Server 2022, host mode): IOCP runtime tests.
+  windows-runtime:
+    name: Windows runtime tests (runner02, windows-2022)
+    runs-on: windows-2022
+    needs: build
+    timeout-minutes: 15
+    steps:
+      - name: Trust the Pacy World Root CA for Node
+        run: |
+          $pem = Join-Path $env:RUNNER_TEMP 'pacyworld-root.pem'
+          Set-Content -Path $pem -Value $env:PACYWORLD_ROOT_CA -Encoding ascii -NoNewline
+          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList $pem
+          $digest = [System.Security.Cryptography.SHA256]::Create().ComputeHash($cert.RawData)
+          $fingerprint = ($digest | ForEach-Object { $_.ToString('X2') }) -join ':'
+          if ($fingerprint -ne $env:PACYWORLD_ROOT_CA_SHA256) { throw "root CA fingerprint mismatch: $fingerprint" }
+          Add-Content -Path $env:GITHUB_ENV -Value "NODE_EXTRA_CA_CERTS=$pem" -Encoding ascii
+
+      - name: Download Windows test executable
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: born-tests-x86_64-windows-gnu
+          path: born-tests
+
+      - name: Run born-tests.exe
+        run: |
+          cd born-tests
+          $expected = (Get-Content born-tests.exe.sha256 -Raw).Split(' ')[0].Trim().ToUpperInvariant()
+          $actual = (Get-FileHash born-tests.exe -Algorithm SHA256).Hash
+          if ($actual -ne $expected) { throw "born-tests.exe sha256 $actual does not match the build ($expected)" }
+          "born-tests.exe: OK ($actual)"
+          "host: $([System.Environment]::OSVersion.VersionString), commit $env:GITHUB_SHA"
+          # cmd redirection keeps the test runner's stderr out of PowerShell's error stream.
+          cmd /c "born-tests.exe > born-tests.log 2>&1"
+          $rc = $LASTEXITCODE
+          Get-Content born-tests.log
+          if ($rc -ne 0) { throw "born-tests.exe exited with $rc" }
+          $summary = Select-String -Path born-tests.log -Pattern '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$'
+          if (-not $summary) { throw "born-tests.exe printed no passing summary line" }
+          "runtime evidence (x86_64-windows-gnu, IOCP): $($summary.Line)"
