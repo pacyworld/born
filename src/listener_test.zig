@@ -188,3 +188,83 @@ test "listener: .balanced is Unsupported where the kernel cannot balance" {
     try closeListener(&port, &l);
     try std.testing.expectError(error.Unsupported, Listener.openTcp(alloc, any, .{ .reuse_port = .balanced }));
 }
+
+/// A born handle as a socket for std.posix calls (a HANDLE on Windows).
+fn socketOf(h: born.Handle) std.posix.socket_t {
+    return if (is_windows) @ptrCast(h) else h;
+}
+
+/// The next event for `l`, within five seconds.
+fn waitFor(port: *born.EvPort, l: *Listener) !born.Event {
+    var events: [8]born.Event = undefined;
+    var timer = try std.time.Timer.start();
+    while (true) {
+        const elapsed = timer.read() / std.time.ns_per_ms;
+        if (elapsed >= 5000) return error.ListenerEventTimeout;
+        const n = try port.wait(&events, @intCast(5000 - elapsed));
+        for (events[0..n]) |ev| {
+            if (ev.udata == @as(?*anyopaque, l)) return ev;
+        }
+    }
+}
+
+test "listener: an accepted stream reports its peer address" {
+    try wsaStart();
+    defer wsaStop();
+    var port = try born.EvPort.init(alloc);
+    defer port.deinit();
+    var l = try openOrSkip(try std.net.Address.parseIp4("127.0.0.1", 0), .{});
+    try l.register(&port, &l);
+    var streams = [_]PlainNb{.{}};
+    var acceptor: Acceptor = .{ .listener = &l, .streams = &streams };
+    defer acceptor.deinit();
+    var client = try std.net.tcpConnectToAddress(try l.localAddress());
+    defer client.close();
+
+    try pump(&port, &.{&acceptor}, 1, 5000);
+    var peer: std.posix.sockaddr.storage = undefined;
+    var peer_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+    try std.posix.getpeername(socketOf(streams[0].handle()), @ptrCast(&peer), &peer_len);
+    var local: std.posix.sockaddr.storage = undefined;
+    var local_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+    try std.posix.getsockname(client.handle, @ptrCast(&local), &local_len);
+    try std.testing.expect(std.net.Address.initPosix(@ptrCast(&peer)).eql(std.net.Address.initPosix(@ptrCast(&local))));
+    try closeListener(&port, &l);
+}
+
+test "listener: descriptor exhaustion is ResourceExhausted and the drain resumes" {
+    // RLIMIT_NOFILE is POSIX; AcceptEx creates its sockets ahead of time.
+    if (is_windows) return error.SkipZigTest;
+    var port = try born.EvPort.init(alloc);
+    defer port.deinit();
+    var l = try openOrSkip(try std.net.Address.parseIp4("127.0.0.1", 0), .{});
+    try l.register(&port, &l);
+    const n = 4;
+    var streams = [_]PlainNb{.{}} ** n;
+    var acceptor: Acceptor = .{ .listener = &l, .streams = &streams };
+    defer acceptor.deinit();
+    var clients: [n]std.net.Stream = undefined;
+    try connectClients(&clients, try l.localAddress());
+    defer for (&clients) |*c| c.close();
+    const ev = try waitFor(&port, &l);
+
+    // Every descriptor below the lowest free one is open, so a limit equal
+    // to it fails the next allocation with EMFILE.
+    const saved = try std.posix.getrlimit(.NOFILE);
+    const probe = try std.posix.dup(l.handle());
+    std.posix.close(probe);
+    var low = saved;
+    low.cur = @intCast(probe);
+    try std.posix.setrlimit(.NOFILE, low);
+    const exhausted = acceptor.onEvent(ev);
+    try std.posix.setrlimit(.NOFILE, saved);
+    try std.testing.expectError(error.ResourceExhausted, exhausted);
+    try std.testing.expectEqual(@as(usize, 0), acceptor.count);
+
+    // The connections stayed queued; resuming drains them without a new edge.
+    // Darwin's kernel drops the connection whose accept hit the limit.
+    try std.testing.expect(try acceptor.onEvent(ev));
+    const kept: usize = if (builtin.os.tag.isDarwin()) n - 1 else n;
+    try std.testing.expectEqual(kept, acceptor.count);
+    try closeListener(&port, &l);
+}
