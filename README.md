@@ -21,6 +21,23 @@ The build rejects missing or extra target rows in this table.
 Other Apple/BSD OS tags select kqueue but are not in the checked matrix;
 selection alone is not a compilation or runtime guarantee.
 
+### Runtime evidence
+
+CI runs the test suite on FreeBSD, Linux and Windows for every push and pull
+request (procedure in `AGENTS.md`). This table records the last run on each
+OS per primitive, and lists real runs only.
+
+| backend | primitive | last runtime run | date | commit |
+|---|---|---|---|---|
+| kqueue, FreeBSD 15 (runner01) | event port, wake, plain TCP stream | [run 39, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/39/jobs/0): Debug and ReleaseSafe, 29 passed, 26 skipped, 0 failed | 2026-10-18 | [3ed3785](https://pacyworld.dev/pacyworld/born/commit/3ed378538592c0f8c3a0598c957409dd6becfd57) |
+| epoll, Linux 6.8 (runner03, Ubuntu 24.04) | event port, wake, plain TCP stream | [run 39, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/39/jobs/1): ReleaseSafe, 28 passed, 26 skipped, 0 failed | 2026-10-18 | [3ed3785](https://pacyworld.dev/pacyworld/born/commit/3ed378538592c0f8c3a0598c957409dd6becfd57) |
+| IOCP, Windows Server 2022 build 20348 (runner02) | event port, wake, plain TCP stream | [run 39, Windows job](https://pacyworld.dev/pacyworld/born/actions/runs/39/jobs/2): ReleaseSafe, 21 passed, 27 skipped, 0 failed | 2026-10-18 | [3ed3785](https://pacyworld.dev/pacyworld/born/commit/3ed378538592c0f8c3a0598c957409dd6becfd57) |
+| kqueue, epoll, IOCP | timers, signals, TCP listener, Unix sockets | none: not implemented yet, their contract tests skip | n/a | n/a |
+
+Commit 3ed3785 changes only the CI workflow; its library and tests are
+those of master d1017b8. Skips are platform-only tests and the 0.3.0
+contract tests that wait for their implementations.
+
 ## Programming model
 
 The raw event port has a uniform **type surface**, not identical I/O semantics.
@@ -275,10 +292,11 @@ zig build test-bin -Dtarget=x86_64-linux-gnu --prefix zig-out/linux
 
 Requires Zig 0.15.2. The module propagates its libc or Winsock/kernel32 linkage.
 Forgejo CI checks the exact toolchain version, runs FreeBSD Debug/ReleaseSafe
-tests, compiles the seven-target test matrix and links Linux/Windows test
-executables. `check-targets` is deliberately compile-only, not evidence that
-target libraries link or that tests ran on those operating systems. Run the
-`test-bin` output on its matching platform for runtime verification.
+tests, compiles the seven-target test matrix, links the Linux/Windows test
+executables and runs them on an Ubuntu 24.04 and a Windows Server 2022 runner.
+`check-targets` is deliberately compile-only, not evidence that target
+libraries link or that tests ran on those operating systems. Outside CI, run
+the `test-bin` output on its matching platform (hosts in `AGENTS.md`).
 
 ## Provenance
 

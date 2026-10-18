@@ -58,6 +58,7 @@ jobs:
 
       - name: Verify Zig 0.15.2
         run: |
+          echo "host: $(uname -srm), commit $GITHUB_SHA"
           zig version
           test "$(zig version)" = "0.15.2"
 
