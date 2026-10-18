@@ -29,6 +29,9 @@
 //!     readiness sources: kqueue reports them perpetually ready natively,
 //!     and epoll emulates exactly that with always-ready pseudo
 //!     registrations (raw epoll_ctl would refuse them with EPERM).
+//!   - 0.3.0 timers, signals, TCP listeners and Unix sockets are declared
+//!     with their final signatures and return error.Unsupported until each
+//!     backend's implementation lands (README, "Planned in 0.3.0").
 //!
 //! ## Provenance
 //!
@@ -71,7 +74,19 @@ const impl = switch (builtin.os.tag) {
 pub const EvPort = impl.EvPort;
 pub const Handle = @import("types.zig").Handle;
 pub const Event = @import("types.zig").Event;
+pub const Signal = @import("types.zig").Signal;
+pub const TimerMode = @import("types.zig").TimerMode;
+/// Per-operation error sets. Each EvPort method returns only its own set;
+/// `Error` is their union.
+pub const InitError = impl.InitError;
+pub const WaitError = impl.WaitError;
+pub const TimerError = impl.TimerError;
+pub const SignalError = impl.SignalError;
 pub const Error = impl.Error;
+/// Block signals in the calling thread before watching them. Required on
+/// epoll (signalfd), a no-op on kqueue and Windows. Call it in `main`
+/// before spawning threads.
+pub const blockSignals = impl.blockSignals;
 pub const socket = @import("socket.zig");
 
 /// Which backend this build selected. Useful in diagnostics so a program can
@@ -90,4 +105,11 @@ test {
     _ = impl;
     _ = @import("api_test.zig");
     _ = @import("socket_test.zig");
+    _ = @import("timer_heap.zig");
+    // 0.3.0 contract tests: they skip while the backend returns
+    // error.Unsupported and run once the implementation issue lands.
+    _ = @import("timer_test.zig");
+    _ = @import("signal_test.zig");
+    _ = @import("listener_test.zig");
+    _ = @import("unix_test.zig");
 }

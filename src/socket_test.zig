@@ -188,10 +188,17 @@ const Pair = struct {
 };
 
 test "plain socket has the same companion API on every target" {
-    try std.testing.expect(@TypeOf(PlainNb.startConnectInto) == fn (*PlainNb, std.mem.Allocator, []const u8, u16, *born.EvPort, ?*anyopaque) socket.IoError!void);
-    try std.testing.expect(@TypeOf(PlainNb.connectDone) == fn (*PlainNb) socket.IoError!void);
-    try std.testing.expect(@TypeOf(PlainNb.readNb) == fn (*PlainNb, []u8) socket.IoError!socket.NbRead);
-    try std.testing.expect(@TypeOf(PlainNb.writeNb) == fn (*PlainNb, []const u8) socket.IoError!socket.NbWrite);
+    try std.testing.expect(@TypeOf(PlainNb.startConnectInto) == fn (*PlainNb, std.mem.Allocator, []const u8, u16, *born.EvPort, ?*anyopaque) socket.ConnectError!void);
+    try std.testing.expect(@TypeOf(PlainNb.connectDone) == fn (*PlainNb) socket.ConnectDoneError!void);
+    try std.testing.expect(@TypeOf(PlainNb.readNb) == fn (*PlainNb, []u8) socket.ReadError!socket.NbRead);
+    try std.testing.expect(@TypeOf(PlainNb.writeNb) == fn (*PlainNb, []const u8) socket.WriteError!socket.NbWrite);
+    // Each operation's set is exactly what it can return, so consumers can
+    // switch over it with no else prong.
+    try std.testing.expect(socket.ReadError == error{SocketError});
+    try std.testing.expect(socket.WriteError == error{SocketError});
+    try std.testing.expect(socket.ConnectDoneError == error{ ConnectFailed, SocketError });
+    try std.testing.expect(socket.ConnectError == error{ ConnectFailed, SocketError, OutOfMemory });
+    try std.testing.expect(PlainNb.Error == socket.IoError);
     try std.testing.expect(@TypeOf(PlainNb.absorbCompletion) == fn (*PlainNb, ?*windows.OVERLAPPED, usize, ?usize) socket.CompletionKind);
     try std.testing.expect(@TypeOf(PlainNb.pendingOps) == fn (*const PlainNb) usize);
     try std.testing.expect(@TypeOf(PlainNb.handle) == fn (*const PlainNb) born.Handle);
@@ -199,7 +206,7 @@ test "plain socket has the same companion API on every target" {
         try std.testing.expect(@TypeOf(@field(PlainNb, name)) == fn (*PlainNb) void);
     }
     if (!is_windows) {
-        try std.testing.expect(@TypeOf(PlainNb.startConnect) == fn (std.mem.Allocator, []const u8, u16) socket.IoError!PlainNb);
+        try std.testing.expect(@TypeOf(PlainNb.startConnect) == fn (std.mem.Allocator, []const u8, u16) socket.ConnectError!PlainNb);
     }
 }
 

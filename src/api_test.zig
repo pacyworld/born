@@ -15,11 +15,11 @@ test "reactor has exact non-generic handle and event API" {
     try std.testing.expect(Handle == @import("types.zig").Handle);
     try std.testing.expect(backend.Event == @import("types.zig").Event);
     if (builtin.os.tag == .windows) {
-        try std.testing.expect(@TypeOf(Port.associate) == fn (*Port, Handle, ?*anyopaque) backend.Error!void);
+        try std.testing.expect(@TypeOf(Port.associate) == fn (*Port, Handle, ?*anyopaque) backend.AssociateError!void);
         try std.testing.expect(@TypeOf(Port.post) == fn (*Port, *anyopaque, ?*std.os.windows.OVERLAPPED, usize) void);
         try std.testing.expect(@TypeOf(Port.wakeKey) == fn () *anyopaque);
     }
-    try std.testing.expect(@TypeOf(Port.init) == fn (std.mem.Allocator) backend.Error!Port);
+    try std.testing.expect(@TypeOf(Port.init) == fn (std.mem.Allocator) backend.InitError!Port);
     try std.testing.expect(@TypeOf(Port.deinit) == fn (*Port) void);
     inline for (.{ "monitorRead", "wantWrite" }) |name| {
         try std.testing.expect(@TypeOf(@field(Port, name)) == fn (*Port, Handle, ?*anyopaque) void);
@@ -28,16 +28,35 @@ test "reactor has exact non-generic handle and event API" {
         try std.testing.expect(@TypeOf(@field(Port, name)) == fn (*Port, Handle) void);
     }
     try std.testing.expect(@TypeOf(Port.wake) == fn (*Port) void);
-    try std.testing.expect(@TypeOf(Port.wait) == fn (*Port, []backend.Event, ?i32) backend.Error!usize);
+    try std.testing.expect(@TypeOf(Port.wait) == fn (*Port, []backend.Event, ?i32) backend.WaitError!usize);
+    const types = @import("types.zig");
+    try std.testing.expect(@TypeOf(Port.addTimer) == fn (*Port, u32, ?*anyopaque, u32, types.TimerMode) types.TimerError!void);
+    try std.testing.expect(@TypeOf(Port.cancelTimer) == fn (*Port, u32) void);
+    try std.testing.expect(@TypeOf(Port.watchSignal) == fn (*Port, types.Signal, ?*anyopaque) types.SignalError!void);
+    try std.testing.expect(@TypeOf(Port.unwatchSignal) == fn (*Port, types.Signal) void);
+    try std.testing.expect(@TypeOf(backend.blockSignals) == fn ([]const types.Signal) types.SignalError!void);
+    // wait() reports only loop failures; primitive refusals stay with the
+    // call that caused them.
+    inline for (.{ "Unsupported", "InvalidArgument", "SignalInUse", "SignalNotBlocked" }) |name| {
+        inline for (@typeInfo(backend.WaitError).error_set.?) |e| {
+            try std.testing.expect(!std.mem.eql(u8, e.name, name));
+        }
+    }
+    try std.testing.expect(backend.Error == (backend.InitError || backend.WaitError || types.TimerError || types.SignalError ||
+        (if (builtin.os.tag == .windows) backend.AssociateError else error{})));
     const event = backend.Event{};
     try std.testing.expect(@TypeOf(event.udata) == ?*anyopaque);
     try std.testing.expect(@TypeOf(event.err_no) == usize);
     try std.testing.expect(@TypeOf(event.overlapped) == ?*std.os.windows.OVERLAPPED);
     try std.testing.expect(@TypeOf(event.bytes) == usize);
-    inline for (.{ "readable", "writable", "eof", "err", "wake" }) |name| {
+    inline for (.{ "readable", "writable", "eof", "err", "wake", "timer" }) |name| {
         try std.testing.expect(@TypeOf(@field(event, name)) == bool);
         try std.testing.expect(!@field(event, name));
     }
+    try std.testing.expect(@TypeOf(event.signal) == ?types.Signal);
+    try std.testing.expect(event.signal == null);
+    try std.testing.expect(@TypeOf(event.fired) == u32);
+    try std.testing.expectEqual(@as(u32, 0), event.fired);
     try std.testing.expect(event.udata == null);
     try std.testing.expect(event.overlapped == null);
     try std.testing.expectEqual(@as(usize, 0), event.err_no);

@@ -18,15 +18,24 @@
 //   - Closing fds need no unmonitoring: close(2) removes all filters. The
 //     core defers close() until just after a wait() flush so staged entries
 //     never reference a closed (and possibly recycled) fd.
+//   - Timers and signals (timer_kqueue.zig, signal_kqueue.zig) register
+//     through stageRaw like any other change. wait() translates
+//     EVFILT_TIMER and EVFILT_SIGNAL into Event.timer/.signal/.fired after
+//     each module's observe() hook has seen the kevent.
 
 const std = @import("std");
+const types = @import("types.zig");
+const timer_kqueue = @import("timer_kqueue.zig");
+const signal_kqueue = @import("signal_kqueue.zig");
 
 // Use the target's struct kevent: FreeBSD 12+ needs its extended 64-byte
 // layout (ext[4]), while NetBSD has wider filter/flags fields. A wrong
 // stride corrupts multi-entry changelists and event buffers.
-const Kevent = std.posix.Kevent;
+pub const Kevent = std.posix.Kevent;
 const EVFILT_READ = std.posix.system.EVFILT.READ;
 const EVFILT_WRITE = std.posix.system.EVFILT.WRITE;
+pub const EVFILT_TIMER = std.posix.system.EVFILT.TIMER;
+pub const EVFILT_SIGNAL = std.posix.system.EVFILT.SIGNAL;
 
 const EV_ADD = std.posix.system.EV.ADD;
 const EV_DELETE = std.posix.system.EV.DELETE;
@@ -52,15 +61,23 @@ const netbsd = struct {
 // Target-native pipe flags; std.posix.pipe2 uses pipe + fcntl on macOS.
 const PIPE2_FLAGS: std.posix.O = .{ .NONBLOCK = true, .CLOEXEC = true };
 
-pub const Handle = @import("types.zig").Handle;
-pub const Event = @import("types.zig").Event;
+pub const Handle = types.Handle;
+pub const Event = types.Event;
+pub const Signal = types.Signal;
+pub const TimerMode = types.TimerMode;
 
-pub const Error = error{
-    KqueueFailed,
-    PipeFailed,
-    WaitFailed,
-    OutOfMemory,
-};
+pub const InitError = error{ KqueueFailed, PipeFailed };
+/// A stashed allocation failure is reported as OutOfMemory; kernel
+/// rejections of staged changes arrive as Event.err instead.
+pub const WaitError = error{ WaitFailed, OutOfMemory };
+pub const TimerError = types.TimerError;
+pub const SignalError = types.SignalError;
+/// Every error this backend can return.
+pub const Error = InitError || WaitError || TimerError || SignalError;
+
+/// Block `sigs` in the calling thread so a signal-watching port can receive
+/// them. Call it in `main` before spawning threads; see signal_kqueue.zig.
+pub const blockSignals = signal_kqueue.blockSignals;
 
 /// Stable address used as the wake pipe's udata tag (module-level so a
 /// by-value EvPort return never leaves it dangling).
@@ -80,24 +97,39 @@ pub const EvPort = struct {
     /// Stashed registration failure (the IOCP backend's shape): an
     /// allocation failure in monitor*/want*/cancel*/unmonitor* is returned
     /// by the next non-empty wait() instead of silently dropping the change.
-    pending_error: ?Error = null,
+    pending_error: ?WaitError = null,
+    /// Timer bookkeeping, owned by timer_kqueue.zig.
+    timers: timer_kqueue.State = .{},
+    /// Signal-watch bookkeeping, owned by signal_kqueue.zig.
+    signals: signal_kqueue.State = .{},
 
-    pub fn init(alloc: std.mem.Allocator) Error!EvPort {
-        const kq = std.posix.kqueue() catch return Error.KqueueFailed;
+    pub fn init(alloc: std.mem.Allocator) InitError!EvPort {
+        const kq = std.posix.kqueue() catch return InitError.KqueueFailed;
         errdefer _ = std.c.close(kq);
 
-        const fds = std.posix.pipe2(PIPE2_FLAGS) catch return Error.PipeFailed;
+        const fds = std.posix.pipe2(PIPE2_FLAGS) catch return InitError.PipeFailed;
         errdefer {
             _ = std.c.close(fds[0]);
             _ = std.c.close(fds[1]);
         }
 
-        var self = EvPort{ .kq = kq, .alloc = alloc, .wake_r = fds[0], .wake_w = fds[1] };
+        var self = EvPort{
+            .kq = kq,
+            .alloc = alloc,
+            .wake_r = fds[0],
+            .wake_w = fds[1],
+            .timers = timer_kqueue.State.init(alloc),
+            .signals = signal_kqueue.State.init(alloc),
+        };
         self.monitorRead(self.wake_r, @as(?*anyopaque, &wake_sentinel));
         return self;
     }
 
     pub fn deinit(self: *EvPort) void {
+        // Signal dispositions are process-wide: restore them while the
+        // port can still describe what it changed.
+        self.signals.deinit(self);
+        self.timers.deinit(self);
         if (self.kq >= 0) _ = std.c.close(self.kq);
         if (self.wake_r >= 0) _ = std.c.close(self.wake_r);
         if (self.wake_w >= 0) _ = std.c.close(self.wake_w);
@@ -120,7 +152,7 @@ pub const EvPort = struct {
         // Reserve the dedup slot before staging so the armed bit and the
         // staged change agree even when the stage append later fails.
         self.armed_write.ensureUnusedCapacity(self.alloc, 1) catch {
-            self.pending_error = Error.OutOfMemory;
+            self.pending_error = WaitError.OutOfMemory;
             return;
         };
         self.armed_write.putAssumeCapacity(fd, {});
@@ -142,12 +174,15 @@ pub const EvPort = struct {
     /// closed, plus its armed-write bit. close(2) itself removes the fd's
     /// live filters; this prevents staged entries from applying to a
     /// recycled fd number at the next wait() flush.
+    /// Only descriptor filters match: a staged timer or signal whose ident
+    /// equals the fd number is not the fd's.
     pub fn purgeFd(self: *EvPort, fd: Handle) void {
         _ = self.armed_write.remove(fd);
         const ident: usize = @intCast(fd);
         var i: usize = 0;
         while (i < self.changes.items.len) {
-            if (self.changes.items[i].ident == ident) {
+            const kev = self.changes.items[i];
+            if (kev.ident == ident and (kev.filter == EVFILT_READ or kev.filter == EVFILT_WRITE)) {
                 _ = self.changes.swapRemove(i);
             } else {
                 i += 1;
@@ -171,9 +206,38 @@ pub const EvPort = struct {
         return kev;
     }
 
+    /// Arm a timer. `id` is caller-chosen and unique per port; re-adding a
+    /// live id replaces it. Timers are deadlines, never I/O drivers.
+    pub fn addTimer(self: *EvPort, id: u32, udata: ?*anyopaque, after_ms: u32, mode: TimerMode) TimerError!void {
+        return timer_kqueue.add(self, id, udata, after_ms, mode);
+    }
+
+    /// Disarm a timer. Unknown or already-expired ids are a no-op.
+    pub fn cancelTimer(self: *EvPort, id: u32) void {
+        timer_kqueue.cancel(self, id);
+    }
+
+    /// Deliver `sig` as Event.signal. Process-wide: one port per signal.
+    pub fn watchSignal(self: *EvPort, sig: Signal, udata: ?*anyopaque) SignalError!void {
+        return signal_kqueue.watch(self, sig, udata);
+    }
+
+    /// Stop watching `sig` and restore its prior disposition. Unwatched
+    /// signals are a no-op.
+    pub fn unwatchSignal(self: *EvPort, sig: Signal) void {
+        signal_kqueue.unwatch(self, sig);
+    }
+
+    /// Internal hook for timer_kqueue.zig and signal_kqueue.zig: stage an
+    /// arbitrary change for the next wait(). Never call kevent() to
+    /// register; an allocation failure is stashed like any other stage.
+    pub fn stageRaw(self: *EvPort, kev: Kevent) void {
+        self.stage(kev);
+    }
+
     fn stage(self: *EvPort, kev: Kevent) void {
         self.changes.append(self.alloc, kev) catch {
-            self.pending_error = Error.OutOfMemory;
+            self.pending_error = WaitError.OutOfMemory;
         };
     }
 
@@ -181,7 +245,7 @@ pub const EvPort = struct {
     /// timeout_ms: null = block until an event; 0 = harvest without blocking.
     /// A stashed allocation failure is reported here, once, ahead of the
     /// syscall — an empty wait neither consumes nor reports it.
-    pub fn wait(self: *EvPort, events: []Event, timeout_ms: ?i32) Error!usize {
+    pub fn wait(self: *EvPort, events: []Event, timeout_ms: ?i32) WaitError!usize {
         if (events.len == 0) return 0;
         if (self.pending_error) |err| {
             self.pending_error = null;
@@ -205,7 +269,7 @@ pub const EvPort = struct {
         if (n < 0) {
             const e = std.posix.errno(@as(isize, n));
             if (e == .INTR) return 0;
-            return Error.WaitFailed;
+            return WaitError.WaitFailed;
         }
 
         var out: usize = 0;
@@ -224,20 +288,55 @@ pub const EvPort = struct {
                 // One-shot consumed: the writer must re-arm explicitly.
                 _ = self.armed_write.remove(@intCast(kev.ident));
             }
-            // A failed change (e.g. EV_ADD on a dead fd) must not masquerade
-            // as readiness: keep readable/writable clear when err is set.
-            const is_err = (kev.flags & EV_ERROR) != 0;
-            events[out] = .{
-                .udata = @ptrFromInt(kev.udata),
-                .readable = !is_err and kev.filter == EVFILT_READ,
-                .writable = !is_err and kev.filter == EVFILT_WRITE,
-                .eof = (kev.flags & EV_EOF) != 0,
-                .err = is_err,
-                .err_no = if (is_err) @intCast(kev.data) else 0,
-            };
+            // The owning module sees its kevents first (live-id bookkeeping,
+            // or suppressing an expected ENOENT from a late delete).
+            const keep = if (kev.filter == EVFILT_TIMER)
+                timer_kqueue.observe(self, kev)
+            else if (kev.filter == EVFILT_SIGNAL)
+                signal_kqueue.observe(self, kev)
+            else
+                true;
+            if (!keep) continue;
+            events[out] = translate(kev);
             out += 1;
         }
         return out;
+    }
+
+    /// kevent to Event. A failed change (e.g. EV_ADD on a dead fd) must not
+    /// masquerade as readiness, a timer or a signal: those stay clear when
+    /// err is set. A signal number outside `Signal` is reported as an error
+    /// event rather than dropped.
+    fn translate(kev: Kevent) Event {
+        const is_err = (kev.flags & EV_ERROR) != 0;
+        var ev: Event = .{
+            .udata = @ptrFromInt(kev.udata),
+            .eof = (kev.flags & EV_EOF) != 0,
+            .err = is_err,
+            .err_no = if (is_err) @intCast(kev.data) else 0,
+        };
+        if (is_err) return ev;
+        if (kev.filter == EVFILT_READ) {
+            ev.readable = true;
+        } else if (kev.filter == EVFILT_WRITE) {
+            ev.writable = true;
+        } else if (kev.filter == EVFILT_TIMER) {
+            ev.timer = true;
+            ev.fired = firedCount(kev.data);
+        } else if (kev.filter == EVFILT_SIGNAL) {
+            if (Signal.fromPosix(kev.ident)) |sig| {
+                ev.signal = sig;
+                ev.fired = firedCount(kev.data);
+            } else {
+                ev.err = true;
+            }
+        }
+        return ev;
+    }
+
+    fn firedCount(data: @FieldType(Kevent, "data")) u32 {
+        if (data <= 0) return 1;
+        return std.math.cast(u32, data) orelse std.math.maxInt(u32);
     }
 
     fn drainWake(self: *EvPort) void {
@@ -457,4 +556,101 @@ test "kqueue: non-blocking connect completes via write filter" {
     var so_error: c_int = -1;
     try std.posix.getsockopt(s, std.posix.SOL.SOCKET, std.posix.SO.ERROR, std.mem.asBytes(&so_error));
     try std.testing.expectEqual(@as(c_int, 0), so_error);
+}
+
+test "kqueue: timer and signal kevents translate to their event fields" {
+    var tag: u8 = 1;
+    var kev = EvPort.change(9, EVFILT_TIMER, EV_ADD, &tag);
+    kev.data = 3;
+    const timer = EvPort.translate(kev);
+    try std.testing.expect(timer.timer and timer.signal == null);
+    try std.testing.expectEqual(@as(u32, 3), timer.fired);
+    try std.testing.expect(timer.udata == @as(?*anyopaque, &tag));
+    try std.testing.expect(!timer.readable and !timer.writable and !timer.err);
+
+    kev.data = std.math.maxInt(@FieldType(Kevent, "data"));
+    try std.testing.expectEqual(@as(u32, std.math.maxInt(u32)), EvPort.translate(kev).fired);
+
+    var sig = EvPort.change(Signal.hangup.toPosix(), EVFILT_SIGNAL, EV_ADD, &tag);
+    sig.data = 2;
+    const hup = EvPort.translate(sig);
+    try std.testing.expectEqual(@as(?Signal, .hangup), hup.signal);
+    try std.testing.expectEqual(@as(u32, 2), hup.fired);
+    try std.testing.expect(!hup.timer and !hup.err);
+
+    // A rejected timer change is an error, never a firing.
+    kev.flags = EV_ERROR;
+    kev.data = @intFromEnum(std.posix.E.NOENT);
+    const failed = EvPort.translate(kev);
+    try std.testing.expect(failed.err and !failed.timer);
+    try std.testing.expectEqual(@as(u32, 0), failed.fired);
+    try std.testing.expectEqual(@as(usize, @intFromEnum(std.posix.E.NOENT)), failed.err_no);
+
+    // A signal outside Signal is reported, not dropped or mislabelled.
+    const unknown = EvPort.translate(EvPort.change(std.posix.SIG.WINCH, EVFILT_SIGNAL, EV_ADD, &tag));
+    try std.testing.expect(unknown.err and unknown.signal == null);
+
+    // Descriptor events leave the new fields inert.
+    const read = EvPort.translate(EvPort.change(5, EVFILT_READ, EV_ADD, &tag));
+    try std.testing.expect(read.readable and !read.timer and read.signal == null);
+    try std.testing.expectEqual(@as(u32, 0), read.fired);
+}
+
+test "kqueue: stageRaw timer is submitted by the next wait and fires once" {
+    var port = try EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    var tag: u8 = 1;
+    // Milliseconds are the default unit (fflags 0) on every kqueue target.
+    var kev = EvPort.change(42, EVFILT_TIMER, EV_ADD | EV_ONESHOT, &tag);
+    kev.data = 5;
+    port.stageRaw(kev);
+    try std.testing.expectEqual(@as(usize, 2), port.changes.items.len);
+    var events: [4]Event = undefined;
+    var n: usize = 0;
+    while (n == 0) n = try port.wait(&events, 1000);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expect(events[0].timer);
+    try std.testing.expectEqual(@as(u32, 1), events[0].fired);
+    try std.testing.expect(events[0].udata == @as(?*anyopaque, &tag));
+    try std.testing.expectEqual(@as(usize, 0), try port.wait(&events, 20));
+}
+
+test "kqueue: stageRaw signal is delivered as Event.signal" {
+    const signo = Signal.user2.toPosix();
+    // EVFILT_SIGNAL records deliveries under any disposition; ignore the
+    // signal so the default action cannot end the test process.
+    var prior: std.posix.Sigaction = undefined;
+    const ignore: std.posix.Sigaction = .{ .handler = .{ .handler = std.posix.SIG.IGN }, .mask = std.posix.sigemptyset(), .flags = 0 };
+    std.posix.sigaction(signo, &ignore, &prior);
+    defer std.posix.sigaction(signo, &prior, null);
+
+    var port = try EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    var tag: u8 = 1;
+    port.stageRaw(EvPort.change(signo, EVFILT_SIGNAL, EV_ADD | EV_CLEAR, &tag));
+    var events: [4]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try port.wait(&events, 0));
+    try std.posix.raise(signo);
+    try std.testing.expectEqual(@as(usize, 1), try port.wait(&events, 1000));
+    try std.testing.expectEqual(@as(?Signal, .user2), events[0].signal);
+    try std.testing.expect(events[0].fired >= 1);
+    try std.testing.expect(events[0].udata == @as(?*anyopaque, &tag));
+    port.stageRaw(EvPort.change(signo, EVFILT_SIGNAL, EV_DELETE, null));
+    try std.testing.expectEqual(@as(usize, 0), try port.wait(&events, 0));
+}
+
+test "kqueue: purgeFd leaves a staged timer whose ident equals the fd" {
+    var port = try EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    var events: [4]Event = undefined;
+    _ = try port.wait(&events, 0);
+    const fd = port.wake_r;
+    var tag: u8 = 1;
+    port.monitorRead(fd, &tag);
+    var kev = EvPort.change(fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, &tag);
+    kev.data = 1000;
+    port.stageRaw(kev);
+    port.purgeFd(fd);
+    try std.testing.expectEqual(@as(usize, 1), port.changes.items.len);
+    try std.testing.expectEqual(EVFILT_TIMER, port.changes.items[0].filter);
 }

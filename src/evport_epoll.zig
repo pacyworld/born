@@ -29,19 +29,57 @@
 //   - Cross-thread wakeup: eventfd (the pipe trick's Linux twin).
 //   - purgeFd drops only the port's bookkeeping; the kernel removes a
 //     closed fd's registration itself.
+//   - Internal sources (timer_epoll.zig's timerfd, signal_epoll.zig's
+//     signalfd): at most one fd per kind per port, registered
+//     level-triggered with a kind sentinel as epoll data. wait() hands a
+//     ready one to its kind's harvest(), which drains it into Events. A
+//     source left ready (the caller's buffer filled) is re-reported by the
+//     next wait(), so nothing is dropped.
 
 const std = @import("std");
 const linux = std.os.linux;
+const types = @import("types.zig");
+const timer_epoll = @import("timer_epoll.zig");
+const signal_epoll = @import("signal_epoll.zig");
 
-pub const Handle = @import("types.zig").Handle;
-pub const Event = @import("types.zig").Event;
+pub const Handle = types.Handle;
+pub const Event = types.Event;
+pub const Signal = types.Signal;
+pub const TimerMode = types.TimerMode;
 
-pub const Error = error{
-    InitFailed,
-    RegisterFailed,
-    WaitFailed,
-    OutOfMemory,
-};
+pub const InitError = error{InitFailed};
+/// RegisterFailed and OutOfMemory are stashed registration failures;
+/// SourceFailed is an internal source (timerfd, signalfd) that could not
+/// be harvested or re-armed.
+pub const WaitError = error{ WaitFailed, RegisterFailed, SourceFailed, OutOfMemory };
+pub const TimerError = types.TimerError;
+pub const SignalError = types.SignalError;
+/// Every error this backend can return.
+pub const Error = InitError || WaitError || TimerError || SignalError;
+
+/// Block `sigs` in the calling thread; signalfd only sees blocked signals.
+/// Call it in `main` before spawning threads; see signal_epoll.zig.
+pub const blockSignals = signal_epoll.blockSignals;
+
+/// Internal source kinds; each owns one slot in EvPort.internal.
+pub const InternalKind = enum { timer, signal };
+
+/// Stable addresses used as epoll data for internal sources, one per kind.
+/// They cannot collide with a caller's udata, which never points here.
+var internal_tags = [_]u8{0} ** std.meta.fields(InternalKind).len;
+
+fn internalKind(data: usize) ?InternalKind {
+    const base = @intFromPtr(&internal_tags);
+    if (data < base or data >= base + internal_tags.len) return null;
+    return @enumFromInt(data - base);
+}
+
+/// Events a harvest may write at position `out` while `pending` kernel
+/// events after it still need a slot each. Always at least 1, because
+/// epoll_wait returned no more events than the buffer holds.
+fn harvestRoom(len: usize, out: usize, pending: usize) usize {
+    return len - out - pending;
+}
 
 /// Stable address used as the wake eventfd's udata tag.
 var wake_sentinel: u8 = 0;
@@ -67,30 +105,45 @@ pub const EvPort = struct {
     /// Stashed registration failure (the IOCP backend's shape): a rejected
     /// epoll_ctl or an allocation failure is returned by the next non-empty
     /// wait() instead of being dropped on the floor.
-    pending_error: ?Error = null,
+    pending_error: ?WaitError = null,
     /// Live pseudo registrations: wait() must not block while any exist.
     pseudo_count: usize = 0,
+    /// Internal source fd per kind, -1 when absent. The fd is owned by the
+    /// kind's module, which closes it after removeInternal.
+    internal: [std.meta.fields(InternalKind).len]i32 = .{-1} ** std.meta.fields(InternalKind).len,
+    /// Timer bookkeeping, owned by timer_epoll.zig.
+    timers: timer_epoll.State = .{},
+    /// Signal-watch bookkeeping, owned by signal_epoll.zig.
+    signals: signal_epoll.State = .{},
 
-    pub fn init(alloc: std.mem.Allocator) Error!EvPort {
+    pub fn init(alloc: std.mem.Allocator) InitError!EvPort {
         // Raw linux syscalls do not set libc errno; decode the return value
         // itself. std.posix.errno() would read libc's thread-local errno in
         // this libc-linked binary and report SUCCESS for failed syscalls.
         const ep_rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
-        if (linux.E.init(ep_rc) != .SUCCESS) return Error.InitFailed;
+        if (linux.E.init(ep_rc) != .SUCCESS) return InitError.InitFailed;
         const ep: i32 = @intCast(ep_rc);
         errdefer _ = std.c.close(ep);
 
         const wfd_rc = linux.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
-        if (linux.E.init(wfd_rc) != .SUCCESS) return Error.InitFailed;
+        if (linux.E.init(wfd_rc) != .SUCCESS) return InitError.InitFailed;
         const wfd: i32 = @intCast(wfd_rc);
         errdefer _ = std.c.close(wfd);
 
-        var self = EvPort{ .ep = ep, .alloc = alloc, .wake_fd = wfd };
+        var self = EvPort{
+            .ep = ep,
+            .alloc = alloc,
+            .wake_fd = wfd,
+            .timers = timer_epoll.State.init(alloc),
+            .signals = signal_epoll.State.init(alloc),
+        };
         self.register(wfd, true, false, @as(?*anyopaque, &wake_sentinel));
         return self;
     }
 
     pub fn deinit(self: *EvPort) void {
+        self.signals.deinit(self);
+        self.timers.deinit(self);
         if (self.ep >= 0) _ = std.c.close(self.ep);
         if (self.wake_fd >= 0) _ = std.c.close(self.wake_fd);
         self.ep = -1;
@@ -147,6 +200,56 @@ pub const EvPort = struct {
         _ = std.posix.write(self.wake_fd, std.mem.asBytes(&one)) catch {};
     }
 
+    /// Arm a timer. `id` is caller-chosen and unique per port; re-adding a
+    /// live id replaces it. Timers are deadlines, never I/O drivers.
+    pub fn addTimer(self: *EvPort, id: u32, udata: ?*anyopaque, after_ms: u32, mode: TimerMode) TimerError!void {
+        return timer_epoll.add(self, id, udata, after_ms, mode);
+    }
+
+    /// Disarm a timer. Unknown or already-expired ids are a no-op.
+    pub fn cancelTimer(self: *EvPort, id: u32) void {
+        timer_epoll.cancel(self, id);
+    }
+
+    /// Deliver `sig` as Event.signal. Process-wide: one port per signal.
+    /// The signal must already be blocked (`blockSignals`).
+    pub fn watchSignal(self: *EvPort, sig: Signal, udata: ?*anyopaque) SignalError!void {
+        return signal_epoll.watch(self, sig, udata);
+    }
+
+    /// Stop watching `sig`. Unwatched signals are a no-op.
+    pub fn unwatchSignal(self: *EvPort, sig: Signal) void {
+        signal_epoll.unwatch(self, sig);
+    }
+
+    /// Internal hook: register `fd` as the port's `kind` source,
+    /// level-triggered EPOLLIN. One source per kind.
+    pub fn addInternal(self: *EvPort, kind: InternalKind, fd: i32) error{ InvalidArgument, SystemResources }!void {
+        const slot = &self.internal[@intFromEnum(kind)];
+        if (slot.* != -1 or fd < 0) return error.InvalidArgument;
+        var ev: linux.epoll_event = .{
+            .events = linux.EPOLL.IN,
+            .data = .{ .ptr = @intFromPtr(&internal_tags[@intFromEnum(kind)]) },
+        };
+        if (linux.E.init(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_ADD, fd, &ev)) != .SUCCESS)
+            return error.SystemResources;
+        slot.* = fd;
+    }
+
+    /// Internal hook: drop the `kind` source before its owner closes the fd.
+    pub fn removeInternal(self: *EvPort, kind: InternalKind) void {
+        const slot = &self.internal[@intFromEnum(kind)];
+        if (slot.* == -1) return;
+        _ = linux.epoll_ctl(self.ep, linux.EPOLL.CTL_DEL, slot.*, null);
+        slot.* = -1;
+    }
+
+    /// The fd registered for `kind`, or null.
+    pub fn internalFd(self: *const EvPort, kind: InternalKind) ?i32 {
+        const fd = self.internal[@intFromEnum(kind)];
+        return if (fd == -1) null else fd;
+    }
+
     /// Apply the fd's computed mask: ADD / MOD / DEL / pseudo as needed.
     ///
     /// epoll_ctl answers EPERM for a descriptor it cannot poll, and
@@ -180,7 +283,7 @@ pub const EvPort = struct {
             return;
         }
         const gop = self.fds.getOrPut(self.alloc, fd) catch {
-            self.pending_error = Error.OutOfMemory;
+            self.pending_error = WaitError.OutOfMemory;
             return;
         };
         if (!gop.found_existing) {
@@ -197,7 +300,7 @@ pub const EvPort = struct {
                 // is a real rejection and must reach the caller.
                 else => {
                     _ = self.fds.remove(fd);
-                    self.pending_error = Error.RegisterFailed;
+                    self.pending_error = WaitError.RegisterFailed;
                 },
             }
             return;
@@ -206,7 +309,7 @@ pub const EvPort = struct {
             var ev = makeEvent(st);
             if (linux.E.init(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_MOD, fd, &ev)) != .SUCCESS) {
                 _ = self.fds.remove(fd);
-                self.pending_error = Error.RegisterFailed;
+                self.pending_error = WaitError.RegisterFailed;
                 return;
             }
         }
@@ -235,8 +338,10 @@ pub const EvPort = struct {
     /// is reported here, once, ahead of the syscall — an empty wait neither
     /// consumes nor reports it. Pseudo registrations (regular files) are
     /// always ready: while any exist the syscall never blocks, and they
-    /// fill whatever space the kernel left.
-    pub fn wait(self: *EvPort, events: []Event, timeout_ms: ?i32) Error!usize {
+    /// fill whatever space the kernel left. A ready internal source goes to
+    /// its kind's harvest, which may emit several events or none (wait()
+    /// can then return 0 before its timeout).
+    pub fn wait(self: *EvPort, events: []Event, timeout_ms: ?i32) WaitError!usize {
         if (events.len == 0) return 0;
         if (self.pending_error) |err| {
             self.pending_error = null;
@@ -250,12 +355,13 @@ pub const EvPort = struct {
         const n_err = linux.E.init(n_rc);
         if (n_err != .SUCCESS) {
             if (n_err == .INTR) return 0;
-            return Error.WaitFailed;
+            return WaitError.WaitFailed;
         }
 
+        const n: usize = @intCast(n_rc);
         var out: usize = 0;
         var woke = false;
-        for (ebuf[0..@intCast(n_rc)]) |eev| {
+        for (ebuf[0..n], 0..) |eev, i| {
             if (eev.data.ptr == @intFromPtr(&wake_sentinel)) {
                 if (!woke) {
                     woke = true;
@@ -263,6 +369,14 @@ pub const EvPort = struct {
                     events[out] = .{ .wake = true };
                     out += 1;
                 }
+                continue;
+            }
+            if (internalKind(eev.data.ptr)) |kind| {
+                const room = events[out..][0..harvestRoom(events.len, out, n - i - 1)];
+                out += switch (kind) {
+                    .timer => timer_epoll.harvest(self, room),
+                    .signal => signal_epoll.harvest(self, room),
+                };
                 continue;
             }
             const udata: ?*anyopaque = @ptrFromInt(eev.data.ptr);
@@ -548,4 +662,47 @@ test "epoll: non-blocking connect completes via write interest" {
     var so_error: c_int = -1;
     try std.posix.getsockopt(s, std.posix.SOL.SOCKET, std.posix.SO.ERROR, std.mem.asBytes(&so_error));
     try std.testing.expectEqual(@as(c_int, 0), so_error);
+}
+
+test "epoll: internal source tags never match caller data" {
+    var tag: u8 = 1;
+    try std.testing.expect(internalKind(@intFromPtr(&tag)) == null);
+    try std.testing.expect(internalKind(@intFromPtr(&wake_sentinel)) == null);
+    try std.testing.expect(internalKind(0) == null);
+    inline for (std.meta.fields(InternalKind)) |field| {
+        const kind: InternalKind = @enumFromInt(field.value);
+        try std.testing.expectEqual(@as(?InternalKind, kind), internalKind(@intFromPtr(&internal_tags[field.value])));
+    }
+}
+
+test "epoll: harvest room keeps a slot for every later kernel event" {
+    // 8 slots, harvest at 2, 3 kernel events still to translate.
+    try std.testing.expectEqual(@as(usize, 3), harvestRoom(8, 2, 3));
+    // Worst case the kernel filled the buffer: exactly one slot each.
+    try std.testing.expectEqual(@as(usize, 1), harvestRoom(4, 3, 0));
+}
+
+test "epoll: internal source table is one fd per kind" {
+    var evp = try EvPort.init(std.testing.allocator);
+    defer evp.deinit();
+    const rc = linux.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.E.init(rc));
+    const fd: i32 = @intCast(rc);
+    defer _ = std.c.close(fd);
+
+    try std.testing.expect(evp.internalFd(.timer) == null);
+    try evp.addInternal(.timer, fd);
+    try std.testing.expectEqual(@as(?i32, fd), evp.internalFd(.timer));
+    try std.testing.expectError(error.InvalidArgument, evp.addInternal(.timer, fd));
+    try std.testing.expectError(error.InvalidArgument, evp.addInternal(.signal, -1));
+    // Not ready: the source is silent and is not a caller registration.
+    var events: [4]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
+    try std.testing.expect(!evp.fds.contains(fd));
+
+    evp.removeInternal(.timer);
+    try std.testing.expect(evp.internalFd(.timer) == null);
+    evp.removeInternal(.timer);
+    try evp.addInternal(.timer, fd);
+    evp.removeInternal(.timer);
 }
