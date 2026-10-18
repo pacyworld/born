@@ -18,10 +18,13 @@
 //   - Closing fds need no unmonitoring: close(2) removes all filters. The
 //     core defers close() until just after a wait() flush so staged entries
 //     never reference a closed (and possibly recycled) fd.
-//   - Timers and signals (timer_kqueue.zig, signal_kqueue.zig) register
-//     through stageRaw like any other change. wait() translates
-//     EVFILT_TIMER and EVFILT_SIGNAL into Event.timer/.signal/.fired after
-//     each module's observe() hook has seen the kevent.
+//   - Timers (timer_kqueue.zig) register through stageRaw like any other
+//     change. The one exception: signal watch/unwatch (signal_kqueue.zig)
+//     are one-time setup calls that apply their change with an immediate
+//     kevent(), so no delivery is lost before the next wait(). wait()
+//     translates EVFILT_TIMER and EVFILT_SIGNAL into
+//     Event.timer/.signal/.fired after each module's observe() hook has
+//     seen the kevent.
 
 const std = @import("std");
 const types = @import("types.zig");
@@ -630,7 +633,8 @@ test "kqueue: stageRaw signal is delivered as Event.signal" {
     port.stageRaw(EvPort.change(signo, EVFILT_SIGNAL, EV_ADD | EV_CLEAR, &tag));
     var events: [4]Event = undefined;
     try std.testing.expectEqual(@as(usize, 0), try port.wait(&events, 0));
-    try std.posix.raise(signo);
+    // Process-directed: XNU's EVFILT_SIGNAL does not see a thread-directed raise(3).
+    try std.posix.kill(std.c.getpid(), signo);
     try std.testing.expectEqual(@as(usize, 1), try port.wait(&events, 1000));
     try std.testing.expectEqual(@as(?Signal, .user2), events[0].signal);
     try std.testing.expect(events[0].fired >= 1);

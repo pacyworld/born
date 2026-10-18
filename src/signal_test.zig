@@ -27,7 +27,8 @@ fn raise(sig: Signal) !void {
         };
         if (win.GenerateConsoleCtrlEvent(ctrl, 0) == 0) return error.TestUnexpectedResult;
     } else {
-        try std.posix.raise(sig.toPosix());
+        // Process-directed: XNU's EVFILT_SIGNAL does not see a thread-directed raise(3).
+        try std.posix.kill(std.c.getpid(), sig.toPosix());
     }
 }
 
