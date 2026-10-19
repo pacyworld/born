@@ -55,6 +55,33 @@ pub const PlainNb = struct {
         return unix_posix.connectInto(self, alloc, path, evp, key);
     }
 
+    /// Wrap `h`, a connected non-blocking stream socket from accept, as
+    /// this stream; `Listener.acceptNb` adopts through here. Takes ownership:
+    /// on failure `h` is closed and `self` is untouched. `evp` and `key` are
+    /// for IOCP association and unused here: register read interest
+    /// yourself. Darwin sets SO_NOSIGPIPE, which a socket whose peer is
+    /// already gone refuses (EINVAL): error.SocketError.
+    pub fn adoptAccepted(self: *PlainNb, h: types.Handle, evp: ?*evport.EvPort, key: ?*anyopaque) io.AcceptError!void {
+        std.debug.assert(self.sock == -1);
+        _ = evp;
+        _ = key;
+        if (comptime builtin.os.tag.isDarwin()) {
+            const one: c_int = 1;
+            switch (std.posix.errno(std.c.setsockopt(h, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, &one, @sizeOf(c_int)))) {
+                .SUCCESS => {},
+                .NOBUFS, .NOMEM => {
+                    std.posix.close(h);
+                    return io.AcceptError.ResourceExhausted;
+                },
+                else => {
+                    std.posix.close(h);
+                    return io.AcceptError.SocketError;
+                },
+            }
+        }
+        self.* = .{ .sock = h };
+    }
+
     /// socket(SOCK_NONBLOCK) + connect(). On success the fd is either in
     /// EINPROGRESS state or instantly connected (loopback) — register write
     /// interest and confirm with connectDone() on the first write event.
