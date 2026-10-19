@@ -32,7 +32,10 @@ OS per primitive, and lists real runs only.
 | kqueue, FreeBSD 15 (runner01) | event port, wake, plain TCP stream | [run 39, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/39/jobs/0): Debug and ReleaseSafe, 29 passed, 26 skipped, 0 failed | 2026-10-18 | [3ed3785](https://pacyworld.dev/pacyworld/born/commit/3ed378538592c0f8c3a0598c957409dd6becfd57) |
 | epoll, Linux 6.8 (runner03, Ubuntu 24.04) | event port, wake, plain TCP stream | [run 39, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/39/jobs/1): ReleaseSafe, 28 passed, 26 skipped, 0 failed | 2026-10-18 | [3ed3785](https://pacyworld.dev/pacyworld/born/commit/3ed378538592c0f8c3a0598c957409dd6becfd57) |
 | IOCP, Windows Server 2022 build 20348 (runner02) | event port, wake, plain TCP stream | [run 39, Windows job](https://pacyworld.dev/pacyworld/born/actions/runs/39/jobs/2): ReleaseSafe, 21 passed, 27 skipped, 0 failed | 2026-10-18 | [3ed3785](https://pacyworld.dev/pacyworld/born/commit/3ed378538592c0f8c3a0598c957409dd6becfd57) |
-| kqueue, epoll, IOCP | timers, signals, TCP listener, Unix sockets | none: not implemented yet, their contract tests skip | n/a | n/a |
+| epoll, Linux 6.8 (runner03, Ubuntu 24.04) | signals (signalfd) | [run 51, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/51/jobs/1): ReleaseSafe, 53 passed, 18 skipped, 0 failed | 2026-10-19 | [af7d004](https://pacyworld.dev/pacyworld/born/commit/af7d0046630ed67698570b6b9fd261b6e659c3a7) |
+| kqueue | Unix sockets | none: not implemented yet, their contract tests skip | n/a | n/a |
+| epoll | timers, Unix sockets | none: not implemented yet, their contract tests skip | n/a | n/a |
+| IOCP | timers, signals, TCP listener, Unix sockets | none: not implemented yet, their contract tests skip | n/a | n/a |
 
 Commit 3ed3785 changes only the CI workflow; its library and tests are
 those of master d1017b8. Skips are platform-only tests and the 0.3.0
