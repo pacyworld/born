@@ -38,8 +38,8 @@ OS per primitive, and lists real runs only.
 | IOCP, Windows Server 2022 build 20348 (runner02) | signals (console control events) | [run 81, Windows job](https://pacyworld.dev/pacyworld/born/actions/runs/81/jobs/2): ReleaseSafe, 36 passed, 25 skipped, 0 failed | 2026-10-20 | [f2229c6](https://pacyworld.dev/pacyworld/born/commit/f2229c68d7e32f718e34f6b5c563461b993b61b9) |
 | IOCP, Windows 11 build 26100 (win11-dev, manual) | signals (console control events) | born-tests.exe Debug and ReleaseSafe over OpenSSH: 36 passed, 25 skipped, 0 failed each | 2026-10-20 | [f2229c6](https://pacyworld.dev/pacyworld/born/commit/f2229c68d7e32f718e34f6b5c563461b993b61b9) |
 | IOCP, Windows Server 2022 build 20348 (runner02) | TCP listener (AcceptEx) | [run 64, Windows job](https://pacyworld.dev/pacyworld/born/actions/runs/64/jobs/2): ReleaseSafe, 38 passed, 26 skipped, 0 failed | 2026-10-20 | [8eca1d3](https://pacyworld.dev/pacyworld/born/commit/8eca1d3e226b14d5120a84192b2aa0779d50884a) |
-| kqueue | Unix sockets | none: not implemented yet, their contract tests skip | n/a | n/a |
-| epoll | Unix sockets | none: not implemented yet, their contract tests skip | n/a | n/a |
+| kqueue, FreeBSD 15 (runner01) | Unix domain stream sockets | [run 70, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/70/jobs/0): Debug and ReleaseSafe, 81 passed, 4 skipped, 0 failed | 2026-10-19 | [86ef7ec](https://pacyworld.dev/pacyworld/born/commit/86ef7ec20f50151e4719254a79d590b7feb7f4ba) |
+| epoll, Linux 6.8 (runner03, Ubuntu 24.04) | Unix domain stream sockets | [run 70, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/70/jobs/1): ReleaseSafe, 65 passed, 13 skipped, 0 failed | 2026-10-19 | [86ef7ec](https://pacyworld.dev/pacyworld/born/commit/86ef7ec20f50151e4719254a79d590b7feb7f4ba) |
 | IOCP | Unix sockets | none: not implemented yet, their contract tests skip | n/a | n/a |
 
 Commit 3ed3785 changes only the CI workflow; its library and tests are
@@ -276,7 +276,10 @@ Rules every implementation follows:
   never truncated. `unlink_stale` replaces a socket file that refuses
   connections and never unlinks a live listener (`error.AddressInUse`) or a
   non-socket file (`error.PathNotASocket`). The mode is applied before
-  `listen`, so there is no window with wider permissions.
+  `listen`, so there is no window with wider permissions. On POSIX the
+  stale check is a datagram connect probe, so a live listener with a full
+  backlog is never mistaken for a stale file, and `close` removes the path
+  only from the process that bound it and only while it is still that file.
 - **Nothing fails silently:** every refusal reaches the caller as an error
   from the call, or from the next `wait()` for deferred registrations.
 
