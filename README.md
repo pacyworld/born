@@ -248,6 +248,18 @@ Rules every implementation follows:
   spawning threads; `watchSignal` reports `error.SignalNotBlocked` otherwise.
   On kqueue and Windows `blockSignals` is a no-op, so portable programs call
   it unconditionally. Unwatching restores the prior disposition.
+- **Windows signals are console control events:** CTRL_C_EVENT is
+  `.interrupt`; CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT and CTRL_SHUTDOWN_EVENT
+  are `.terminate`. `.hangup`, `.user1` and `.user2` are `error.Unsupported`,
+  and so is every signal in a process without a console (a service or GUI
+  program). After CTRL_CLOSE_EVENT or CTRL_SHUTDOWN_EVENT the system ends
+  the process when the program exits or after its timeout (5 s for a closed
+  console window): finish shutdown within that time. Watching `.interrupt`
+  clears an inherited CTRL+C ignore flag; unwatching sets it again. Changing
+  the process's console (FreeConsole, AllocConsole, AttachConsole) drops
+  every watch without an error born could detect, so change consoles before
+  watching, or unwatch every signal and watch again. A port must not move
+  while it watches a signal.
 - **`.balanced` reuse-port** means the kernel spreads connections across
   listeners on one port: `SO_REUSEPORT_LB` on FreeBSD, `SO_REUSEPORT` on
   Linux. Where the platform can only share a port without balancing (macOS,

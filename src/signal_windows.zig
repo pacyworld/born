@@ -58,7 +58,11 @@
 //!
 //! Changing the process's console (FreeConsole, AllocConsole,
 //! AttachConsole) clears its handler list, so a routine installed before
-//! the change is gone (Windows 11 26100). Watch after changing consoles.
+//! the change is gone (Windows 11 26100). No API reports it, and the
+//! parameter block's console handle can have the same value on the new
+//! console, so born cannot detect it. Change consoles before watching, or
+//! unwatch every signal afterwards (the routine's removal then fails and
+//! the next watch installs it again) and watch again.
 
 const std = @import("std");
 const windows = std.os.windows;

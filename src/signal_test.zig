@@ -281,3 +281,26 @@ test "signal: Windows CTRL_C arrives as interrupt and unwatch restores CTRL+C ig
     port.unwatchSignal(.interrupt);
     try std.testing.expect(params.ConsoleFlags & 1 != 0);
 }
+
+test "signal: Windows unwatch and watch after a console change reinstalls the handler" {
+    if (!is_windows) return error.SkipZigTest;
+    var port = try born.EvPort.init(alloc);
+    defer port.deinit();
+    var tag: u8 = 0;
+    {
+        const first = try Console.isolate();
+        defer first.restore();
+        try watchOrSkip(&port, probe, &tag);
+    }
+    // The console change cleared the process's handler list.
+    const second = try Console.isolate();
+    defer second.restore();
+    port.unwatchSignal(probe);
+    try port.watchSignal(probe, &tag);
+    defer port.unwatchSignal(probe);
+    try raise(probe);
+    var seen: std.ArrayList(Event) = .empty;
+    defer seen.deinit(alloc);
+    try collect(&port, probe, &seen, 2000, 1);
+    try std.testing.expectEqual(@as(usize, 1), seen.items.len);
+}
