@@ -35,9 +35,11 @@ OS per primitive, and lists real runs only.
 | epoll, Linux 6.8 (runner03, Ubuntu 24.04) | signals (signalfd) | [run 51, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/51/jobs/1): ReleaseSafe, 53 passed, 18 skipped, 0 failed | 2026-10-19 | [af7d004](https://pacyworld.dev/pacyworld/born/commit/af7d0046630ed67698570b6b9fd261b6e659c3a7) |
 | IOCP, Windows Server 2022 build 20348 (runner02) | timers (thread-pool timer) | [run 75, Windows job](https://pacyworld.dev/pacyworld/born/actions/runs/75/jobs/2): ReleaseSafe, 49 passed, 20 skipped, 0 failed | 2026-10-20 | [27c7357](https://pacyworld.dev/pacyworld/born/commit/27c735706b9b3e8f29adcf966ba62b4dfe3b8c4a) |
 | epoll, Linux 6.8 (runner03, Ubuntu 24.04) | timers (timerfd plus deadline heap) | [run 61, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/61/jobs/1): ReleaseSafe, 67 passed, 9 skipped, 0 failed | 2026-10-19 | [efa2d93](https://pacyworld.dev/pacyworld/born/commit/efa2d93497abf0ca4d52fe500a6094a9dc1b5888) |
+| IOCP, Windows Server 2022 build 20348 (runner02) | signals (console control events) | [run 81, Windows job](https://pacyworld.dev/pacyworld/born/actions/runs/81/jobs/2): ReleaseSafe, 36 passed, 25 skipped, 0 failed | 2026-10-20 | [f2229c6](https://pacyworld.dev/pacyworld/born/commit/f2229c68d7e32f718e34f6b5c563461b993b61b9) |
+| IOCP, Windows 11 build 26100 (win11-dev, manual) | signals (console control events) | born-tests.exe Debug and ReleaseSafe over OpenSSH: 36 passed, 25 skipped, 0 failed each | 2026-10-20 | [f2229c6](https://pacyworld.dev/pacyworld/born/commit/f2229c68d7e32f718e34f6b5c563461b993b61b9) |
 | kqueue | Unix sockets | none: not implemented yet, their contract tests skip | n/a | n/a |
 | epoll | Unix sockets | none: not implemented yet, their contract tests skip | n/a | n/a |
-| IOCP | signals, TCP listener, Unix sockets | none: not implemented yet, their contract tests skip | n/a | n/a |
+| IOCP | TCP listener, Unix sockets | none: not implemented yet, their contract tests skip | n/a | n/a |
 
 Commit 3ed3785 changes only the CI workflow; its library and tests are
 those of master d1017b8. Skips are platform-only tests and the 0.3.0
