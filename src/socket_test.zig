@@ -277,7 +277,8 @@ test "plain socket connect refusal surfaces at connectDone" {
     defer pair.deinit();
     var address = try std.net.Address.parseIp4("127.0.0.1", 0);
     const refused_socket = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
-    defer std.posix.close(refused_socket);
+    var reserved = true;
+    defer if (reserved) std.posix.close(refused_socket);
     try std.posix.bind(refused_socket, &address.any, address.getOsSockLen());
     var address_len = address.getOsSockLen();
     try std.posix.getsockname(refused_socket, &address.any, &address_len);
@@ -287,6 +288,14 @@ test "plain socket connect refusal surfaces at connectDone" {
     pair.client.deinit();
     pair.connected = false;
     pair.expect_connect_err = true;
+    // XNU drops a SYN to a bound, non-listening port instead of sending RST,
+    // so Darwin frees the port and connects to a closed one. Other targets
+    // keep the reservation: Windows refusal timing needs it, and it keeps the
+    // port from being reused.
+    if (builtin.os.tag.isDarwin()) {
+        std.posix.close(refused_socket);
+        reserved = false;
+    }
     pair.client.startConnectInto(alloc, "127.0.0.1", refused_port, &pair.port, &pair.client) catch |err| {
         try std.testing.expectEqual(error.ConnectFailed, err);
         try std.testing.expectEqual(@as(usize, 0), pair.client.pendingOps());
