@@ -44,6 +44,9 @@ pub const ListenOptions = struct {
     reuse_port: ReusePort = .none,
     /// IPv6 addresses only: refuse IPv4-mapped connections.
     v6_only: bool = true,
+    /// IOCP: AcceptEx operations kept outstanding (minimum 1). Ignored on
+    /// POSIX, where `acceptNb` drains the kernel queue directly.
+    accept_depth: u16 = 4,
 };
 
 pub const UnixOptions = struct {
