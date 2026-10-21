@@ -35,9 +35,11 @@ OS per primitive, and lists real runs only.
 | epoll, Linux 6.8 (runner03, Ubuntu 24.04) | signals (signalfd) | [run 51, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/51/jobs/1): ReleaseSafe, 53 passed, 18 skipped, 0 failed | 2026-10-19 | [af7d004](https://pacyworld.dev/pacyworld/born/commit/af7d0046630ed67698570b6b9fd261b6e659c3a7) |
 | IOCP, Windows Server 2022 build 20348 (runner02) | timers (thread-pool timer) | [run 75, Windows job](https://pacyworld.dev/pacyworld/born/actions/runs/75/jobs/2): ReleaseSafe, 49 passed, 20 skipped, 0 failed | 2026-10-20 | [27c7357](https://pacyworld.dev/pacyworld/born/commit/27c735706b9b3e8f29adcf966ba62b4dfe3b8c4a) |
 | epoll, Linux 6.8 (runner03, Ubuntu 24.04) | timers (timerfd plus deadline heap) | [run 61, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/61/jobs/1): ReleaseSafe, 67 passed, 9 skipped, 0 failed | 2026-10-19 | [efa2d93](https://pacyworld.dev/pacyworld/born/commit/efa2d93497abf0ca4d52fe500a6094a9dc1b5888) |
+| IOCP, Windows Server 2022 build 20348 (runner02) | signals (console control events) | [run 81, Windows job](https://pacyworld.dev/pacyworld/born/actions/runs/81/jobs/2): ReleaseSafe, 36 passed, 25 skipped, 0 failed | 2026-10-20 | [f2229c6](https://pacyworld.dev/pacyworld/born/commit/f2229c68d7e32f718e34f6b5c563461b993b61b9) |
+| IOCP, Windows 11 build 26100 (win11-dev, manual) | signals (console control events) | born-tests.exe Debug and ReleaseSafe over OpenSSH: 36 passed, 25 skipped, 0 failed each | 2026-10-20 | [f2229c6](https://pacyworld.dev/pacyworld/born/commit/f2229c68d7e32f718e34f6b5c563461b993b61b9) |
 | kqueue | Unix sockets | none: not implemented yet, their contract tests skip | n/a | n/a |
 | epoll | Unix sockets | none: not implemented yet, their contract tests skip | n/a | n/a |
-| IOCP | signals, TCP listener, Unix sockets | none: not implemented yet, their contract tests skip | n/a | n/a |
+| IOCP | TCP listener, Unix sockets | none: not implemented yet, their contract tests skip | n/a | n/a |
 
 Commit 3ed3785 changes only the CI workflow; its library and tests are
 those of master d1017b8. Skips are platform-only tests and the 0.3.0
@@ -248,6 +250,18 @@ Rules every implementation follows:
   spawning threads; `watchSignal` reports `error.SignalNotBlocked` otherwise.
   On kqueue and Windows `blockSignals` is a no-op, so portable programs call
   it unconditionally. Unwatching restores the prior disposition.
+- **Windows signals are console control events:** CTRL_C_EVENT is
+  `.interrupt`; CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT and CTRL_SHUTDOWN_EVENT
+  are `.terminate`. `.hangup`, `.user1` and `.user2` are `error.Unsupported`,
+  and so is every signal in a process without a console (a service or GUI
+  program). After CTRL_CLOSE_EVENT or CTRL_SHUTDOWN_EVENT the system ends
+  the process when the program exits or after its timeout (5 s for a closed
+  console window): finish shutdown within that time. Watching `.interrupt`
+  clears an inherited CTRL+C ignore flag; unwatching sets it again. Changing
+  the process's console (FreeConsole, AllocConsole, AttachConsole) drops
+  every watch without an error born could detect, so change consoles before
+  watching, or unwatch every signal and watch again. A port must not move
+  while it watches a signal.
 - **`.balanced` reuse-port** means the kernel spreads connections across
   listeners on one port: `SO_REUSEPORT_LB` on FreeBSD, `SO_REUSEPORT` on
   Linux. Where the platform can only share a port without balancing (macOS,

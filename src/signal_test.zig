@@ -15,7 +15,69 @@ const is_windows = builtin.os.tag == .windows;
 const probe: Signal = if (is_windows) .terminate else .user1;
 
 const win = struct {
-    extern "kernel32" fn GenerateConsoleCtrlEvent(dwCtrlEvent: u32, dwProcessGroupId: u32) callconv(.winapi) std.os.windows.BOOL;
+    const BOOL = std.os.windows.BOOL;
+    const HANDLE = std.os.windows.HANDLE;
+    extern "kernel32" fn GenerateConsoleCtrlEvent(dwCtrlEvent: u32, dwProcessGroupId: u32) callconv(.winapi) BOOL;
+    extern "kernel32" fn AllocConsole() callconv(.winapi) BOOL;
+    extern "kernel32" fn FreeConsole() callconv(.winapi) BOOL;
+    extern "kernel32" fn AttachConsole(dwProcessId: u32) callconv(.winapi) BOOL;
+    extern "kernel32" fn GetConsoleProcessList(lpdwProcessList: [*]u32, dwProcessCount: u32) callconv(.winapi) u32;
+    extern "kernel32" fn GetCurrentProcessId() callconv(.winapi) u32;
+    extern "kernel32" fn GetStdHandle(nStdHandle: u32) callconv(.winapi) ?HANDLE;
+    extern "kernel32" fn SetStdHandle(nStdHandle: u32, hHandle: ?HANDLE) callconv(.winapi) BOOL;
+    const ATTACH_PARENT_PROCESS: u32 = 0xFFFFFFFF;
+    /// STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE.
+    const std_ids = [3]u32{ 0xFFFFFFF6, 0xFFFFFFF5, 0xFFFFFFF4 };
+
+    /// This process is the only one attached to its console.
+    fn consoleIsOwn() bool {
+        var pids: [4]u32 = undefined;
+        const n = GetConsoleProcessList(&pids, pids.len);
+        return n == 1 and pids[0] == GetCurrentProcessId();
+    }
+};
+
+/// Windows: a console event generated for process group 0 reaches every
+/// process on the console, which can include the runner's parents (the
+/// ssh shell, `zig build`, the CI step's PowerShell). `isolate` moves the
+/// test process onto a new console of its own and checks that it is alone
+/// there, so `raise` reaches only this process. Changing consoles clears
+/// the process's console handlers, so isolate before watching. The standard
+/// handles are kept, and `restore` returns to the parent's console. A
+/// no-op on POSIX.
+const Console = struct {
+    saved: [3]?win.HANDLE = .{ null, null, null },
+    attached: bool = false,
+
+    fn isolate() !Console {
+        if (!is_windows) return .{};
+        var self: Console = .{};
+        for (win.std_ids, &self.saved) |id, *h| h.* = win.GetStdHandle(id);
+        self.attached = win.FreeConsole() != 0;
+        if (win.AllocConsole() == 0) {
+            const err = std.os.windows.GetLastError();
+            self.restore();
+            std.debug.print("skip: AllocConsole failed ({t}); console events need a console of the test's own\n", .{err});
+            return error.SkipZigTest;
+        }
+        self.keepStdHandles();
+        if (!win.consoleIsOwn()) {
+            self.restore();
+            return error.TestUnexpectedResult;
+        }
+        return self;
+    }
+
+    fn restore(self: Console) void {
+        if (!is_windows) return;
+        _ = win.FreeConsole();
+        if (self.attached) _ = win.AttachConsole(win.ATTACH_PARENT_PROCESS);
+        self.keepStdHandles();
+    }
+
+    fn keepStdHandles(self: Console) void {
+        for (win.std_ids, self.saved) |id, h| _ = win.SetStdHandle(id, h);
+    }
 };
 
 fn raise(sig: Signal) !void {
@@ -25,6 +87,8 @@ fn raise(sig: Signal) !void {
             .terminate => 1, // CTRL_BREAK_EVENT
             else => return error.TestUnexpectedResult,
         };
+        // Never signal a console shared with other processes.
+        if (!win.consoleIsOwn()) return error.TestUnexpectedResult;
         if (win.GenerateConsoleCtrlEvent(ctrl, 0) == 0) return error.TestUnexpectedResult;
     } else {
         // Process-directed: XNU's EVFILT_SIGNAL does not see a thread-directed raise(3).
@@ -75,6 +139,8 @@ test "signal: Signal maps to and from POSIX numbers" {
 }
 
 test "signal: a raised signal arrives as one event" {
+    const console = try Console.isolate();
+    defer console.restore();
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
     var tag: u8 = 0;
@@ -146,6 +212,8 @@ test "signal: unwatch restores the prior disposition" {
 }
 
 test "signal: a second port cannot watch the same signal" {
+    const console = try Console.isolate();
+    defer console.restore();
     var first = try born.EvPort.init(alloc);
     defer first.deinit();
     var second = try born.EvPort.init(alloc);
@@ -159,6 +227,8 @@ test "signal: a second port cannot watch the same signal" {
 }
 
 test "signal: unwatching an unwatched signal is a no-op" {
+    const console = try Console.isolate();
+    defer console.restore();
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
     var tag: u8 = 0;
@@ -172,6 +242,8 @@ test "signal: unwatching an unwatched signal is a no-op" {
 
 test "signal: Windows has only interrupt and terminate" {
     if (!is_windows) return error.SkipZigTest;
+    const console = try Console.isolate();
+    defer console.restore();
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
     var tag: u8 = 0;
@@ -180,4 +252,55 @@ test "signal: Windows has only interrupt and terminate" {
     inline for (.{ Signal.hangup, Signal.user1, Signal.user2 }) |sig| {
         try std.testing.expectError(error.Unsupported, port.watchSignal(sig, &tag));
     }
+}
+
+test "signal: Windows CTRL_C arrives as interrupt and unwatch restores CTRL+C ignoring" {
+    if (!is_windows) return error.SkipZigTest;
+    const console = try Console.isolate();
+    defer console.restore();
+    const windows = std.os.windows;
+    const params = windows.peb().ProcessParameters;
+    const ignored_before = params.ConsoleFlags & 1 != 0;
+    defer _ = windows.kernel32.SetConsoleCtrlHandler(null, @intFromBool(ignored_before));
+    // Start ignoring CTRL+C, as a process in a new process group does: the
+    // watch must clear that and its unwatch set it again.
+    if (windows.kernel32.SetConsoleCtrlHandler(null, windows.TRUE) == 0) return error.TestUnexpectedResult;
+
+    var port = try born.EvPort.init(alloc);
+    defer port.deinit();
+    var tag: u8 = 0;
+    try watchOrSkip(&port, .interrupt, &tag);
+    try std.testing.expect(params.ConsoleFlags & 1 == 0);
+    try raise(.interrupt);
+    var seen: std.ArrayList(Event) = .empty;
+    defer seen.deinit(alloc);
+    try collect(&port, .interrupt, &seen, 2000, 1);
+    try std.testing.expectEqual(@as(usize, 1), seen.items.len);
+    try std.testing.expect(seen.items[0].udata == @as(?*anyopaque, &tag));
+    try std.testing.expectEqual(@as(u32, 1), seen.items[0].fired);
+    port.unwatchSignal(.interrupt);
+    try std.testing.expect(params.ConsoleFlags & 1 != 0);
+}
+
+test "signal: Windows unwatch and watch after a console change reinstalls the handler" {
+    if (!is_windows) return error.SkipZigTest;
+    var port = try born.EvPort.init(alloc);
+    defer port.deinit();
+    var tag: u8 = 0;
+    {
+        const first = try Console.isolate();
+        defer first.restore();
+        try watchOrSkip(&port, probe, &tag);
+    }
+    // The console change cleared the process's handler list.
+    const second = try Console.isolate();
+    defer second.restore();
+    port.unwatchSignal(probe);
+    try port.watchSignal(probe, &tag);
+    defer port.unwatchSignal(probe);
+    try raise(probe);
+    var seen: std.ArrayList(Event) = .empty;
+    defer seen.deinit(alloc);
+    try collect(&port, probe, &seen, 2000, 1);
+    try std.testing.expectEqual(@as(usize, 1), seen.items.len);
 }
