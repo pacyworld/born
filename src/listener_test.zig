@@ -189,6 +189,55 @@ test "listener: .balanced is Unsupported where the kernel cannot balance" {
     try std.testing.expectError(error.Unsupported, Listener.openTcp(alloc, any, .{ .reuse_port = .balanced }));
 }
 
+test "listener: close with accepts outstanding drains cleanly, 1000 times" {
+    try wsaStart();
+    defer wsaStop();
+    var port = try born.EvPort.init(alloc);
+    defer port.deinit();
+    const loopback = try std.net.Address.parseIp4("127.0.0.1", 0);
+    const depth: usize = if (is_windows) (socket.ListenOptions{}).accept_depth else 0;
+    for (0..1000) |_| {
+        var l = try openOrSkip(loopback, .{});
+        try l.register(&port, &l);
+        try std.testing.expectEqual(depth, l.pendingOps());
+        try closeListener(&port, &l);
+    }
+    // No completion outlived its listener.
+    var events: [8]born.Event = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try port.wait(&events, 0));
+}
+
+test "listener: close drops completed connections that were never accepted" {
+    try wsaStart();
+    defer wsaStop();
+    var port = try born.EvPort.init(alloc);
+    defer port.deinit();
+    var l = try openOrSkip(try std.net.Address.parseIp4("127.0.0.1", 0), .{});
+    try l.register(&port, &l);
+    var clients: [2]std.net.Stream = undefined;
+    try connectClients(&clients, try l.localAddress());
+    defer for (&clients) |*c| c.close();
+    // Absorb every listener event of the batch, but accept none.
+    var events: [8]born.Event = undefined;
+    var absorbed: usize = 0;
+    var spins: usize = 0;
+    while (absorbed == 0) : (spins += 1) {
+        if (spins > 50) return error.ListenerEventTimeout;
+        const n = try port.wait(&events, 100);
+        for (events[0..n]) |ev| {
+            if (ev.udata != @as(?*anyopaque, &l)) continue;
+            _ = l.absorbCompletion(ev.overlapped, ev.bytes, if (ev.err) ev.err_no else null);
+            absorbed += 1;
+        }
+    }
+    try closeListener(&port, &l);
+}
+
+test {
+    // Windows-only completion paths (listener_windows.zig).
+    if (is_windows) _ = @import("listener_windows.zig");
+}
+
 /// A born handle as a socket for std.posix calls (a HANDLE on Windows).
 fn socketOf(h: born.Handle) std.posix.socket_t {
     return if (is_windows) @ptrCast(h) else h;

@@ -156,6 +156,28 @@ pub const PlainNb = struct {
         return last_err;
     }
 
+    /// Adopt a socket accepted by `Listener.acceptNb` (AcceptEx, accept
+    /// context already updated), CONSTRUCTED IN PLACE at `self`, and
+    /// associate it with `evp` under `key`. Takes ownership of `h`: on
+    /// failure it is closed and `self` stays empty. `evp` is required here.
+    pub fn adoptAccepted(self: *PlainNb, h: types.Handle, evp: ?*evport.EvPort, key: ?*anyopaque) io.AcceptError!void {
+        std.debug.assert(self.sock == ws2.INVALID_SOCKET and self.pendingOps() == 0 and !self.wsa_started);
+        const s: ws2.SOCKET = @ptrCast(h);
+        const port = evp orelse {
+            _ = ws2.closesocket(s);
+            return io.AcceptError.SocketError;
+        };
+        ensureWsa() catch {
+            _ = ws2.closesocket(s);
+            return io.AcceptError.SocketError;
+        };
+        self.* = .{ .sock = s, .wsa_started = true };
+        port.associate(h, key) catch {
+            self.deinit();
+            return io.AcceptError.SocketError;
+        };
+    }
+
     fn postConnectSetup(self: *PlainNb) error{SocketError}!void {
         if (ws2.setsockopt(self.sock, ws2.SOL.SOCKET, SO_UPDATE_CONNECT_CONTEXT, null, 0) != 0) return error.SocketError;
     }
