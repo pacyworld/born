@@ -1,0 +1,50 @@
+== rep 1 plain
+a_waits=258017
+wake mode=roundtrip size=0 requests=258017 seconds=5.501 rps=46908 p50_us=17.3 p99_us=52.6 p999_us=119.6 max_us=4441.5 dropped=0 failures=0
+== rep 1 syscalls
+a_waits=179459
+wake mode=roundtrip size=0 requests=179459 seconds=5.501 rps=32626 p50_us=24.0 p99_us=69.4 p999_us=173.0 max_us=4752.0 dropped=0 failures=0
+  read              717839    4.000/req
+  kevent            358919    2.000/req
+  write             358918    2.000/req
+syscalls=1435814 per_request=8.001
+== rep 2 plain
+a_waits=253340
+wake mode=roundtrip size=0 requests=253340 seconds=5.500 rps=46059 p50_us=15.9 p99_us=55.8 p999_us=128.0 max_us=2460.8 dropped=0 failures=0
+== rep 2 syscalls
+a_waits=181043
+wake mode=roundtrip size=0 requests=181043 seconds=5.501 rps=32913 p50_us=24.1 p99_us=68.9 p999_us=163.9 max_us=2160.5 dropped=0 failures=0
+  read              724175    4.000/req
+  kevent            362087    2.000/req
+  write             362086    2.000/req
+syscalls=1448485 per_request=8.001
+== rep 3 plain
+a_waits=250857
+wake mode=roundtrip size=0 requests=250857 seconds=5.500 rps=45608 p50_us=17.7 p99_us=53.7 p999_us=118.1 max_us=1695.2 dropped=0 failures=0
+== rep 3 syscalls
+a_waits=192817
+wake mode=roundtrip size=0 requests=192817 seconds=5.501 rps=35054 p50_us=21.9 p99_us=68.3 p999_us=200.0 max_us=10912.4 dropped=0 failures=0
+  read              771271    4.000/req
+  kevent            385635    2.000/req
+  write             385634    2.000/req
+syscalls=1542678 per_request=8.001
+== rep 4 plain
+a_waits=284663
+wake mode=roundtrip size=0 requests=284663 seconds=5.500 rps=51754 p50_us=14.4 p99_us=48.8 p999_us=112.5 max_us=20314.0 dropped=0 failures=0
+== rep 4 syscalls
+a_waits=208722
+wake mode=roundtrip size=0 requests=208722 seconds=5.500 rps=37946 p50_us=20.6 p99_us=65.7 p999_us=162.0 max_us=3669.0 dropped=0 failures=0
+  read              834891    4.000/req
+  kevent            417445    2.000/req
+  write             417444    2.000/req
+syscalls=1669918 per_request=8.001
+== rep 5 plain
+a_waits=283951
+wake mode=roundtrip size=0 requests=283951 seconds=5.500 rps=51623 p50_us=15.0 p99_us=48.7 p999_us=108.0 max_us=1777.7 dropped=0 failures=0
+== rep 5 syscalls
+a_waits=185488
+wake mode=roundtrip size=0 requests=185488 seconds=5.501 rps=33720 p50_us=23.1 p99_us=67.4 p999_us=165.9 max_us=1553.3 dropped=0 failures=0
+  read              741955    4.000/req
+  kevent            370977    2.000/req
+  write             370976    2.000/req
+syscalls=1484046 per_request=8.001
