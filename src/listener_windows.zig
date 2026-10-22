@@ -22,8 +22,10 @@
 //! `acceptNb`, which re-posts the slot. A re-post that fails leaves the
 //! slot idle and every later `acceptNb` retries it and reports the error
 //! (error.ResourceExhausted for WSAEMFILE/WSAENOBUFS). No completion arrives
-//! for an idle slot, so after closing connections resume by calling
-//! `acceptNb` again.
+//! for an idle slot. Resume as on POSIX: after closing connections call
+//! `register` again with the same port and udata (it re-posts the idle
+//! slots), then `acceptNb` until `.want_accept`. `unmonitorRead` is a
+//! no-op on IOCP, so the pause step needs no special case.
 //!
 //! An AF_UNIX listener (born#21) is the same machinery: bind and listen
 //! its socket, then `adoptListening` with its family and protocol.
@@ -98,6 +100,8 @@ pub const Listener = struct {
     alloc: ?std.mem.Allocator = null,
     /// The port from `register`; accepted streams are associated with it.
     evp: ?*evport.EvPort = null,
+    /// The completion key from `register`; a resume must repeat it.
+    udata: ?*anyopaque = null,
 
     /// TCP listener on `addr` (port 0 picks one; see `localAddress`) with
     /// SO_EXCLUSIVEADDRUSE. A backlog of 200 or more is requested exactly
@@ -145,10 +149,25 @@ pub const Listener = struct {
     /// Associate with the port under `udata` (every listener completion
     /// carries it) and post the AcceptEx operations. On failure, `close`
     /// and drain as usual.
+    ///
+    /// Called again with the same port and udata, it resumes (the POSIX
+    /// pause/resume sequence): idle slots are re-posted and the rest are
+    /// left alone. A re-post that fails here leaves its slot idle for the
+    /// `acceptNb` drain that must follow, which reports the precise error.
+    /// Another port or udata is error.SocketError: the completion key is
+    /// fixed when the socket is associated.
     pub fn register(self: *Listener, evp: *evport.EvPort, udata: ?*anyopaque) io.ListenerRegisterError!void {
-        if (self.sock == ws2.INVALID_SOCKET or self.evp != null) return io.ListenerRegisterError.SocketError;
+        if (self.sock == ws2.INVALID_SOCKET) return io.ListenerRegisterError.SocketError;
+        if (self.evp) |registered| {
+            if (registered != evp or self.udata != udata) return io.ListenerRegisterError.SocketError;
+            for (self.slots) |*slot| {
+                if (slot.state == .idle) self.post(slot) catch {}; // reported by acceptNb
+            }
+            return;
+        }
         evp.associate(self.handle(), udata) catch return io.ListenerRegisterError.SocketError;
         self.evp = evp;
+        self.udata = udata;
         for (self.slots) |*slot| self.post(slot) catch return io.ListenerRegisterError.SocketError;
     }
 
@@ -307,6 +326,7 @@ pub const Listener = struct {
         self.slots = &.{};
         self.alloc = null;
         self.evp = null;
+        self.udata = null;
         if (self.wsa_started) {
             _ = ws2.WSACleanup();
             self.wsa_started = false;
@@ -375,8 +395,9 @@ fn completionError(status: usize) io.AcceptError {
 // Completion paths the contract tests cannot provoke on demand: the real
 // AcceptEx is cancelled and its completion is absorbed with another status.
 
+/// The next completion for `l`. One per wait, so none is dropped.
 fn waitFor(port: *evport.EvPort, l: *Listener) !evport.Event {
-    var events: [8]evport.Event = undefined;
+    var events: [1]evport.Event = undefined;
     var timer = try std.time.Timer.start();
     while (true) {
         const elapsed = timer.read() / std.time.ns_per_ms;
@@ -440,4 +461,64 @@ test "listener_windows: a peer-gone completion re-posts its accept silently" {
 test "listener_windows: other failed completions surface once from acceptNb" {
     try expectCompletionOutcome(.INSUFFICIENT_RESOURCES, io.AcceptError.ResourceExhausted);
     try expectCompletionOutcome(.CANCELLED, io.AcceptError.SocketError);
+}
+
+test "listener_windows: register on the same port re-posts idle slots" {
+    const testing = std.testing;
+    var wsa: ws2.WSADATA = undefined;
+    try testing.expectEqual(@as(i32, 0), ws2.WSAStartup(0x0202, &wsa));
+    defer _ = ws2.WSACleanup();
+    var port = try evport.EvPort.init(testing.allocator);
+    defer port.deinit();
+    var other = try evport.EvPort.init(testing.allocator);
+    defer other.deinit();
+    const depth = 2;
+    var l = try Listener.openTcp(testing.allocator, try std.net.Address.parseIp4("127.0.0.1", 0), .{ .accept_depth = depth });
+    try l.register(&port, &l);
+
+    // Resuming with nothing idle posts nothing more.
+    try l.register(&port, &l);
+    try testing.expectEqual(@as(usize, depth), l.pendingOps());
+
+    // Leave slot 0 as a failed re-post leaves it: its AcceptEx completed
+    // (cancelled here) and no new one is outstanding.
+    const slot = &l.slots[0];
+    try testing.expect(kernel32.CancelIoEx(l.handle(), &slot.ov) != 0);
+    const cancelled = try waitFor(&port, &l);
+    try testing.expect(cancelled.overlapped == &slot.ov);
+    slot.closeSocket();
+    slot.state = .idle;
+    try testing.expectEqual(@as(usize, depth - 1), l.pendingOps());
+
+    // Another port or completion key is refused and changes nothing.
+    try testing.expectError(io.ListenerRegisterError.SocketError, l.register(&other, &l));
+    try testing.expectError(io.ListenerRegisterError.SocketError, l.register(&port, &other));
+    try testing.expectEqual(@as(usize, depth - 1), l.pendingOps());
+
+    // The POSIX resume sequence: pause (a no-op here), register, drain.
+    port.unmonitorRead(l.handle());
+    try l.register(&port, &l);
+    try testing.expectEqual(@as(usize, depth), l.pendingOps());
+    var out: PlainNb = .{};
+    try testing.expectEqual(io.AcceptResult.want_accept, try l.acceptNb(&out, &out));
+
+    // Every slot accepts again.
+    var clients: [depth]std.net.Stream = undefined;
+    for (&clients) |*c| c.* = try std.net.tcpConnectToAddress(try l.localAddress());
+    defer for (&clients) |*c| c.close();
+    var streams = [_]PlainNb{.{}} ** depth;
+    var accepted: usize = 0;
+    while (accepted < depth) {
+        const ev = try waitFor(&port, &l);
+        _ = l.absorbCompletion(ev.overlapped, ev.bytes, if (ev.err) ev.err_no else null);
+        while (accepted < depth) {
+            const s = &streams[accepted];
+            switch (try l.acceptNb(s, s)) {
+                .accepted => accepted += 1,
+                .want_accept => break,
+            }
+        }
+    }
+    for (&streams) |*s| s.cancelAndClose();
+    try drain(&port, &l);
 }

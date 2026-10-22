@@ -257,6 +257,32 @@ fn waitFor(port: *born.EvPort, l: *Listener) !born.Event {
     }
 }
 
+test "listener: pause with unmonitorRead, resume with register and drain" {
+    try wsaStart();
+    defer wsaStop();
+    var port = try born.EvPort.init(alloc);
+    defer port.deinit();
+    var l = try openOrSkip(try std.net.Address.parseIp4("127.0.0.1", 0), .{});
+    try l.register(&port, &l);
+    port.unmonitorRead(l.handle());
+
+    const n = 4;
+    var streams = [_]PlainNb{.{}} ** n;
+    var acceptor: Acceptor = .{ .listener = &l, .streams = &streams };
+    defer acceptor.deinit();
+    var clients: [n]std.net.Stream = undefined;
+    try connectClients(&clients, try l.localAddress());
+    defer for (&clients) |*c| c.close();
+
+    // Resume: register again, then drain at once, since connections
+    // already queued produce no new edge on POSIX.
+    try l.register(&port, &l);
+    try std.testing.expect(try acceptor.onEvent(.{ .udata = &l }));
+    try pump(&port, &.{&acceptor}, n, 5000);
+    try std.testing.expectEqual(@as(usize, n), acceptor.count);
+    try closeListener(&port, &l);
+}
+
 test "listener: an accepted stream reports its peer address" {
     try wsaStart();
     defer wsaStop();
