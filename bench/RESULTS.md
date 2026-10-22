@@ -1,11 +1,11 @@
 # kqueue hot-path results
 
-Host: freebsd-dev1, FreeBSD 15.1-RELEASE-p2 amd64, Intel Xeon E5-2620 v4,
+Host: FreeBSD 15.1-RELEASE-p2 amd64 development host, Intel Xeon E5-2620 v4,
 20 CPUs, `kern.hz=100`. Zig 0.15.2, ReleaseSafe. Server on CPU 2, clients on
-CPUs 4-11 (`bench/README.md`). The host is shared with other sessions, so
-throughput and tail latency carry noise; every cell is the median of 5
-repetitions with (min-max) beside it. Syscalls per request come from DTrace on
-the server; the loop's own calls are deterministic. Raw runs: `bench/raw/<step>/`.
+CPUs 4-11 (`bench/README.md`). The host is shared, so throughput and tail
+latency carry noise; every cell is the median of 5 repetitions with (min-max)
+beside it. Syscalls per request come from DTrace on the server; the loop's own
+calls are deterministic.
 
 Scenarios: `echo1` one connection, 64-byte echo; `echo16` sixteen connections;
 `storm16` sixteen threads of connect, 1 byte, reply, close; `bulk4` four
@@ -69,7 +69,7 @@ The syscall count is identical by construction. bulk4 CPU per request differs by
 directions with the host's drift. The kernel saves a knote allocation per
 re-arm, but at six re-arms per hundred events it does not show. **Rejected, not
 adopted:** `wantWrite` stays `EV_ONESHOT`, which also avoids a parked knote per
-connection. Raw runs: `bench/raw/b-rejected/`.
+connection.
 
 ## (c) EVFILT_USER for `wake()` (adopted on FreeBSD and macOS)
 
@@ -86,7 +86,6 @@ guards.
 A wake round trip drops from 8 to 4 syscalls (per wake: `write` + `read` x2 + the
 loop's `kevent` become a trigger `kevent` + the loop's `kevent`), p50 -20%, p99
 -19%, throughput +29%, with the ranges apart. The echo guards do not move.
-Raw runs: `bench/raw/c/`.
 
 macOS check (second kqueue): MacBook Pro, Apple silicon (Darwin 25.1.0 arm64), Zig
 0.15.2 ReleaseSafe, `born-bench wake --seconds 4`, three alternating runs of the
@@ -98,15 +97,13 @@ EVFILT_USER wake and the readiness-count tests asserting the kernel's counts.
 ## (d) Accept filter (accf_data) and (e) event buffer size: not measured, not adopted
 
 Both were implemented and built (accept filter: `ListenOptions.accept_filter`,
-`error.AcceptFilterUnavailable`, tests passing with `accf_data` loaded on
-freebsd-dev1; buffer: `kbuf` 64 to 256), then measurement became impossible:
-from about 06:40 on 2026-10-22 freebsd-dev1 was loaded by other work (load
-average 30-35: a root `xz` with 21 threads running 19+ hours, builds from other
-sessions), and the single `ip` netisr thread (`netstat -Q`: 1 thread, queue
-limit 256, 333977 queue drops) started dropping loopback packets. Every connection
-storm then stalled for 0.5-4 s on SYN retransmits, with or without the filter and
-on every `cpuset` choice, and even `echo16` fell from about 100000 to 1424 req/s.
-Changing `net.isr` settings or killing the foreign job is outside this work.
+`error.AcceptFilterUnavailable`, tests passing with `accf_data` loaded;
+buffer: `kbuf` 64 to 256). Measurement then became impossible: sustained
+foreign load pushed the host's load average to 30-35 and the single `ip` netisr
+thread (`netstat -Q`: queue limit 256, 333977 queue drops) started dropping
+loopback packets. Every connection storm stalled for 0.5-4 s on SYN
+retransmits, with or without the filter and on every `cpuset` choice, and even
+`echo16` fell from about 100000 to 1424 req/s. System settings were not changed.
 
 | Run (storm16 unless noted, host degraded) | req/s | notes |
 |---|---|---|
@@ -114,11 +111,10 @@ Changing `net.isr` settings or killing the foreign job is outside this work.
 | filter + read after accept | 7 (2-112) | p50 1.9 s |
 | read after accept only | 7 (3-11) | p50 1.5 s |
 
-These numbers say nothing about the filter. With no measured improvement, neither
-change is in this branch. The accept-filter change is kept as a patch against this
-branch's parent (`born31-accept-filter.patch` in the session notes folder) and
-the benchmark keeps `--read-after-accept`, so both can be measured on a quiet
-host: `SERVER_ARGS=--read-after-accept` against the patch's `--accept-filter`.
-Expected effect to confirm: with the filter a lone connection needs one `kevent`
-wake instead of two. `kbuf` stays 64 (it matters only when more than 64 events are
-ready per wait).
+These numbers say nothing about the filter. With no measured improvement,
+neither change is in this tree. The accept-filter patch is attached to issue #31
+and the benchmark keeps `--read-after-accept`, so both can be measured on a
+quiet host: `SERVER_ARGS=--read-after-accept` against the patch's
+`--accept-filter`. Expected effect to confirm: with the filter a lone
+connection needs one `kevent` wake instead of two. `kbuf` stays 64 (it matters
+only when more than 64 events are ready per wait).
