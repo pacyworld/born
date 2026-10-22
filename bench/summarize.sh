@@ -19,12 +19,12 @@ for f in "$1"/*.txt; do
     /^== rep .* plain/ { plain = 1; next }
     /^== rep .* syscalls/ { plain = 0; next }
     /^(client|wake) mode=/ && plain { n++; rps[n] = kv($0, "rps"); p50[n] = kv($0, "p50_us"); p99[n] = kv($0, "p99_us"); p999[n] = kv($0, "p999_us") }
-    /^server waits=/ && plain { w++; wpr[w] = kv($0, "waits") / (kv(last, "requests")) }
+    /^server waits=/ && plain { w++; cpu[w] = kv($0, "cpu_us") / kv(last, "requests") }
     /^(client|wake) mode=/ { last = $0 }
     /^syscalls=/ { s++; spr[s] = kv($0, "per_request") }
     END {
-        printf "%-8s reps=%d  rps %s  p50_us %s  p99_us %s  p999_us %s  syscalls/req %s\n", name, n,
-            rng(rps, n), rng(p50, n), rng(p99, n), rng(p999, n), rng(spr, s)
+        printf "%-8s reps=%d  rps %s  p50_us %s  p99_us %s  p999_us %s  cpu_us/req %s  syscalls/req %s\n", name, n,
+            rng(rps, n), rng(p50, n), rng(p99, n), rng(p999, n), rng(cpu, w), rng(spr, s)
     }
     function rng(a, n,   i, lo, hi, m, b) {
         if (n == 0) return "-"

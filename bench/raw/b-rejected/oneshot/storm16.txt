@@ -1,0 +1,72 @@
+== rep 1 plain
+client mode=storm size=1 requests=162438 seconds=5.001 rps=32484 p50_us=442.8 p99_us=954.8 p999_us=1916.6 max_us=33575.7 dropped=0 failures=0
+server waits=432340 events=484456 accepts=162438 reads=487314 writes=162438 short_writes=0 closed=162438 resets=162438 errors=0 cpu_us=2504294
+== rep 1 syscalls
+client mode=storm size=1 requests=153932 seconds=5.001 rps=30783 p50_us=475.6 p99_us=917.7 p999_us=2419.3 max_us=7741.9 dropped=0 failures=0
+server waits=368680 events=454411 accepts=153932 reads=461796 writes=153932 short_writes=0 closed=153932 resets=153932 errors=0 cpu_us=3145922
+  kevent            368680    2.395/req
+  read              307867    2.000/req
+  close             153943    1.000/req
+  accept4           153932    1.000/req
+  sendto            153932    1.000/req
+syscalls=1138487 per_request=7.396
+== rep 1 plain
+client mode=storm size=1 requests=174821 seconds=5.000 rps=34962 p50_us=377.0 p99_us=857.2 p999_us=1917.3 max_us=16100.6 dropped=0 failures=0
+server waits=463873 events=521141 accepts=174821 reads=524463 writes=174821 short_writes=0 closed=174821 resets=174821 errors=0 cpu_us=2500681
+== rep 1 syscalls
+client mode=storm size=1 requests=137016 seconds=5.000 rps=27402 p50_us=483.8 p99_us=1007.6 p999_us=1859.5 max_us=252114.4 dropped=0 failures=0
+server waits=333923 events=405923 accepts=137016 reads=411048 writes=137016 short_writes=0 closed=137016 resets=137016 errors=0 cpu_us=3015735
+  kevent            333923    2.437/req
+  read              274035    2.000/req
+  close             137027    1.000/req
+  accept4           137016    1.000/req
+  sendto            137016    1.000/req
+syscalls=1019150 per_request=7.438
+== rep 1 plain
+client mode=storm size=1 requests=186246 seconds=5.000 rps=37246 p50_us=384.4 p99_us=822.9 p999_us=1787.0 max_us=17209.7 dropped=0 failures=0
+server waits=479134 events=555192 accepts=186246 reads=558738 writes=186246 short_writes=0 closed=186246 resets=186246 errors=0 cpu_us=2888609
+== rep 1 syscalls
+client mode=storm size=1 requests=157964 seconds=5.091 rps=31029 p50_us=401.3 p99_us=897.4 p999_us=1626.1 max_us=480325.4 dropped=0 failures=0
+server waits=373150 events=467018 accepts=157964 reads=473892 writes=157964 short_writes=0 closed=157964 resets=157964 errors=0 cpu_us=3063538
+  kevent            373150    2.362/req
+  read              315931    2.000/req
+  close             157975    1.000/req
+  accept4           157964    1.000/req
+  sendto            157964    1.000/req
+syscalls=1163117 per_request=7.363
+== rep 1 plain
+client mode=storm size=1 requests=135433 seconds=5.000 rps=27084 p50_us=512.9 p99_us=977.5 p999_us=2876.4 max_us=79458.4 dropped=0 failures=0
+server waits=353145 events=402439 accepts=135433 reads=406299 writes=135433 short_writes=0 closed=135433 resets=135433 errors=0 cpu_us=2506295
+== rep 1 syscalls
+client mode=storm size=1 requests=143501 seconds=5.000 rps=28698 p50_us=469.1 p99_us=865.4 p999_us=6408.7 max_us=94639.3 dropped=0 failures=0
+server waits=341933 events=424173 accepts=143501 reads=430503 writes=143501 short_writes=0 closed=143501 resets=143501 errors=0 cpu_us=2957452
+  kevent            341933    2.383/req
+  read              287005    2.000/req
+  close             143512    1.000/req
+  accept4           143501    1.000/req
+  sendto            143501    1.000/req
+syscalls=1059583 per_request=7.384
+== rep 1 plain
+client mode=storm size=1 requests=191738 seconds=5.001 rps=38343 p50_us=395.8 p99_us=762.6 p999_us=1541.7 max_us=7386.8 dropped=0 failures=0
+server waits=491603 events=571737 accepts=191738 reads=575214 writes=191738 short_writes=0 closed=191738 resets=191738 errors=0 cpu_us=2925835
+== rep 1 syscalls
+client mode=storm size=1 requests=174764 seconds=5.000 rps=34950 p50_us=334.5 p99_us=777.3 p999_us=1200.5 max_us=495454.6 dropped=0 failures=0
+server waits=414338 events=517745 accepts=174764 reads=524292 writes=174764 short_writes=0 closed=174764 resets=174764 errors=0 cpu_us=2930582
+  kevent            414338    2.371/req
+  read              349531    2.000/req
+  close             174775    1.000/req
+  accept4           174764    1.000/req
+  sendto            174764    1.000/req
+syscalls=1288305 per_request=7.372
+== rep 1 plain
+client mode=storm size=1 requests=144382 seconds=5.001 rps=28873 p50_us=466.0 p99_us=961.6 p999_us=8262.4 max_us=87349.4 dropped=0 failures=0
+server waits=375199 events=430611 accepts=144382 reads=433146 writes=144382 short_writes=0 closed=144382 resets=144382 errors=0 cpu_us=2621939
+== rep 1 syscalls
+client mode=storm size=1 requests=140006 seconds=5.000 rps=27999 p50_us=474.7 p99_us=1001.3 p999_us=12035.3 max_us=94068.6 dropped=0 failures=0
+server waits=329880 events=413011 accepts=140006 reads=420018 writes=140006 short_writes=0 closed=140006 resets=140006 errors=0 cpu_us=2966880
+  kevent            329880    2.356/req
+  read              280015    2.000/req
+  close             140017    1.000/req
+  accept4           140006    1.000/req
+  sendto            140006    1.000/req
+syscalls=1030056 per_request=7.357

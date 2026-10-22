@@ -316,9 +316,12 @@ fn serve(alloc: std.mem.Allocator, opts: Options) !void {
         srv.reap();
     }
     const s = srv.stats;
+    // User plus system CPU of the whole process, the loop being its only thread.
+    const cpu = posix.clock_gettime(.PROCESS_CPUTIME_ID) catch @panic("clock_gettime failed");
+    const cpu_us: u64 = @as(u64, @intCast(cpu.sec)) * 1_000_000 + @as(u64, @intCast(cpu.nsec)) / 1000;
     std.debug.print(
-        "server waits={d} events={d} accepts={d} reads={d} writes={d} short_writes={d} closed={d} resets={d} errors={d}\n",
-        .{ s.waits, s.events, s.accepts, s.reads, s.writes, s.short_writes, s.closed, s.resets, s.errors },
+        "server waits={d} events={d} accepts={d} reads={d} writes={d} short_writes={d} closed={d} resets={d} errors={d} cpu_us={d}\n",
+        .{ s.waits, s.events, s.accepts, s.reads, s.writes, s.short_writes, s.closed, s.resets, s.errors, cpu_us },
     );
 }
 
@@ -326,7 +329,6 @@ fn serve(alloc: std.mem.Allocator, opts: Options) !void {
 
 /// <netinet/tcp.h> TCP_NODELAY is 1 on FreeBSD, Linux and macOS.
 const TCP_NODELAY: u32 = 1;
-
 const Linger = extern struct { onoff: c_int, linger: c_int };
 
 const Worker = struct {

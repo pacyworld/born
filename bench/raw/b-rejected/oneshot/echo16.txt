@@ -1,0 +1,60 @@
+== rep 1 plain
+client mode=echo size=64 requests=432660 seconds=5.000 rps=86530 p50_us=146.3 p99_us=325.7 p999_us=1324.2 max_us=440529.6 dropped=0 failures=0
+server waits=340528 events=432693 accepts=16 reads=865336 writes=432660 short_writes=0 closed=16 resets=0 errors=0 cpu_us=2953904
+== rep 1 syscalls
+client mode=echo size=64 requests=492074 seconds=5.000 rps=98409 p50_us=146.3 p99_us=316.6 p999_us=703.6 max_us=4265.6 dropped=0 failures=0
+server waits=347187 events=492107 accepts=16 reads=984164 writes=492074 short_writes=0 closed=16 resets=0 errors=0 cpu_us=3735709
+  read              492093    1.000/req
+  sendto            492074    1.000/req
+  kevent            347187    0.706/req
+syscalls=1331523 per_request=2.706
+== rep 1 plain
+client mode=echo size=64 requests=471214 seconds=5.000 rps=94239 p50_us=133.3 p99_us=289.0 p999_us=817.1 max_us=94706.4 dropped=0 failures=0
+server waits=360791 events=471247 accepts=16 reads=942444 writes=471214 short_writes=0 closed=16 resets=0 errors=0 cpu_us=3153045
+== rep 1 syscalls
+client mode=echo size=64 requests=525442 seconds=5.000 rps=105084 p50_us=127.0 p99_us=291.7 p999_us=686.3 max_us=89605.4 dropped=0 failures=0
+server waits=329667 events=525475 accepts=16 reads=1050900 writes=525442 short_writes=0 closed=16 resets=0 errors=0 cpu_us=3891972
+  read              525461    1.000/req
+  sendto            525442    1.000/req
+  kevent            329667    0.627/req
+syscalls=1380739 per_request=2.628
+== rep 1 plain
+client mode=echo size=64 requests=448705 seconds=5.000 rps=89738 p50_us=144.8 p99_us=322.4 p999_us=784.0 max_us=94692.1 dropped=0 failures=0
+server waits=361284 events=448738 accepts=16 reads=897426 writes=448705 short_writes=0 closed=16 resets=0 errors=0 cpu_us=2958269
+== rep 1 syscalls
+client mode=echo size=64 requests=577016 seconds=5.000 rps=115393 p50_us=124.0 p99_us=301.5 p999_us=375.1 max_us=25556.9 dropped=0 failures=0
+server waits=346669 events=577048 accepts=16 reads=1154048 writes=577016 short_writes=0 closed=16 resets=0 errors=0 cpu_us=4371428
+  read              577035    1.000/req
+  sendto            577016    1.000/req
+  kevent            346669    0.601/req
+syscalls=1500889 per_request=2.601
+== rep 1 plain
+client mode=echo size=64 requests=531941 seconds=5.000 rps=106383 p50_us=128.4 p99_us=274.8 p999_us=394.3 max_us=94834.5 dropped=0 failures=0
+server waits=417078 events=531974 accepts=16 reads=1063898 writes=531941 short_writes=0 closed=16 resets=0 errors=0 cpu_us=3556637
+== rep 1 syscalls
+client mode=echo size=64 requests=508854 seconds=5.000 rps=101767 p50_us=141.2 p99_us=315.2 p999_us=441.9 max_us=3133.5 dropped=0 failures=0
+server waits=305545 events=508887 accepts=16 reads=1017724 writes=508854 short_writes=0 closed=16 resets=0 errors=0 cpu_us=4342265
+  read              508873    1.000/req
+  sendto            508854    1.000/req
+  kevent            305545    0.600/req
+syscalls=1323441 per_request=2.601
+== rep 1 plain
+client mode=echo size=64 requests=624567 seconds=5.000 rps=124906 p50_us=113.5 p99_us=260.8 p999_us=378.1 max_us=12576.9 dropped=0 failures=0
+server waits=487380 events=624600 accepts=16 reads=1249150 writes=624567 short_writes=0 closed=16 resets=0 errors=0 cpu_us=3433011
+== rep 1 syscalls
+client mode=echo size=64 requests=518551 seconds=5.000 rps=103706 p50_us=139.2 p99_us=282.8 p999_us=369.8 max_us=5075.5 dropped=0 failures=0
+server waits=317708 events=518584 accepts=16 reads=1037118 writes=518551 short_writes=0 closed=16 resets=0 errors=0 cpu_us=4308842
+  read              518570    1.000/req
+  sendto            518551    1.000/req
+  kevent            317708    0.613/req
+syscalls=1354998 per_request=2.613
+== rep 1 plain
+client mode=echo size=64 requests=580631 seconds=5.000 rps=116121 p50_us=123.4 p99_us=366.3 p999_us=693.1 max_us=10598.0 dropped=0 failures=0
+server waits=429991 events=580664 accepts=16 reads=1161278 writes=580631 short_writes=0 closed=16 resets=0 errors=0 cpu_us=3644858
+== rep 1 syscalls
+client mode=echo size=64 requests=560060 seconds=5.000 rps=112008 p50_us=127.0 p99_us=268.4 p999_us=405.1 max_us=20713.8 dropped=0 failures=0
+server waits=310696 events=560093 accepts=16 reads=1120136 writes=560060 short_writes=0 closed=16 resets=0 errors=0 cpu_us=4398151
+  read              560079    1.000/req
+  sendto            560060    1.000/req
+  kevent            310696    0.555/req
+syscalls=1431004 per_request=2.555

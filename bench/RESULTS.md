@@ -48,3 +48,25 @@ accept4 per storm connection plus the same read, and by ~0.7 per bulk request.
 Latency and throughput stay inside the run-to-run noise (echo1 p50 -5%,
 storm16 p50 -7%, both within the baseline's own min-max). Adopted for the
 syscall reduction; wake is untouched, as expected.
+
+## (b) EV_DISPATCH + EV_ENABLE write re-arm (rejected)
+
+Interleaved A/B (`bench/ab.sh`, 6 pairs, scenarios echo16, storm16, bulk4) of
+`wantWrite` staging `EV_ADD | EV_ONESHOT` (A, the (a) tree) against
+`EV_ADD | EV_DISPATCH | EV_ENABLE` (B). Only bulk4 arms write interest (about 0.3
+re-arms per request, 6% of its events); echo and storm never do. Server CPU per
+request is the process CPU time (`clock_gettime(PROCESS_CPUTIME_ID)`) divided by
+requests.
+
+| Scenario | req/s A | req/s B | server cpu us/req A | server cpu us/req B | syscalls/req A | B |
+|---|---|---|---|---|---|---|
+| bulk4 | 500 (472-532) | 500 (461-526) | 2040 (1938-2211) | 2031 (1969-2118) | 6.013 | 6.031 |
+| echo16 | 94240 (86530-124900) | 114300 (98470-139700) | 6.59 (5.50-6.83) | 6.29 (4.85-6.75) | 2.601 | 2.614 |
+| storm16 | 32480 (27080-38340) | 26800 (21120-37990) | 15.42 (14.30-18.51) | 16.84 (13.32-18.72) | 7.372 | 7.384 |
+
+The syscall count is identical by construction. bulk4 CPU per request differs by
+0.4%, far inside the 5-10% spread, and echo16/storm16 differences go in both
+directions with the host's drift. The kernel saves a knote allocation per
+re-arm, but at six re-arms per hundred events it does not show. **Rejected, not
+adopted:** `wantWrite` stays `EV_ONESHOT`, which also avoids a parked knote per
+connection. Raw runs: `bench/raw/b-rejected/`.
