@@ -30,3 +30,21 @@ costs per wake: `write` 1, `kevent` 1 and `read` 2 (the drain). A bulk request
 is ~4.4 `sendto` (64 KiB chunks from a 1 MiB pattern buffer), `read` 2 and
 `kevent` ~0.5; about 0.3 of its `sendto` calls per request end in EAGAIN and
 arm write interest.
+
+## (a) Readiness counts: `Event.avail` and `hintReadable` (adopted)
+
+The bench server calls `hintReadable(ev)` on each listener and stream event.
+
+| Scenario | req/s | p50 us | p99 us | p99.9 us | syscalls/req (baseline) |
+|---|---|---|---|---|---|
+| echo1 | 23690 (18940-30340) | 30.5 (28.2-31.2) | 111.8 (98.6-121.5) | 378.5 (262.4-421.6) | 3.001 (4.001) |
+| echo16 | 111200 (101200-126600) | 128.5 (111.6-141.1) | 309.5 (237-338.6) | 685.6 (370.3-807.1) | 2.626 (3.578) |
+| storm16 | 31810 (28020-37180) | 427.8 (340.6-474.3) | 853.3 (744.1-887.8) | 1823 (1226-23450) | 7.305 (9.153) |
+| bulk4 | 496 (481-518) | 7682 (7387-7978) | 11210 (10730-12260) | 18840 (17500-57780) | 6.234 (6.959) |
+| wake | 50590 (47140-51190) | 16.2 (14.2-17.1) | 51.4 (50.8-53.7) | 117.2 (112.2-124.3) | 8.001 (8.001) |
+
+Syscalls fall by one per echo (the read that only returned EAGAIN), by one
+accept4 per storm connection plus the same read, and by ~0.7 per bulk request.
+Latency and throughput stay inside the run-to-run noise (echo1 p50 -5%,
+storm16 p50 -7%, both within the baseline's own min-max). Adopted for the
+syscall reduction; wake is untouched, as expected.

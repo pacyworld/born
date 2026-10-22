@@ -170,7 +170,7 @@ const Server = struct {
     pattern: []const u8 = &.{},
 
     fn serviceListener(self: *Server, ev: born.Event) !void {
-        _ = ev;
+        self.listener.hintReadable(ev);
         while (true) {
             const slot = self.free orelse {
                 self.stats.errors += 1;
@@ -196,7 +196,7 @@ const Server = struct {
     fn serviceConn(self: *Server, c: *Conn, ev: born.Event) void {
         if (c.closing) return;
         if (ev.err) return self.closeLater(c, true);
-
+        c.stream.hintReadable(ev);
         self.pump(c) catch |err| switch (err) {
             error.Closed => self.closeLater(c, false),
             error.SocketError => self.closeLater(c, true),
@@ -471,10 +471,10 @@ fn reportLatency(role: []const u8, mode: []const u8, samples: []u32, elapsed_ns:
     out(
         "{s} mode={s} size={d} requests={d} seconds={d:.3} rps={d:.0} p50_us={d:.1} p99_us={d:.1} p999_us={d:.1} max_us={d:.1} dropped={d} failures={d}\n",
         .{
-            role,                                                mode,                 size,
-            n,                                                   secs,                 @as(f64, @floatFromInt(n)) / secs,
-            percentileUs(samples, 50.0),                         percentileUs(samples, 99.0), percentileUs(samples, 99.9),
-            if (n == 0) 0.0 else @as(f64, @floatFromInt(samples[n - 1])) / 1000.0, dropped, failures,
+            role,                                                                  mode,                        size,
+            n,                                                                     secs,                        @as(f64, @floatFromInt(n)) / secs,
+            percentileUs(samples, 50.0),                                           percentileUs(samples, 99.0), percentileUs(samples, 99.9),
+            if (n == 0) 0.0 else @as(f64, @floatFromInt(samples[n - 1])) / 1000.0, dropped,                     failures,
         },
     );
 }

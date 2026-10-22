@@ -43,6 +43,8 @@ pub const Listener = struct {
     sock: posix.fd_t = -1,
     /// Unix-socket state (e.g. the bound path), owned by unix_posix.zig.
     unix: unix_posix.ListenerState = .{},
+    /// Connections the last readable event reported; see `hintReadable`.
+    hint: io.ReadyHint = .{},
 
     /// TCP listener on `addr` (port 0 picks one; see `localAddress`).
     /// `.balanced` is SO_REUSEPORT_LB on FreeBSD and SO_REUSEPORT on Linux;
@@ -116,20 +118,33 @@ pub const Listener = struct {
         _ = key;
         if (self.sock < 0) return io.AcceptError.SocketError;
         std.debug.assert(out.sock == -1);
+        // Every exit but a successful accept forgets the count, so a resume
+        // after ResourceExhausted drains to EAGAIN.
+        errdefer self.hint.clear();
         while (true) {
+            if (self.hint.exhausted()) return .want_accept;
             const rc = if (have_accept4)
                 std.c.accept4(self.sock, null, null, posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC)
             else
                 std.c.accept(self.sock, null, null);
             switch (posix.errno(rc)) {
-                .SUCCESS => {},
+                .SUCCESS => self.hint.consume(1),
                 .INTR => continue,
-                .AGAIN => return .want_accept,
-                .CONNABORTED, .PROTO => continue,
+                .AGAIN => {
+                    self.hint.clear();
+                    return .want_accept;
+                },
+                .CONNABORTED, .PROTO => {
+                    self.hint.consume(1);
+                    continue;
+                },
                 .MFILE, .NFILE, .NOBUFS, .NOMEM => return io.AcceptError.ResourceExhausted,
                 else => |e| {
                     if (comptime builtin.os.tag == .linux) {
-                        if (linuxSkip(e)) continue;
+                        if (linuxSkip(e)) {
+                            self.hint.consume(1);
+                            continue;
+                        }
                     }
                     return io.AcceptError.SocketError;
                 },
@@ -143,6 +158,15 @@ pub const Listener = struct {
             };
             return .accepted;
         }
+    }
+
+    /// Record the pending-connection count of a readable listener event
+    /// (`Event.avail` on kqueue; unknown elsewhere). `acceptNb` then answers
+    /// `.want_accept` without the accept that would only return EAGAIN once
+    /// that many connections were taken. Call it on every readable event
+    /// before the first `acceptNb`; each event replaces the previous count.
+    pub fn hintReadable(self: *Listener, ev: types.Event) void {
+        self.hint.arm(ev);
     }
 
     /// No overlapped accepts on POSIX.

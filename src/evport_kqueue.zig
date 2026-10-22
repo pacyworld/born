@@ -321,6 +321,8 @@ pub const EvPort = struct {
         if (is_err) return ev;
         if (kev.filter == EVFILT_READ) {
             ev.readable = true;
+            // Bytes buffered, or connections queued on a listener.
+            ev.avail = if (kev.data > 0) std.math.cast(usize, kev.data) orelse std.math.maxInt(usize) else 0;
         } else if (kev.filter == EVFILT_WRITE) {
             ev.writable = true;
         } else if (kev.filter == EVFILT_TIMER) {
@@ -597,6 +599,17 @@ test "kqueue: timer and signal kevents translate to their event fields" {
     const read = EvPort.translate(EvPort.change(5, EVFILT_READ, EV_ADD, &tag));
     try std.testing.expect(read.readable and !read.timer and read.signal == null);
     try std.testing.expectEqual(@as(u32, 0), read.fired);
+    try std.testing.expectEqual(@as(usize, 0), read.avail);
+
+    // Readable events carry the kernel's count; nothing else does.
+    var counted = EvPort.change(5, EVFILT_READ, EV_ADD, &tag);
+    counted.data = 4096;
+    try std.testing.expectEqual(@as(usize, 4096), EvPort.translate(counted).avail);
+    counted.data = -1;
+    try std.testing.expectEqual(@as(usize, 0), EvPort.translate(counted).avail);
+    counted.filter = EVFILT_WRITE;
+    counted.data = 4096;
+    try std.testing.expectEqual(@as(usize, 0), EvPort.translate(counted).avail);
 }
 
 test "kqueue: stageRaw timer is submitted by the next wait and fires once" {

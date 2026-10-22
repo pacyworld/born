@@ -126,7 +126,8 @@ overlappable named pipes or a blocking-pipe relay, as mcp-bridge does.
 `overlapped: ?*std.os.windows.OVERLAPPED`, `bytes: usize`, and the 0.3.0
 fields `timer: bool`, `signal: ?born.Signal` and `fired: u32` (see
 [Planned in 0.3.0](#planned-in-030)), which stay false, null and zero for
-every other event.
+every other event, and `avail: usize`, the readiness count (see
+[Readiness counts](#readiness-counts)).
 Completion fields are null/zero on POSIX. Error numbers are native errno on
 kqueue and NTSTATUS on IOCP, not a portable error enumeration.
 
@@ -199,6 +200,28 @@ asynchronous DNS, TLS, or arbitrary child-process I/O.
 
 `src/socket_test.zig` exercises the same loopback lifecycle on all three backend
 families and is the executable usage reference.
+
+### Readiness counts
+
+On kqueue a readable event carries the kernel's count in `Event.avail`: bytes
+buffered on a stream, connections queued on a listener. It is 0 where the
+count is unknown (always on epoll and IOCP, and on any other event).
+`PlainNb.hintReadable(event)` and `Listener.hintReadable(event)` record it, and
+`readNb` / `acceptNb` then answer `.want_read` / `.want_accept` without the
+call that could only return EAGAIN once that many bytes or connections were
+taken. The drain-to-EAGAIN contract is unchanged: with no hint the calls drain
+exactly as before, and stopping at the count never strands data because
+anything arriving after the kernel took the count raises a new edge.
+
+- Call `hintReadable` on every readable event before the first read or
+  accept. Each event replaces the previous count; a count outliving a
+  partial drain would strand the rest.
+- An EOF event is not hinted (`readNb` keeps reading until it returns `.eof`),
+  and every error, EAGAIN or `ResourceExhausted` path clears the hint.
+- On IOCP, `hintReadable` is a no-op.
+
+Measured on the loopback benchmark (`bench/RESULTS.md`): one syscall less per
+echo and about two less per connection in the accept storm.
 
 ## Planned in 0.3.0
 

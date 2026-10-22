@@ -242,6 +242,12 @@ pub const Listener = struct {
         return .accept;
     }
 
+    /// No readiness counts on IOCP: accepts complete as posted operations.
+    pub fn hintReadable(self: *Listener, ev: types.Event) void {
+        _ = self;
+        _ = ev;
+    }
+
     /// Outstanding AcceptEx operations; free the Listener only at 0.
     pub fn pendingOps(self: *const Listener) usize {
         var n: usize = 0;

@@ -1,0 +1,55 @@
+== rep 1 plain
+client mode=bulk size=16 requests=2409 seconds=5.010 rps=481 p50_us=7978.4 p99_us=11803.1 p999_us=18838.1 max_us=23369.1 dropped=0 failures=0
+server waits=1161 events=2780 accepts=4 reads=4822 writes=10309 short_writes=362 closed=4 resets=0 errors=0
+== rep 1 syscalls
+client mode=bulk size=16 requests=2437 seconds=5.008 rps=487 p50_us=7949.3 p99_us=11574.4 p999_us=232307.0 max_us=337538.6 dropped=0 failures=0
+server waits=1459 events=3034 accepts=4 reads=4878 writes=10878 short_writes=588 closed=4 resets=0 errors=0
+  sendto             10878    4.464/req
+  read                2473    1.015/req
+  kevent              1459    0.599/req
+  mmap                  34    0.014/req
+syscalls=14964 per_request=6.140
+== rep 2 plain
+client mode=bulk size=16 requests=2547 seconds=5.009 rps=509 p50_us=7682.5 p99_us=10732.4 p999_us=17502.0 max_us=283386.0 dropped=0 failures=0
+server waits=1854 events=3555 accepts=4 reads=5098 writes=12125 short_writes=999 closed=4 resets=0 errors=0
+== rep 2 syscalls
+client mode=bulk size=16 requests=2434 seconds=5.007 rps=486 p50_us=8093.2 p99_us=10698.5 p999_us=14790.9 max_us=239358.4 dropped=0 failures=0
+server waits=1684 events=3379 accepts=4 reads=4872 writes=11573 short_writes=936 closed=4 resets=0 errors=0
+  sendto             11573    4.755/req
+  read                2483    1.020/req
+  kevent              1684    0.692/req
+  mmap                  34    0.014/req
+syscalls=15894 per_request=6.530
+== rep 3 plain
+client mode=bulk size=16 requests=2476 seconds=5.007 rps=494 p50_us=7939.5 p99_us=11208.3 p999_us=18637.0 max_us=290223.3 dropped=0 failures=0
+server waits=1776 events=3457 accepts=4 reads=4956 writes=11767 short_writes=972 closed=4 resets=0 errors=0
+== rep 3 syscalls
+client mode=bulk size=16 requests=2543 seconds=5.009 rps=508 p50_us=7535.7 p99_us=10424.0 p999_us=273907.3 max_us=328474.0 dropped=0 failures=0
+server waits=1621 events=3230 accepts=4 reads=5090 writes=11496 short_writes=678 closed=4 resets=0 errors=0
+  sendto             11496    4.521/req
+  read                2581    1.015/req
+  kevent              1621    0.637/req
+  mmap                  34    0.013/req
+syscalls=15852 per_request=6.234
+== rep 4 plain
+client mode=bulk size=16 requests=2486 seconds=5.008 rps=496 p50_us=7658.9 p99_us=12255.4 p999_us=32169.9 max_us=295354.3 dropped=0 failures=0
+server waits=1261 events=2871 accepts=4 reads=4976 writes=10653 short_writes=376 closed=4 resets=0 errors=0
+== rep 4 syscalls
+client mode=bulk size=16 requests=2538 seconds=5.008 rps=507 p50_us=7660.4 p99_us=11085.2 p999_us=16709.9 max_us=18365.2 dropped=0 failures=0
+server waits=1534 events=3337 accepts=4 reads=5080 writes=11671 short_writes=790 closed=4 resets=0 errors=0
+  sendto             11671    4.599/req
+  read                2580    1.017/req
+  kevent              1534    0.604/req
+  mmap                  34    0.013/req
+syscalls=15939 per_request=6.280
+== rep 5 plain
+client mode=bulk size=16 requests=2592 seconds=5.006 rps=518 p50_us=7387.2 p99_us=11152.2 p999_us=57780.2 max_us=278680.6 dropped=0 failures=0
+server waits=1282 events=3033 accepts=4 reads=5188 writes=11172 short_writes=432 closed=4 resets=0 errors=0
+== rep 5 syscalls
+client mode=bulk size=16 requests=2389 seconds=5.008 rps=477 p50_us=7482.1 p99_us=12067.7 p999_us=278560.5 max_us=333538.4 dropped=0 failures=0
+server waits=1431 events=2913 accepts=4 reads=4782 writes=10529 short_writes=515 closed=4 resets=0 errors=0
+  sendto             10529    4.407/req
+  read                2426    1.015/req
+  kevent              1431    0.599/req
+  mmap                  34    0.014/req
+syscalls=14540 per_request=6.086

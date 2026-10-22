@@ -106,3 +106,61 @@ pub const ConnectUnixError = error{
     SocketError,
     OutOfMemory,
 };
+
+// ------------------------------------------------------ readiness counts ----
+
+/// Readiness count carried from `Event.avail` into the next drain loop
+/// (POSIX streams and listeners). `left` is how many bytes or connections the
+/// kernel reported; once consumed, the next call answers "drained" without a
+/// syscall that could only return EAGAIN. Null means unknown: do the call.
+///
+/// Safe with edge-triggered readiness: anything that arrives after the kernel
+/// took the count raises a new event, so stopping at the count never strands
+/// data. Each readable event replaces the hint, and every error, EOF or
+/// EAGAIN path clears it.
+pub const ReadyHint = struct {
+    left: ?usize = null,
+
+    /// Take the count from a readable event. EOF events and unknown (0)
+    /// counts leave the stream or listener draining to EAGAIN or EOF.
+    pub fn arm(self: *ReadyHint, ev: @import("types.zig").Event) void {
+        self.left = if (ev.avail > 0 and !ev.eof and !ev.err) ev.avail else null;
+    }
+
+    /// True once the reported count is used up. Clears the hint.
+    pub fn exhausted(self: *ReadyHint) bool {
+        const l = self.left orelse return false;
+        if (l != 0) return false;
+        self.left = null;
+        return true;
+    }
+
+    /// `n` bytes or connections were taken from the kernel.
+    pub fn consume(self: *ReadyHint, n: usize) void {
+        if (self.left) |l| self.left = l -| n;
+    }
+
+    pub fn clear(self: *ReadyHint) void {
+        self.left = null;
+    }
+};
+
+test "ReadyHint counts down to exhaustion and clears" {
+    const std = @import("std");
+    var h: ReadyHint = .{};
+    try std.testing.expect(!h.exhausted());
+    h.arm(.{ .readable = true, .avail = 5 });
+    try std.testing.expect(!h.exhausted());
+    h.consume(2);
+    try std.testing.expect(!h.exhausted());
+    h.consume(9);
+    try std.testing.expect(h.exhausted());
+    try std.testing.expect(!h.exhausted());
+    h.arm(.{ .readable = true, .avail = 0 });
+    try std.testing.expectEqual(@as(?usize, null), h.left);
+    h.arm(.{ .readable = true, .eof = true, .avail = 7 });
+    try std.testing.expectEqual(@as(?usize, null), h.left);
+    h.arm(.{ .readable = true, .avail = 3 });
+    h.clear();
+    try std.testing.expect(!h.exhausted());
+}

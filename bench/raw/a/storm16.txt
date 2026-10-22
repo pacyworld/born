@@ -1,0 +1,60 @@
+== rep 1 plain
+client mode=storm size=1 requests=140132 seconds=5.001 rps=28023 p50_us=474.3 p99_us=859.1 p999_us=1912.4 max_us=204259.9 dropped=0 failures=0
+server waits=359223 events=416640 accepts=140132 reads=420396 writes=140132 short_writes=0 closed=140132 resets=140132 errors=0
+== rep 1 syscalls
+client mode=storm size=1 requests=175206 seconds=5.000 rps=35039 p50_us=398.2 p99_us=830.8 p999_us=1195.1 max_us=6425.2 dropped=0 failures=0
+server waits=419776 events=518648 accepts=175206 reads=525618 writes=175206 short_writes=0 closed=175206 resets=175206 errors=0
+  kevent            419776    2.396/req
+  read              350415    2.000/req
+  close             175217    1.000/req
+  accept4           175206    1.000/req
+  sendto            175206    1.000/req
+syscalls=1295950 per_request=7.397
+== rep 2 plain
+client mode=storm size=1 requests=185938 seconds=5.000 rps=37185 p50_us=381.5 p99_us=853.3 p999_us=1331.0 max_us=4730.7 dropped=0 failures=0
+server waits=485893 events=554273 accepts=185938 reads=557814 writes=185938 short_writes=0 closed=185938 resets=185938 errors=0
+== rep 2 syscalls
+client mode=storm size=1 requests=167721 seconds=5.000 rps=33541 p50_us=435.9 p99_us=806.1 p999_us=1585.1 max_us=9940.5 dropped=0 failures=0
+server waits=378251 events=493143 accepts=167721 reads=503163 writes=167721 short_writes=0 closed=167721 resets=167721 errors=0
+  kevent            378251    2.255/req
+  read              335445    2.000/req
+  close             167732    1.000/req
+  accept4           167721    1.000/req
+  sendto            167721    1.000/req
+syscalls=1217001 per_request=7.256
+== rep 3 plain
+client mode=storm size=1 requests=176979 seconds=5.000 rps=35394 p50_us=427.8 p99_us=744.1 p999_us=1226.0 max_us=3690.9 dropped=0 failures=0
+server waits=441253 events=526148 accepts=176979 reads=530937 writes=176979 short_writes=0 closed=176979 resets=176979 errors=0
+== rep 3 syscalls
+client mode=storm size=1 requests=160105 seconds=5.000 rps=32019 p50_us=452.7 p99_us=846.2 p999_us=1722.7 max_us=6522.3 dropped=0 failures=0
+server waits=360053 events=470390 accepts=160105 reads=480315 writes=160105 short_writes=0 closed=160105 resets=160105 errors=0
+  kevent            360053    2.249/req
+  read              320213    2.000/req
+  close             160116    1.000/req
+  accept4           160105    1.000/req
+  sendto            160105    1.000/req
+syscalls=1160722 per_request=7.250
+== rep 4 plain
+client mode=storm size=1 requests=159076 seconds=5.000 rps=31813 p50_us=458.9 p99_us=832.4 p999_us=1822.6 max_us=4519.9 dropped=0 failures=0
+server waits=415760 events=473651 accepts=159076 reads=477228 writes=159076 short_writes=0 closed=159076 resets=159076 errors=0
+== rep 4 syscalls
+client mode=storm size=1 requests=154030 seconds=5.000 rps=30804 p50_us=420.5 p99_us=947.4 p999_us=4690.0 max_us=94576.5 dropped=0 failures=0
+server waits=366484 events=455442 accepts=154030 reads=462090 writes=154030 short_writes=0 closed=154030 resets=154030 errors=0
+  kevent            366484    2.379/req
+  read              308063    2.000/req
+  close             154041    1.000/req
+  accept4           154030    1.000/req
+  sendto            154030    1.000/req
+syscalls=1136779 per_request=7.380
+== rep 5 plain
+client mode=storm size=1 requests=158464 seconds=5.000 rps=31692 p50_us=340.6 p99_us=887.8 p999_us=23448.8 max_us=94583.0 dropped=0 failures=0
+server waits=415889 events=472740 accepts=158464 reads=475392 writes=158464 short_writes=0 closed=158464 resets=158464 errors=0
+== rep 5 syscalls
+client mode=storm size=1 requests=180371 seconds=5.000 rps=36072 p50_us=408.6 p99_us=788.2 p999_us=1273.9 max_us=10707.4 dropped=0 failures=0
+server waits=415543 events=532175 accepts=180371 reads=541113 writes=180371 short_writes=0 closed=180371 resets=180371 errors=0
+  kevent            415543    2.304/req
+  read              360745    2.000/req
+  close             180382    1.000/req
+  accept4           180371    1.000/req
+  sendto            180371    1.000/req
+syscalls=1317542 per_request=7.305
