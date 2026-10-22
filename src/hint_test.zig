@@ -128,25 +128,43 @@ test "hint: listener count skips the trailing accept, and a late arrival raises 
     for (&clients) |*c| c.* = try std.net.tcpConnectToAddress(addr);
     defer for (&clients) |*c| c.close();
 
+    // The kernel may report fewer than three: a loopback connection can still
+    // be in flight on the server side when the client's connect returns.
     const ev = try nextReadable(&port, &l);
-    try std.testing.expectEqual(if (have_counts) @as(usize, 3) else 0, ev.avail);
-    l.hintReadable(ev);
     var streams: [4]socket.PlainNb = .{ .{}, .{}, .{}, .{} };
     defer for (&streams) |*s| s.deinit();
-    for (streams[0..3]) |*s| {
-        try std.testing.expectEqual(socket.AcceptResult.accepted, try l.acceptNb(s, null));
-    }
-
-    // A fourth connection arrives after the kernel took the count.
-    var late = try std.net.tcpConnectToAddress(addr);
-    defer late.close();
+    var accepted: usize = 0;
+    l.hintReadable(ev);
     if (have_counts) {
-        // The count is spent: no accept, even though a connection is queued.
-        try std.testing.expectEqual(socket.AcceptResult.want_accept, try l.acceptNb(&streams[3], null));
+        try std.testing.expect(ev.avail >= 1 and ev.avail <= 3);
+        for (0..ev.avail) |_| {
+            try std.testing.expectEqual(socket.AcceptResult.accepted, try l.acceptNb(&streams[accepted], null));
+            accepted += 1;
+        }
+        // A fourth connection arrives after the kernel took the count.
+        var late = try std.net.tcpConnectToAddress(addr);
+        defer late.close();
+        // The count is spent: no accept, even though connections are queued.
+        try std.testing.expectEqual(socket.AcceptResult.want_accept, try l.acceptNb(&streams[accepted], null));
+        try std.testing.expectEqual(@as(std.posix.fd_t, -1), streams[accepted].sock);
+        // The arrivals raised new edges, so nothing is stranded.
+        try drainAccepts(&port, &l, &streams, &accepted, 4);
+    } else {
+        try drainAccepts(&port, &l, &streams, &accepted, 3);
     }
-    const ev2 = try nextReadable(&port, &l);
-    l.hintReadable(ev2);
-    try std.testing.expectEqual(socket.AcceptResult.accepted, try l.acceptNb(&streams[3], null));
-    var spare: socket.PlainNb = .{};
-    try std.testing.expectEqual(socket.AcceptResult.want_accept, try l.acceptNb(&spare, null));
+}
+
+/// Accept from `l` event by event, hinting each one, until `want` streams exist.
+fn drainAccepts(port: *born.EvPort, l: *socket.Listener, streams: []socket.PlainNb, accepted: *usize, want: usize) !void {
+    var first = true;
+    while (accepted.* < want) {
+        if (!first) l.hintReadable(try nextReadable(port, l));
+        first = false;
+        while (accepted.* < want) {
+            switch (try l.acceptNb(&streams[accepted.*], null)) {
+                .accepted => accepted.* += 1,
+                .want_accept => break,
+            }
+        }
+    }
 }
