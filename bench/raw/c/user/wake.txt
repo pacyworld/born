@@ -1,0 +1,48 @@
+== rep 1 plain
+a_waits=393914
+wake mode=roundtrip size=0 requests=393914 seconds=5.500 rps=71617 p50_us=10.6 p99_us=35.7 p999_us=76.5 max_us=1082.6 dropped=0 failures=0
+== rep 1 syscalls
+a_waits=309433
+wake mode=roundtrip size=0 requests=309433 seconds=5.501 rps=56253 p50_us=13.7 p99_us=42.7 p999_us=105.2 max_us=2660.4 dropped=0 failures=0
+  kevent           1237735    4.000/req
+syscalls=1237867 per_request=4.000
+== rep 1 plain
+a_waits=362130
+wake mode=roundtrip size=0 requests=362130 seconds=5.500 rps=65839 p50_us=11.8 p99_us=39.7 p999_us=90.8 max_us=25738.8 dropped=0 failures=0
+== rep 1 syscalls
+a_waits=301761
+wake mode=roundtrip size=0 requests=301761 seconds=5.501 rps=54860 p50_us=13.7 p99_us=46.2 p999_us=108.9 max_us=1971.0 dropped=0 failures=0
+  kevent           1207047    4.000/req
+syscalls=1207179 per_request=4.000
+== rep 1 plain
+a_waits=415252
+wake mode=roundtrip size=0 requests=415252 seconds=5.500 rps=75497 p50_us=10.3 p99_us=33.2 p999_us=76.1 max_us=677.8 dropped=0 failures=0
+== rep 1 syscalls
+a_waits=317969
+wake mode=roundtrip size=0 requests=317969 seconds=5.501 rps=57804 p50_us=13.5 p99_us=42.5 p999_us=100.3 max_us=17497.9 dropped=0 failures=0
+  kevent           1271879    4.000/req
+syscalls=1272011 per_request=4.000
+== rep 1 plain
+a_waits=359351
+wake mode=roundtrip size=0 requests=359351 seconds=5.500 rps=65331 p50_us=12.1 p99_us=39.0 p999_us=87.2 max_us=770.7 dropped=0 failures=0
+== rep 1 syscalls
+a_waits=305579
+wake mode=roundtrip size=0 requests=305579 seconds=5.501 rps=55552 p50_us=15.4 p99_us=39.9 p999_us=96.1 max_us=4706.5 dropped=0 failures=0
+  kevent           1222319    4.000/req
+syscalls=1222451 per_request=4.000
+== rep 1 plain
+a_waits=343463
+wake mode=roundtrip size=0 requests=343463 seconds=5.500 rps=62442 p50_us=12.9 p99_us=42.8 p999_us=91.0 max_us=1073.5 dropped=0 failures=0
+== rep 1 syscalls
+a_waits=312605
+wake mode=roundtrip size=0 requests=312605 seconds=5.501 rps=56830 p50_us=13.6 p99_us=45.7 p999_us=105.9 max_us=2153.1 dropped=0 failures=0
+  kevent           1250423    4.000/req
+syscalls=1250555 per_request=4.000
+== rep 1 plain
+a_waits=340627
+wake mode=roundtrip size=0 requests=340627 seconds=5.500 rps=61929 p50_us=12.9 p99_us=41.2 p999_us=101.9 max_us=2126.6 dropped=0 failures=0
+== rep 1 syscalls
+a_waits=294798
+wake mode=roundtrip size=0 requests=294798 seconds=5.501 rps=53593 p50_us=15.6 p99_us=44.4 p999_us=103.6 max_us=4221.9 dropped=0 failures=0
+  kevent           1179195    4.000/req
+syscalls=1179327 per_request=4.000

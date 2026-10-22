@@ -141,6 +141,19 @@ a refused timer or signal.
 POSIX wakeups coalesce; IOCP queues one completion per post. All other event-port
 and socket operations belong to the owning loop thread.
 
+How a POSIX port wakes: FreeBSD and macOS use one `EVFILT_USER` knote
+(`EV_CLEAR`) that `init` registers with an immediate `kevent()`, as one-time
+setup, so a `wake()` from another thread before the first `wait()` is not lost.
+`wake()` is a `NOTE_TRIGGER` `kevent()` with no event list. That call is a
+cross-thread trigger, not a registration, so the rule that kqueue
+registrations are staged into `wait()` does not apply to it. It needs no
+descriptors besides the kqueue and no drain `read()`. A trigger the kernel
+refuses is reported by the next non-empty `wait()` as `error.WaitFailed`.
+NetBSD and OpenBSD have no `EVFILT_USER` and keep the non-blocking pipe, and
+epoll uses an eventfd. Measured on FreeBSD (`bench/RESULTS.md`): a wake round
+trip between two threads costs 4 syscalls instead of 8 and p50 falls from 14.8
+to 11.8 us.
+
 ## Raw readiness API (POSIX)
 
 ```zig

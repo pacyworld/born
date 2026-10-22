@@ -70,3 +70,20 @@ directions with the host's drift. The kernel saves a knote allocation per
 re-arm, but at six re-arms per hundred events it does not show. **Rejected, not
 adopted:** `wantWrite` stays `EV_ONESHOT`, which also avoids a parked knote per
 connection. Raw runs: `bench/raw/b-rejected/`.
+
+## (c) EVFILT_USER for `wake()` (adopted on FreeBSD and macOS)
+
+Interleaved A/B (`bench/ab.sh`, 6 pairs) of the (a) tree (pipe) against EVFILT_USER.
+The wake round trip is the only scenario that calls `wake()`; echo1 and echo16 are
+guards.
+
+| Scenario | req/s A | req/s B | p50 us A | p50 us B | p99 us A | p99 us B | syscalls/req A | B |
+|---|---|---|---|---|---|---|---|---|
+| wake (round trip) | 50720 (47720-52810) | 65330 (61930-75500) | 14.8 (14.3-17.7) | 11.8 (10.3-12.9) | 48.1 (45.4-52.5) | 39 (33.2-42.8) | 8.001 | 4 |
+| echo1 | 25610 (17770-30170) | 25570 (21350-27790) | 27.8 (27.5-32.7) | 28.8 (27.9-31.2) | 101.1 (96.3-124) | 103.3 (97.8-115.2) | 3.001 | 3.001 |
+| echo16 | 94810 (79350-106200) | 96110 (67070-125300) | 133.9 (114.7-163.9) | 129.1 (118-143.2) | 308.8 (303.5-329.4) | 275.9 (249.2-325) | 2.627 | 2.593 |
+
+A wake round trip drops from 8 to 4 syscalls (per wake: `write` + `read` x2 + the
+loop's `kevent` become a trigger `kevent` + the loop's `kevent`), p50 -20%, p99
+-19%, throughput +29%, with the ranges apart. The echo guards do not move.
+Raw runs: `bench/raw/c/`.
