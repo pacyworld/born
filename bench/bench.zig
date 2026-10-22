@@ -56,8 +56,9 @@ const Options = struct {
     /// request with that many bytes instead of echoing.
     reply: usize = 0,
     buf: usize = 64 * 1024,
-    /// serve: SO_ACCEPTFILTER accf_data (the opt-in listener option, once adopted).
-    accept_filter: bool = false,
+    /// serve: read a connection right after accepting it instead of waiting
+    /// for its event.
+    read_after_accept: bool = false,
 };
 
 fn parseArgs(alloc: std.mem.Allocator) !Options {
@@ -69,8 +70,8 @@ fn parseArgs(alloc: std.mem.Allocator) !Options {
     var i: usize = 2;
     while (i < argv.len) : (i += 1) {
         const k = argv[i];
-        if (std.mem.eql(u8, k, "--accept-filter")) {
-            o.accept_filter = true;
+        if (std.mem.eql(u8, k, "--read-after-accept")) {
+            o.read_after_accept = true;
             continue;
         }
         i += 1;
@@ -98,7 +99,7 @@ fn parseArgs(alloc: std.mem.Allocator) !Options {
 
 fn usage() error{Usage} {
     std.debug.print(
-        "usage: born-bench serve [--seconds S] [--buf N] [--reply N] [--accept-filter]\n" ++
+        "usage: born-bench serve [--seconds S] [--buf N] [--reply N] [--read-after-accept]\n" ++
             "       born-bench client --port P [--mode echo|storm|bulk] [--threads T] [--seconds S] [--size N] [--reply N]\n" ++
             "       born-bench wake [--seconds S]\n",
         .{},
@@ -161,10 +162,11 @@ const Server = struct {
     listener: Listener,
     conns: []Conn,
     free: ?*Conn = null,
-    closing: [events_per_wait + 1]*Conn = undefined,
+    closing: [conns_max]*Conn = undefined,
     closing_len: usize = 0,
     stats: Stats = .{},
     done: bool = false,
+    read_after_accept: bool = false,
     /// Reply mode (nonzero): reply bytes per request, sent from `pattern`.
     reply: usize = 0,
     pattern: []const u8 = &.{},
@@ -183,6 +185,9 @@ const Server = struct {
                     slot.* = .{ .stream = slot.stream, .buf = slot.buf };
                     self.port.monitorRead(slot.stream.handle(), slot);
                     self.stats.accepts += 1;
+                    // The accept filter guarantees the first bytes are queued:
+                    // read them now instead of waiting for the next kevent.
+                    if (self.read_after_accept) self.serviceConn(slot, .{});
                     // Large replies: a Nagle-held tail waits on a delayed ACK.
                     if (self.reply != 0) {
                         const one: c_int = 1;
@@ -284,6 +289,7 @@ fn serve(alloc: std.mem.Allocator, opts: Options) !void {
     }
 
     srv.reply = opts.reply;
+    srv.read_after_accept = opts.read_after_accept;
     const pattern = try alloc.alloc(u8, pattern_len);
     defer alloc.free(pattern);
     @memset(pattern, 'r');
@@ -470,13 +476,17 @@ fn reportLatency(role: []const u8, mode: []const u8, samples: []u32, elapsed_ns:
     std.mem.sort(u32, samples, {}, std.sort.asc(u32));
     const n = samples.len;
     const secs = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
+    // Requests that took 100 ms or more (stalls, not tail latency).
+    var slow: usize = 0;
+    for (samples) |dt| slow += @intFromBool(dt >= 100 * std.time.ns_per_ms);
     out(
-        "{s} mode={s} size={d} requests={d} seconds={d:.3} rps={d:.0} p50_us={d:.1} p99_us={d:.1} p999_us={d:.1} max_us={d:.1} dropped={d} failures={d}\n",
+        "{s} mode={s} size={d} requests={d} seconds={d:.3} rps={d:.0} p50_us={d:.1} p99_us={d:.1} p999_us={d:.1} max_us={d:.1} slow={d} dropped={d} failures={d}\n",
         .{
             role,                                                                  mode,                        size,
             n,                                                                     secs,                        @as(f64, @floatFromInt(n)) / secs,
             percentileUs(samples, 50.0),                                           percentileUs(samples, 99.0), percentileUs(samples, 99.9),
-            if (n == 0) 0.0 else @as(f64, @floatFromInt(samples[n - 1])) / 1000.0, dropped,                     failures,
+            if (n == 0) 0.0 else @as(f64, @floatFromInt(samples[n - 1])) / 1000.0, slow,                        dropped,
+            failures,
         },
     );
 }

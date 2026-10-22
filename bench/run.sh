@@ -9,7 +9,7 @@
 #   syscalls the same load with the server's syscalls counted by DTrace
 #            (SYSCALLS=truss uses `truss -c` instead, which perturbs batching).
 # Environment: SRV_CPUS (default 2), CLI_CPUS (default 4-11), SECS (default 5),
-# SERVER_ARGS (extra server arguments, e.g. --accept-filter), SYSCALLS.
+# SERVER_ARGS (extra server arguments, e.g. --read-after-accept), SYSCALLS.
 set -eu
 
 bin=$1
