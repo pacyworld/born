@@ -40,6 +40,18 @@ pub fn build(b: *std.Build) void {
     const install_tests = b.addInstallArtifact(tests, .{});
     b.step("test-bin", "Install the selected target's test executable without running it").dependOn(&install_tests.step);
 
+    // On request only (never part of test, test-bin or check-targets): the
+    // kqueue hot-path benchmark, installed as zig-out/bin/born-bench. Method
+    // and driver: bench/README.md and bench/run.sh.
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "born", .module = mod }},
+    });
+    const bench_exe = b.addExecutable(.{ .name = "born-bench", .root_module = bench_mod });
+    b.step("bench", "Build the born-bench benchmark (bench/README.md)").dependOn(&b.addInstallArtifact(bench_exe, .{}).step);
+
     // Compile-only proof that every claimed platform still builds. Nothing is
     // run; the binaries are discarded.
     const check = b.step("check-targets", "Cross-compile every supported platform");

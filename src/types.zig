@@ -83,4 +83,10 @@ pub const Event = struct {
     /// (kqueue `data`, timerfd count, signalfd count; 1 on IOCP). Zero
     /// for every other event.
     fired: u32 = 0,
+    /// Readiness count the kernel attached to a readable event: bytes
+    /// buffered on a stream, connections queued on a listener (kqueue
+    /// `data` of EVFILT_READ). 0 means unknown, and is all that epoll and
+    /// IOCP ever report. Pass the event to `PlainNb.hintReadable` or
+    /// `Listener.hintReadable` to skip the trailing EAGAIN call.
+    avail: usize = 0,
 };

@@ -112,4 +112,6 @@ test {
     _ = @import("signal_test.zig");
     _ = @import("listener_test.zig");
     _ = @import("unix_test.zig");
+    _ = @import("io_types.zig");
+    _ = @import("hint_test.zig");
 }

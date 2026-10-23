@@ -13,8 +13,15 @@
 //     WANT_READ, which implies the socket hit EAGAIN).
 //   - EV_ONESHOT on EVFILT_WRITE: connect completion and buffer-space
 //     events are single-shot; the connection re-arms on demand.
-//   - Cross-thread wakeup: pipe trick (EVFILT_SIGNAL is unreliable for
-//     that). wake() writes 1 byte; wait() coalesces/drains to one event.
+//   - Cross-thread wakeup: EVFILT_USER on FreeBSD and macOS (EV_CLEAR, one
+//     knote registered by init with an immediate kevent(), which is one-time
+//     setup like the signal watch, so a wake() from another thread before
+//     the first wait() finds it). wake() is NOTE_TRIGGER through a kevent()
+//     with no eventlist: a cross-thread trigger, not a registration, so the
+//     staging rule does not apply. Triggers coalesce into one event. NetBSD
+//     and OpenBSD have no EVFILT_USER and keep the pipe trick (wake()
+//     writes 1 byte; wait() drains to one event). EVFILT_SIGNAL is not a
+//     wake channel.
 //   - Closing fds need no unmonitoring: close(2) removes all filters. The
 //     core defers close() until just after a wait() flush so staged entries
 //     never reference a closed (and possibly recycled) fd.
@@ -27,6 +34,7 @@
 //     seen the kevent.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const types = @import("types.zig");
 const timer_kqueue = @import("timer_kqueue.zig");
 const signal_kqueue = @import("signal_kqueue.zig");
@@ -39,6 +47,17 @@ const EVFILT_READ = std.posix.system.EVFILT.READ;
 const EVFILT_WRITE = std.posix.system.EVFILT.WRITE;
 pub const EVFILT_TIMER = std.posix.system.EVFILT.TIMER;
 pub const EVFILT_SIGNAL = std.posix.system.EVFILT.SIGNAL;
+
+/// EVFILT_USER exists on FreeBSD and macOS only.
+const have_user = switch (builtin.os.tag) {
+    .freebsd, .macos, .ios, .tvos, .watchos, .visionos => true,
+    else => false,
+};
+const EVFILT_USER = if (have_user) std.posix.system.EVFILT.USER else 0;
+/// sys/event.h NOTE_TRIGGER, the same value on FreeBSD and macOS.
+const NOTE_TRIGGER: u32 = 0x01000000;
+/// The wake knote's ident (EVFILT_USER idents are free-form).
+const wake_ident: usize = 0;
 
 const EV_ADD = std.posix.system.EV.ADD;
 const EV_DELETE = std.posix.system.EV.DELETE;
@@ -82,7 +101,7 @@ pub const Error = InitError || WaitError || TimerError || SignalError;
 /// them. Call it in `main` before spawning threads; see signal_kqueue.zig.
 pub const blockSignals = signal_kqueue.blockSignals;
 
-/// Stable address used as the wake pipe's udata tag (module-level so a
+/// Stable address used as the wake source's udata tag (module-level so a
 /// by-value EvPort return never leaves it dangling).
 var wake_sentinel: u8 = 0;
 
@@ -91,8 +110,12 @@ pub const EvPort = struct {
     alloc: std.mem.Allocator,
     /// Staged changelist, flushed by the next wait().
     changes: std.ArrayList(Kevent) = .empty,
+    /// Wake pipe ends; -1 where EVFILT_USER does the waking.
     wake_r: c_int = -1,
     wake_w: c_int = -1,
+    /// Set by a wake() whose trigger the kernel refused; the next
+    /// non-empty wait() reports it as WaitFailed. EVFILT_USER targets only.
+    wake_failed: std.atomic.Value(bool) = .init(false),
     /// fds with write interest currently registered (staged or live).
     /// Deduplicates wantWrite/cancelWrite across the one-shot lifecycle:
     /// delivery clears the bit, so a blocked writer re-arms exactly once.
@@ -110,11 +133,17 @@ pub const EvPort = struct {
         const kq = std.posix.kqueue() catch return InitError.KqueueFailed;
         errdefer _ = std.c.close(kq);
 
-        const fds = std.posix.pipe2(PIPE2_FLAGS) catch return InitError.PipeFailed;
-        errdefer {
+        var fds = [2]c_int{ -1, -1 };
+        if (have_user) {
+            var kev = change(wake_ident, EVFILT_USER, EV_ADD | EV_CLEAR, &wake_sentinel);
+            kevent1(kq, &kev) catch return InitError.KqueueFailed;
+        } else {
+            fds = std.posix.pipe2(PIPE2_FLAGS) catch return InitError.PipeFailed;
+        }
+        errdefer if (!have_user) {
             _ = std.c.close(fds[0]);
             _ = std.c.close(fds[1]);
-        }
+        };
 
         var self = EvPort{
             .kq = kq,
@@ -124,8 +153,22 @@ pub const EvPort = struct {
             .timers = timer_kqueue.State.init(alloc),
             .signals = signal_kqueue.State.init(alloc),
         };
-        self.monitorRead(self.wake_r, @as(?*anyopaque, &wake_sentinel));
+        if (!have_user) self.monitorRead(self.wake_r, @as(?*anyopaque, &wake_sentinel));
         return self;
+    }
+
+    /// Apply one change immediately (one-time setup and the wake trigger;
+    /// everything else is staged for wait()). No eventlist, so a rejected
+    /// entry is the call's errno.
+    fn kevent1(kq: c_int, kev: *Kevent) error{KeventFailed}!void {
+        while (true) {
+            const rc = std.c.kevent(kq, @ptrCast(kev), 1, @ptrCast(kev), 0, null);
+            if (rc >= 0) return;
+            switch (std.posix.errno(@as(isize, rc))) {
+                .INTR => continue,
+                else => return error.KeventFailed,
+            }
+        }
     }
 
     pub fn deinit(self: *EvPort) void {
@@ -193,11 +236,18 @@ pub const EvPort = struct {
         }
     }
 
-    /// Wake a wait() blocked in another thread. Non-blocking; a full pipe
-    /// means the loop is already awake (coalesced).
+    /// Wake a wait() blocked in another thread. Non-blocking; wakes that
+    /// land before the loop runs coalesce into one event. EVFILT_USER: a
+    /// refused trigger is reported by the next non-empty wait().
     pub fn wake(self: *EvPort) void {
-        const b = [1]u8{1};
-        _ = std.c.write(self.wake_w, &b, 1);
+        if (have_user) {
+            var kev = change(wake_ident, EVFILT_USER, 0, &wake_sentinel);
+            kev.fflags = NOTE_TRIGGER;
+            kevent1(self.kq, &kev) catch self.wake_failed.store(true, .release);
+        } else {
+            const b = [1]u8{1};
+            _ = std.c.write(self.wake_w, &b, 1);
+        }
     }
 
     fn change(fd: Handle, filter: @FieldType(Kevent, "filter"), flags: @FieldType(Kevent, "flags"), udata: ?*anyopaque) Kevent {
@@ -254,6 +304,7 @@ pub const EvPort = struct {
             self.pending_error = null;
             return err;
         }
+        if (have_user and self.wake_failed.swap(false, .acquire)) return WaitError.WaitFailed;
         var kbuf: [64]Kevent = undefined;
         const cap = @min(events.len, kbuf.len);
 
@@ -281,7 +332,7 @@ pub const EvPort = struct {
             if (kev.udata == @intFromPtr(&wake_sentinel)) {
                 if (!woke) {
                     woke = true;
-                    self.drainWake();
+                    if (!have_user) self.drainWake();
                     events[out] = .{ .wake = true };
                     out += 1;
                 }
@@ -321,6 +372,8 @@ pub const EvPort = struct {
         if (is_err) return ev;
         if (kev.filter == EVFILT_READ) {
             ev.readable = true;
+            // Bytes buffered, or connections queued on a listener.
+            ev.avail = if (kev.data > 0) std.math.cast(usize, kev.data) orelse std.math.maxInt(usize) else 0;
         } else if (kev.filter == EVFILT_WRITE) {
             ev.writable = true;
         } else if (kev.filter == EVFILT_TIMER) {
@@ -382,9 +435,15 @@ test "kqueue: target-native layout and change encoding" {
     }
 }
 
-test "kqueue: wake pipe is nonblocking and close-on-exec on both ends" {
+test "kqueue: wake source is a user knote or a nonblocking close-on-exec pipe" {
     var port = try EvPort.init(std.testing.allocator);
     defer port.deinit();
+    if (have_user) {
+        // EVFILT_USER needs no descriptors beyond the kqueue itself.
+        try std.testing.expectEqual(@as(c_int, -1), port.wake_r);
+        try std.testing.expectEqual(@as(c_int, -1), port.wake_w);
+        return;
+    }
     for ([_]Handle{ port.wake_r, port.wake_w }) |fd| {
         const flags: std.posix.O = @bitCast(@as(u32, @truncate(try std.posix.fcntl(fd, std.posix.F.GETFL, 0))));
         try std.testing.expect(flags.NONBLOCK);
@@ -396,8 +455,10 @@ test "kqueue: wake pipe is nonblocking and close-on-exec on both ends" {
 test "kqueue: registration error survives empty wait with errno payload" {
     var port = try EvPort.init(std.testing.allocator);
     defer port.deinit();
-    const fd = try std.posix.dup(port.wake_r);
-    std.posix.close(fd);
+    const closed = try std.posix.pipe2(PIPE2_FLAGS);
+    std.posix.close(closed[0]);
+    std.posix.close(closed[1]);
+    const fd = closed[0];
     var tag: u8 = 1;
     port.monitorRead(fd, &tag);
     var empty: [0]Event = .{};
@@ -415,11 +476,15 @@ test "kqueue: registration error survives empty wait with errno payload" {
 }
 
 test "kqueue: allocation failure is reported by the next wait, once" {
-    // fail_index 0 lands inside init's wake-pipe monitorRead stage: the
-    // port constructs, but the changelist append failed.
+    // fail_index 0: the first changelist append fails (on pipe targets it is
+    // init's wake-pipe monitorRead). The port constructs; the stage is stashed.
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var port = try EvPort.init(failing.allocator());
     defer port.deinit();
+    const pipe_fds = try std.posix.pipe2(PIPE2_FLAGS);
+    defer std.posix.close(pipe_fds[0]);
+    defer std.posix.close(pipe_fds[1]);
+    port.monitorRead(pipe_fds[0], null);
     try std.testing.expectEqual(@as(usize, 0), port.changes.items.len);
     var empty: [0]Event = .{};
     try std.testing.expectEqual(@as(usize, 0), try port.wait(&empty, null));
@@ -528,7 +593,40 @@ test "kqueue: wake posts a single coalesced event" {
     const n = try evp.wait(&events, 1000);
     try std.testing.expectEqual(@as(usize, 1), n);
     try std.testing.expect(events[0].wake);
-    // Pipe drained: no further wake events.
+    // Drained: no further wake events.
+    try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
+    // A later wake is a new event.
+    evp.wake();
+    try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));
+    try std.testing.expect(events[0].wake);
+}
+
+test "kqueue: wakes from another thread before the first wait are not lost" {
+    var evp = try EvPort.init(std.testing.allocator);
+    defer evp.deinit();
+    const Waker = struct {
+        fn run(p: *EvPort) void {
+            for (0..100) |_| p.wake();
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Waker.run, .{&evp});
+    t.join();
+    var events: [8]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));
+    try std.testing.expect(events[0].wake);
+    try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
+}
+
+test "kqueue: a refused wake trigger is reported by the next wait" {
+    if (!have_user) return error.SkipZigTest;
+    var evp = try EvPort.init(std.testing.allocator);
+    defer evp.deinit();
+    // Break the wake source: dropping the knote makes NOTE_TRIGGER fail.
+    var del = EvPort.change(wake_ident, EVFILT_USER, EV_DELETE, null);
+    try EvPort.kevent1(evp.kq, &del);
+    evp.wake();
+    var events: [4]Event = undefined;
+    try std.testing.expectError(Error.WaitFailed, evp.wait(&events, 0));
     try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
 }
 
@@ -597,6 +695,17 @@ test "kqueue: timer and signal kevents translate to their event fields" {
     const read = EvPort.translate(EvPort.change(5, EVFILT_READ, EV_ADD, &tag));
     try std.testing.expect(read.readable and !read.timer and read.signal == null);
     try std.testing.expectEqual(@as(u32, 0), read.fired);
+    try std.testing.expectEqual(@as(usize, 0), read.avail);
+
+    // Readable events carry the kernel's count; nothing else does.
+    var counted = EvPort.change(5, EVFILT_READ, EV_ADD, &tag);
+    counted.data = 4096;
+    try std.testing.expectEqual(@as(usize, 4096), EvPort.translate(counted).avail);
+    counted.data = -1;
+    try std.testing.expectEqual(@as(usize, 0), EvPort.translate(counted).avail);
+    counted.filter = EVFILT_WRITE;
+    counted.data = 4096;
+    try std.testing.expectEqual(@as(usize, 0), EvPort.translate(counted).avail);
 }
 
 test "kqueue: stageRaw timer is submitted by the next wait and fires once" {
@@ -606,8 +715,9 @@ test "kqueue: stageRaw timer is submitted by the next wait and fires once" {
     // Milliseconds are the default unit (fflags 0) on every kqueue target.
     var kev = EvPort.change(42, EVFILT_TIMER, EV_ADD | EV_ONESHOT, &tag);
     kev.data = 5;
+    const staged = port.changes.items.len;
     port.stageRaw(kev);
-    try std.testing.expectEqual(@as(usize, 2), port.changes.items.len);
+    try std.testing.expectEqual(staged + 1, port.changes.items.len);
     var events: [4]Event = undefined;
     var n: usize = 0;
     while (n == 0) n = try port.wait(&events, 1000);
@@ -648,7 +758,10 @@ test "kqueue: purgeFd leaves a staged timer whose ident equals the fd" {
     defer port.deinit();
     var events: [4]Event = undefined;
     _ = try port.wait(&events, 0);
-    const fd = port.wake_r;
+    const pipe_fds = try std.posix.pipe2(PIPE2_FLAGS);
+    defer std.posix.close(pipe_fds[0]);
+    defer std.posix.close(pipe_fds[1]);
+    const fd = pipe_fds[0];
     var tag: u8 = 1;
     port.monitorRead(fd, &tag);
     var kev = EvPort.change(fd, EVFILT_TIMER, EV_ADD | EV_ONESHOT, &tag);

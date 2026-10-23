@@ -33,6 +33,8 @@ pub const PlainNb = struct {
     /// doing its own getsockopt — must not be able to erase the verdict
     /// (issue #8).
     connect_err: bool = false,
+    /// Bytes the last readable event reported; see `hintReadable`.
+    hint: io.ReadyHint = .{},
 
     /// Every stream error; each method returns its own narrower set.
     pub const Error = io.IoError;
@@ -125,14 +127,32 @@ pub const PlainNb = struct {
         }
     }
 
+    /// Record the readiness count of a readable event (`Event.avail`, bytes
+    /// buffered on kqueue; unknown elsewhere). `readNb` then answers
+    /// `.want_read` without the read that would only return EAGAIN once that
+    /// many bytes were taken. Call it on every readable event before the
+    /// first `readNb`: each event replaces the previous count, and a count
+    /// that outlives a partial drain would strand the rest.
+    pub fn hintReadable(self: *PlainNb, ev: types.Event) void {
+        self.hint.arm(ev);
+    }
+
     pub fn readNb(self: *PlainNb, out: []u8) io.ReadError!NbRead {
         if (self.sock < 0) return io.ReadError.SocketError;
         if (out.len == 0) return .{ .data = 0 };
-        const n = std.posix.read(self.sock, out) catch |err| switch (err) {
-            error.WouldBlock => return .want_read,
-            else => return io.ReadError.SocketError,
+        if (self.hint.exhausted()) return .want_read;
+        const n = std.posix.read(self.sock, out) catch |err| {
+            self.hint.clear();
+            return switch (err) {
+                error.WouldBlock => .want_read,
+                else => io.ReadError.SocketError,
+            };
         };
-        if (n == 0) return .eof;
+        if (n == 0) {
+            self.hint.clear();
+            return .eof;
+        }
+        self.hint.consume(n);
         return .{ .data = n };
     }
 

@@ -40,6 +40,9 @@ OS per primitive, and lists real runs only.
 | IOCP, Windows Server 2022 build 20348 (runner02) | TCP listener (AcceptEx) | [run 64, Windows job](https://pacyworld.dev/pacyworld/born/actions/runs/64/jobs/2): ReleaseSafe, 38 passed, 26 skipped, 0 failed | 2026-10-20 | [8eca1d3](https://pacyworld.dev/pacyworld/born/commit/8eca1d3e226b14d5120a84192b2aa0779d50884a) |
 | kqueue, FreeBSD 15 (runner01) | Unix domain stream sockets | [run 70, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/70/jobs/0): Debug and ReleaseSafe, 81 passed, 4 skipped, 0 failed | 2026-10-19 | [86ef7ec](https://pacyworld.dev/pacyworld/born/commit/86ef7ec20f50151e4719254a79d590b7feb7f4ba) |
 | epoll, Linux 6.8 (runner03, Ubuntu 24.04) | Unix domain stream sockets | [run 70, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/70/jobs/1): ReleaseSafe, 65 passed, 13 skipped, 0 failed | 2026-10-19 | [86ef7ec](https://pacyworld.dev/pacyworld/born/commit/86ef7ec20f50151e4719254a79d590b7feb7f4ba) |
+| kqueue, FreeBSD 15 (runner01) | readiness counts, EVFILT_USER wake | [run 102, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/102/jobs/0): Debug and ReleaseSafe, 91 passed, 6 skipped, 0 failed | 2026-10-22 | [0b1ec8e](https://pacyworld.dev/pacyworld/born/commit/0b1ec8edb100dd8484f002227bc2a5544ec548ef) |
+| epoll, Linux 6.8 (runner03, Ubuntu 24.04) | readiness hints without counts (drain contract) | [run 102, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/102/jobs/1): ReleaseSafe, 87 passed, 6 skipped, 0 failed | 2026-10-22 | [0b1ec8e](https://pacyworld.dev/pacyworld/born/commit/0b1ec8edb100dd8484f002227bc2a5544ec548ef) |
+| kqueue, macOS 26 arm64 (macinotsh-desktop, manual) | event port, readiness counts, EVFILT_USER wake | zig build test, Debug: 92 passed, 6 skipped, 0 failed | 2026-10-22 | [622ee3c](https://pacyworld.dev/pacyworld/born/commit/622ee3c) |
 | IOCP | Unix sockets | none: not implemented yet, their contract tests skip | n/a | n/a |
 
 Commit 3ed3785 changes only the CI workflow; its library and tests are
@@ -126,7 +129,8 @@ overlappable named pipes or a blocking-pipe relay, as mcp-bridge does.
 `overlapped: ?*std.os.windows.OVERLAPPED`, `bytes: usize`, and the 0.3.0
 fields `timer: bool`, `signal: ?born.Signal` and `fired: u32` (see
 [Planned in 0.3.0](#planned-in-030)), which stay false, null and zero for
-every other event.
+every other event, and `avail: usize`, the readiness count (see
+[Readiness counts](#readiness-counts)).
 Completion fields are null/zero on POSIX. Error numbers are native errno on
 kqueue and NTSTATUS on IOCP, not a portable error enumeration.
 
@@ -139,6 +143,19 @@ a refused timer or signal.
 `wake()` may be called from another thread and produces `Event{ .wake = true }`.
 POSIX wakeups coalesce; IOCP queues one completion per post. All other event-port
 and socket operations belong to the owning loop thread.
+
+How a POSIX port wakes: FreeBSD and macOS use one `EVFILT_USER` knote
+(`EV_CLEAR`) that `init` registers with an immediate `kevent()`, as one-time
+setup, so a `wake()` from another thread before the first `wait()` is not lost.
+`wake()` is a `NOTE_TRIGGER` `kevent()` with no event list. That call is a
+cross-thread trigger, not a registration, so the rule that kqueue
+registrations are staged into `wait()` does not apply to it. It needs no
+descriptors besides the kqueue and no drain `read()`. A trigger the kernel
+refuses is reported by the next non-empty `wait()` as `error.WaitFailed`.
+NetBSD and OpenBSD have no `EVFILT_USER` and keep the non-blocking pipe, and
+epoll uses an eventfd. Measured on FreeBSD (`bench/RESULTS.md`): a wake round
+trip between two threads costs 4 syscalls instead of 8 and p50 falls from 14.8
+to 11.8 us.
 
 ## Raw readiness API (POSIX)
 
@@ -199,6 +216,28 @@ asynchronous DNS, TLS, or arbitrary child-process I/O.
 
 `src/socket_test.zig` exercises the same loopback lifecycle on all three backend
 families and is the executable usage reference.
+
+### Readiness counts
+
+On kqueue a readable event carries the kernel's count in `Event.avail`: bytes
+buffered on a stream, connections queued on a listener. It is 0 where the
+count is unknown (always on epoll and IOCP, and on any other event).
+`PlainNb.hintReadable(event)` and `Listener.hintReadable(event)` record it, and
+`readNb` / `acceptNb` then answer `.want_read` / `.want_accept` without the
+call that could only return EAGAIN once that many bytes or connections were
+taken. The drain-to-EAGAIN contract is unchanged: with no hint the calls drain
+exactly as before, and stopping at the count never strands data because
+anything arriving after the kernel took the count raises a new edge.
+
+- Call `hintReadable` on every readable event before the first read or
+  accept. Each event replaces the previous count; a count outliving a
+  partial drain would strand the rest.
+- An EOF event is not hinted (`readNb` keeps reading until it returns `.eof`),
+  and every error, EAGAIN or `ResourceExhausted` path clears the hint.
+- On IOCP, `hintReadable` is a no-op.
+
+Measured on the loopback benchmark (`bench/RESULTS.md`): one syscall less per
+echo and about two less per connection in the accept storm.
 
 ## Planned in 0.3.0
 

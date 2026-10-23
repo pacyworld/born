@@ -284,6 +284,12 @@ pub const PlainNb = struct {
         return error.SocketError;
     }
 
+    /// No readiness counts on IOCP: completions carry their own bytes.
+    pub fn hintReadable(self: *PlainNb, ev: types.Event) void {
+        _ = self;
+        _ = ev;
+    }
+
     /// In-flight op count (for the core's deferred reap).
     pub fn pendingOps(self: *const PlainNb) usize {
         var n: usize = 0;
