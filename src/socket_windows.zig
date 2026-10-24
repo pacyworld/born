@@ -112,48 +112,68 @@ pub const PlainNb = struct {
 
         var last_err: io.ConnectError = error.ConnectFailed;
         for (addr_list.addrs) |addr| {
-            const s = ws2.WSASocketW(addr.any.family, ws2.SOCK.STREAM, 0, null, 0, ws2.WSA_FLAG_OVERLAPPED | ws2.WSA_FLAG_NO_HANDLE_INHERIT);
-            if (s == ws2.INVALID_SOCKET) continue;
-
-            // ConnectEx requires the socket bound first (wildcard, target's
-            // address family — use a std.net.Address so the layout is
-            // target-correct).
-            const any_addr = switch (addr.any.family) {
-                ws2.AF.INET => std.net.Address.parseIp4("0.0.0.0", 0) catch unreachable,
-                else => std.net.Address.parseIp6("::", 0) catch unreachable,
+            self.connectOne(addr, evp, key) catch |err| switch (err) {
+                error.Unusable => continue,
+                error.Associate => return error.SocketError,
+                error.NoConnectEx => last_err = error.SocketError,
+                error.Refused => last_err = error.ConnectFailed,
             };
-            if (ws2.bind(s, &any_addr.any, @intCast(any_addr.getOsSockLen())) != 0) {
-                _ = ws2.closesocket(s);
-                continue;
-            }
-
-            self.sock = s;
-            evp.associate(self.handle(), key) catch return error.SocketError; // associate with the port
-
-            const cx = connectEx(s) catch {
-                _ = ws2.closesocket(s);
-                self.sock = ws2.INVALID_SOCKET;
-                last_err = error.SocketError;
-                continue;
-            };
-            self.conn_ov = std.mem.zeroes(windows.OVERLAPPED);
-            const rc = cx(s, @ptrCast(&addr.any), @intCast(addr.getOsSockLen()), null, 0, null, &self.conn_ov);
-            if (rc != 0) {
-                // Completed inline.
-                self.connect_pending = true;
-                return;
-            }
-            const e = ws2.WSAGetLastError();
-            if (e != .WSA_IO_PENDING) {
-                _ = ws2.closesocket(s);
-                self.sock = ws2.INVALID_SOCKET;
-                last_err = error.ConnectFailed;
-                continue;
-            }
-            self.connect_pending = true;
-            return;
+            if (self.connect_pending) return;
         }
         return last_err;
+    }
+
+    /// Overlapped connect to an already resolved `addr`, CONSTRUCTED IN
+    /// PLACE like `startConnectInto`, with no resolver and no allocation:
+    /// the call to use from an event loop. Same completion contract.
+    pub fn startConnectAddrInto(self: *PlainNb, addr: std.net.Address, evp: *evport.EvPort, key: ?*anyopaque) io.ConnectAddrError!void {
+        std.debug.assert(self.sock == ws2.INVALID_SOCKET and self.pendingOps() == 0 and !self.wsa_started);
+        self.* = .{};
+        try ensureWsa();
+        self.wsa_started = true;
+        errdefer self.deinit();
+        self.connectOne(addr, evp, key) catch |err| return switch (err) {
+            error.Unusable, error.Associate, error.NoConnectEx => error.SocketError,
+            error.Refused => error.ConnectFailed,
+        };
+    }
+
+    /// One address: socket, wildcard bind, port association, ConnectEx.
+    /// On success the connect is pending. On failure the socket is closed,
+    /// except after `Associate`, which leaves it for the caller's deinit.
+    fn connectOne(self: *PlainNb, addr: std.net.Address, evp: *evport.EvPort, key: ?*anyopaque) error{ Unusable, Associate, NoConnectEx, Refused }!void {
+        const s = ws2.WSASocketW(addr.any.family, ws2.SOCK.STREAM, 0, null, 0, ws2.WSA_FLAG_OVERLAPPED | ws2.WSA_FLAG_NO_HANDLE_INHERIT);
+        if (s == ws2.INVALID_SOCKET) return error.Unusable;
+
+        // ConnectEx requires the socket bound first (wildcard, target's
+        // address family — use a std.net.Address so the layout is
+        // target-correct).
+        const any_addr = switch (addr.any.family) {
+            ws2.AF.INET => std.net.Address.parseIp4("0.0.0.0", 0) catch unreachable,
+            else => std.net.Address.parseIp6("::", 0) catch unreachable,
+        };
+        if (ws2.bind(s, &any_addr.any, @intCast(any_addr.getOsSockLen())) != 0) {
+            _ = ws2.closesocket(s);
+            return error.Unusable;
+        }
+
+        self.sock = s;
+        evp.associate(self.handle(), key) catch return error.Associate; // associate with the port
+
+        const cx = connectEx(s) catch {
+            _ = ws2.closesocket(s);
+            self.sock = ws2.INVALID_SOCKET;
+            return error.NoConnectEx;
+        };
+        self.conn_ov = std.mem.zeroes(windows.OVERLAPPED);
+        const rc = cx(s, @ptrCast(&addr.any), @intCast(addr.getOsSockLen()), null, 0, null, &self.conn_ov);
+        if (rc == 0 and ws2.WSAGetLastError() != .WSA_IO_PENDING) {
+            _ = ws2.closesocket(s);
+            self.sock = ws2.INVALID_SOCKET;
+            return error.Refused;
+        }
+        // Pending, or completed inline (rc != 0): the completion still posts.
+        self.connect_pending = true;
     }
 
     /// Adopt a socket accepted by `Listener.acceptNb` (AcceptEx, accept

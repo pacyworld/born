@@ -24,6 +24,24 @@ const Pair = struct {
     expect_connect_err: bool = false,
 
     fn init(self: *Pair) !void {
+        return self.initWith(.host);
+    }
+
+    /// How the client connects: by host name (`startConnectInto`) or to a
+    /// resolved address (`startConnectAddrInto`).
+    const Connect = enum { host, addr };
+
+    fn startClient(self: *Pair, how: Connect, port: u16) !void {
+        switch (how) {
+            .host => try self.client.startConnectInto(alloc, "127.0.0.1", port, &self.port, &self.client),
+            .addr => {
+                const address = try std.net.Address.parseIp4("127.0.0.1", port);
+                try self.client.startConnectAddrInto(address, &self.port, &self.client);
+            },
+        }
+    }
+
+    fn initWith(self: *Pair, how: Connect) !void {
         self.* = .{ .port = try born.EvPort.init(alloc) };
         errdefer self.deinit();
         if (is_windows) {
@@ -39,7 +57,7 @@ const Pair = struct {
             self.port.monitorRead(self.server.?.stream.handle, self);
             self.accept_pending = true;
         }
-        try self.client.startConnectInto(alloc, "127.0.0.1", self.server.?.listen_address.getPort(), &self.port, &self.client);
+        try self.startClient(how, self.server.?.listen_address.getPort());
         try std.testing.expectEqual(@as(usize, if (is_windows) 1 else 0), self.client.pendingOps());
         if (is_windows) {
             try std.testing.expectError(error.ConnectFailed, self.client.connectDone());
@@ -189,6 +207,8 @@ const Pair = struct {
 
 test "plain socket has the same companion API on every target" {
     try std.testing.expect(@TypeOf(PlainNb.startConnectInto) == fn (*PlainNb, std.mem.Allocator, []const u8, u16, *born.EvPort, ?*anyopaque) socket.ConnectError!void);
+    try std.testing.expect(@TypeOf(PlainNb.startConnectAddrInto) == fn (*PlainNb, std.net.Address, *born.EvPort, ?*anyopaque) socket.ConnectAddrError!void);
+    try std.testing.expect(socket.ConnectAddrError == error{ ConnectFailed, SocketError });
     try std.testing.expect(@TypeOf(PlainNb.connectDone) == fn (*PlainNb) socket.ConnectDoneError!void);
     try std.testing.expect(@TypeOf(PlainNb.readNb) == fn (*PlainNb, []u8) socket.ReadError!socket.NbRead);
     try std.testing.expect(@TypeOf(PlainNb.writeNb) == fn (*PlainNb, []const u8) socket.WriteError!socket.NbWrite);
@@ -246,6 +266,20 @@ test "plain socket loopback round trip, partial drains, and EOF" {
     try std.testing.expectEqual(socket.NbRead.eof, try pair.client.readNb(&scratch));
 }
 
+test "plain socket connects to a resolved address without a resolver" {
+    // Goal: startConnectAddrInto follows the startConnectInto contract.
+    // Method: the same loopback lifecycle, connected by address, then a
+    // round trip each way.
+    var pair: Pair = undefined;
+    try pair.initWith(.addr);
+    defer pair.deinit();
+    const ping = "resolved elsewhere";
+    var got: [ping.len]u8 = undefined;
+    var back: [ping.len]u8 = undefined;
+    try pair.transfer(&pair.client, &pair.peer, ping, &got);
+    try pair.transfer(&pair.peer, &pair.client, &got, &back);
+}
+
 test "plain socket cancellation retains pending operations until absorbed" {
     var pair: Pair = undefined;
     try pair.init();
@@ -272,6 +306,14 @@ test "plain socket cancellation retains pending operations until absorbed" {
 }
 
 test "plain socket connect refusal surfaces at connectDone" {
+    try connectRefused(.host);
+}
+
+test "plain socket connect refusal by address surfaces at connectDone" {
+    try connectRefused(.addr);
+}
+
+fn connectRefused(how: Pair.Connect) !void {
     var pair: Pair = undefined;
     try pair.init();
     defer pair.deinit();
@@ -296,7 +338,7 @@ test "plain socket connect refusal surfaces at connectDone" {
         std.posix.close(refused_socket);
         reserved = false;
     }
-    pair.client.startConnectInto(alloc, "127.0.0.1", refused_port, &pair.port, &pair.client) catch |err| {
+    pair.startClient(how, refused_port) catch |err| {
         try std.testing.expectEqual(error.ConnectFailed, err);
         try std.testing.expectEqual(@as(usize, 0), pair.client.pendingOps());
         return;
