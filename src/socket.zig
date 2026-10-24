@@ -22,6 +22,7 @@ const listener = if (is_windows) @import("listener_windows.zig") else @import("l
 pub const NbRead = io.NbRead;
 pub const NbWrite = io.NbWrite;
 pub const ConnectError = io.ConnectError;
+pub const ConnectAddrError = io.ConnectAddrError;
 pub const ConnectDoneError = io.ConnectDoneError;
 pub const ReadError = io.ReadError;
 pub const WriteError = io.WriteError;

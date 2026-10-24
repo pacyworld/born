@@ -212,7 +212,11 @@ depend on OpenSSL, Schannel or mcp-bridge.
 
 DNS resolution in `startConnectInto` uses the synchronous system resolver;
 only socket connect/read/write are non-blocking. This API does not promise
-asynchronous DNS, TLS, or arbitrary child-process I/O.
+asynchronous DNS, TLS, or arbitrary child-process I/O. From an event loop,
+resolve names on another thread and connect with
+`startConnectAddrInto(address, &ep, user_data)`: the same steps as above,
+with no resolver and no allocator, failing only with `ConnectAddrError`
+(`ConnectFailed`, `SocketError`).
 
 `src/socket_test.zig` exercises the same loopback lifecycle on all three backend
 families and is the executable usage reference.

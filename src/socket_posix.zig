@@ -50,6 +50,37 @@ pub const PlainNb = struct {
         self.* = try startConnect(alloc, host, port);
     }
 
+    /// Non-blocking connect to an already resolved `addr`, with no resolver
+    /// and no allocation: the call to use from an event loop. Same contract
+    /// as `startConnectInto` (wantWrite, then connectDone). `self` is left
+    /// untouched on failure.
+    pub fn startConnectAddrInto(self: *PlainNb, addr: std.net.Address, evp: *evport.EvPort, key: ?*anyopaque) io.ConnectAddrError!void {
+        std.debug.assert(self.sock == -1);
+        _ = evp;
+        _ = key;
+        self.* = try connectAddr(addr);
+    }
+
+    /// socket(SOCK_NONBLOCK) + connect() to one address. A synchronous
+    /// refusal (FreeBSD loopback under load) is ConnectFailed.
+    fn connectAddr(addr: std.net.Address) io.ConnectAddrError!PlainNb {
+        const s = std.posix.socket(addr.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK, 0) catch return io.ConnectAddrError.SocketError;
+        if (comptime builtin.os.tag.isDarwin()) {
+            std.posix.setsockopt(s, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, std.mem.asBytes(&@as(c_int, 1))) catch {
+                std.posix.close(s);
+                return io.ConnectAddrError.SocketError;
+            };
+        }
+        std.posix.connect(s, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
+            error.WouldBlock => return .{ .sock = s }, // EINPROGRESS
+            else => {
+                std.posix.close(s);
+                return io.ConnectAddrError.ConnectFailed;
+            },
+        };
+        return .{ .sock = s }; // connected immediately
+    }
+
     /// Non-blocking connect to a Unix stream socket at `path`, completed
     /// through the same wantWrite + connectDone contract as TCP. `self` is
     /// left untouched on failure. Implemented in unix_posix.zig (born#20).
@@ -96,21 +127,7 @@ pub const PlainNb = struct {
         if (addr_list.addrs.len == 0) return io.ConnectError.ConnectFailed;
 
         for (addr_list.addrs) |addr| {
-            const s = std.posix.socket(addr.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK, 0) catch continue;
-            if (comptime builtin.os.tag.isDarwin()) {
-                std.posix.setsockopt(s, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, std.mem.asBytes(&@as(c_int, 1))) catch {
-                    std.posix.close(s);
-                    continue;
-                };
-            }
-            std.posix.connect(s, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
-                error.WouldBlock => return .{ .sock = s }, // EINPROGRESS
-                else => {
-                    std.posix.close(s);
-                    continue;
-                },
-            };
-            return .{ .sock = s }; // connected immediately
+            return connectAddr(addr) catch continue;
         }
         return io.ConnectError.ConnectFailed;
     }

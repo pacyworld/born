@@ -18,6 +18,8 @@ pub const NbWrite = union(enum) {
 
 /// `PlainNb.startConnectInto` / `startConnect`.
 pub const ConnectError = error{ ConnectFailed, SocketError, OutOfMemory };
+/// `PlainNb.startConnectAddrInto`: no resolver, so no OutOfMemory.
+pub const ConnectAddrError = error{ ConnectFailed, SocketError };
 /// `PlainNb.connectDone`.
 pub const ConnectDoneError = error{ ConnectFailed, SocketError };
 /// `PlainNb.readNb`.
