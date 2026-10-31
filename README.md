@@ -44,6 +44,8 @@ OS per primitive, and lists real runs only.
 | epoll, Linux 6.8 (runner03, Ubuntu 24.04) | readiness hints without counts (drain contract) | [run 102, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/102/jobs/1): ReleaseSafe, 87 passed, 6 skipped, 0 failed | 2026-10-22 | [0b1ec8e](https://pacyworld.dev/pacyworld/born/commit/0b1ec8edb100dd8484f002227bc2a5544ec548ef) |
 | kqueue, macOS 26 arm64 (macinotsh-desktop, manual) | event port, readiness counts, EVFILT_USER wake | zig build test, Debug: 92 passed, 6 skipped, 0 failed | 2026-10-22 | [622ee3c](https://pacyworld.dev/pacyworld/born/commit/622ee3c) |
 | IOCP | Unix sockets | none: not implemented yet, their contract tests skip | n/a | n/a |
+| kqueue, FreeBSD 15 (runner01) | process descriptors (pdfork, EVFILT_PROCDESC) | [run 118, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/118/jobs/0): Debug and ReleaseSafe, 107 passed, 7 skipped, 0 failed | 2026-10-31 | [120b4d2](https://pacyworld.dev/pacyworld/born/commit/120b4d2f84e8ed8cc835b37fe28a393e215254d9) |
+| epoll, Linux 6.8 (runner03, Ubuntu 24.04) | process descriptors (pidfd, waitid) | [run 118, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/118/jobs/1): ReleaseSafe, 101 passed, 7 skipped, 0 failed | 2026-10-31 | [120b4d2](https://pacyworld.dev/pacyworld/born/commit/120b4d2f84e8ed8cc835b37fe28a393e215254d9) |
 | IOCP | process descriptors | none: error.Unsupported on Windows, the contract tests skip | n/a | n/a |
 
 Commit 3ed3785 changes only the CI workflow; its library and tests are
