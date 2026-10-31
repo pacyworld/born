@@ -52,8 +52,9 @@ pub const AssociateError = error{AssociateFailed};
 pub const WaitError = error{ WaitFailed, AssociateFailed, PostFailed, OutOfMemory };
 pub const TimerError = types.TimerError;
 pub const SignalError = types.SignalError;
+pub const ProcessError = types.ProcessError;
 /// Every error this backend can return.
-pub const Error = InitError || AssociateError || WaitError || TimerError || SignalError;
+pub const Error = InitError || AssociateError || WaitError || TimerError || SignalError || ProcessError;
 
 /// Windows has no signal mask: a documented no-op; see signal_windows.zig.
 pub const blockSignals = signal_windows.blockSignals;
@@ -190,6 +191,20 @@ pub const EvPort = struct {
     /// Stop watching `sig`. Unwatched signals are a no-op.
     pub fn unwatchSignal(self: *EvPort, sig: Signal) void {
         signal_windows.unwatch(self, sig);
+    }
+
+    /// Process watches are not implemented on IOCP.
+    pub fn watchProcess(self: *EvPort, handle: Handle, udata: ?*anyopaque) ProcessError!void {
+        _ = self;
+        _ = handle;
+        _ = udata;
+        return ProcessError.Unsupported;
+    }
+
+    /// A no-op: nothing can be watched.
+    pub fn unwatchProcess(self: *EvPort, handle: Handle) void {
+        _ = self;
+        _ = handle;
     }
 
     /// Harvest one batch of completions in ONE GetQueuedCompletionStatusEx

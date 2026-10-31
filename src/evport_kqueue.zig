@@ -32,12 +32,16 @@
 //     translates EVFILT_TIMER and EVFILT_SIGNAL into
 //     Event.timer/.signal/.fired after each module's observe() hook has
 //     seen the kevent.
+//   - Process exits (process_kqueue.zig, FreeBSD): EVFILT_PROCDESC knotes
+//     are staged like descriptor changes and translate into
+//     Event.exited/.exit. purgeFd drops their staged changes too.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("types.zig");
 const timer_kqueue = @import("timer_kqueue.zig");
 const signal_kqueue = @import("signal_kqueue.zig");
+const process_kqueue = @import("process_kqueue.zig");
 
 // Use the target's struct kevent: FreeBSD 12+ needs its extended 64-byte
 // layout (ext[4]), while NetBSD has wider filter/flags fields. A wrong
@@ -94,8 +98,9 @@ pub const InitError = error{ KqueueFailed, PipeFailed };
 pub const WaitError = error{ WaitFailed, OutOfMemory };
 pub const TimerError = types.TimerError;
 pub const SignalError = types.SignalError;
+pub const ProcessError = types.ProcessError;
 /// Every error this backend can return.
-pub const Error = InitError || WaitError || TimerError || SignalError;
+pub const Error = InitError || WaitError || TimerError || SignalError || ProcessError;
 
 /// Block `sigs` in the calling thread so a signal-watching port can receive
 /// them. Call it in `main` before spawning threads; see signal_kqueue.zig.
@@ -128,6 +133,8 @@ pub const EvPort = struct {
     timers: timer_kqueue.State = .{},
     /// Signal-watch bookkeeping, owned by signal_kqueue.zig.
     signals: signal_kqueue.State = .{},
+    /// Process-watch bookkeeping, owned by process_kqueue.zig.
+    processes: process_kqueue.State = .{},
 
     pub fn init(alloc: std.mem.Allocator) InitError!EvPort {
         const kq = std.posix.kqueue() catch return InitError.KqueueFailed;
@@ -176,6 +183,7 @@ pub const EvPort = struct {
         // port can still describe what it changed.
         self.signals.deinit(self);
         self.timers.deinit(self);
+        self.processes.deinit(self);
         if (self.kq >= 0) _ = std.c.close(self.kq);
         if (self.wake_r >= 0) _ = std.c.close(self.wake_r);
         if (self.wake_w >= 0) _ = std.c.close(self.wake_w);
@@ -221,19 +229,26 @@ pub const EvPort = struct {
     /// live filters; this prevents staged entries from applying to a
     /// recycled fd number at the next wait() flush.
     /// Only descriptor filters match: a staged timer or signal whose ident
-    /// equals the fd number is not the fd's.
+    /// equals the fd number is not the fd's. A process descriptor's watch
+    /// ends here too.
     pub fn purgeFd(self: *EvPort, fd: Handle) void {
         _ = self.armed_write.remove(fd);
+        process_kqueue.purge(self, fd);
         const ident: usize = @intCast(fd);
         var i: usize = 0;
         while (i < self.changes.items.len) {
             const kev = self.changes.items[i];
-            if (kev.ident == ident and (kev.filter == EVFILT_READ or kev.filter == EVFILT_WRITE)) {
+            if (kev.ident == ident and isFdFilter(kev.filter)) {
                 _ = self.changes.swapRemove(i);
             } else {
                 i += 1;
             }
         }
+    }
+
+    fn isFdFilter(filter: @FieldType(Kevent, "filter")) bool {
+        if (filter == EVFILT_READ or filter == EVFILT_WRITE) return true;
+        return process_kqueue.have_procdesc and filter == process_kqueue.EVFILT_PROCDESC;
     }
 
     /// Wake a wait() blocked in another thread. Non-blocking; wakes that
@@ -281,6 +296,19 @@ pub const EvPort = struct {
         signal_kqueue.unwatch(self, sig);
     }
 
+    /// Deliver the exit of the process behind `handle` (a process
+    /// descriptor) as Event.exited, staged into the next wait(). FreeBSD
+    /// only; see process_kqueue.zig.
+    pub fn watchProcess(self: *EvPort, handle: Handle, udata: ?*anyopaque) ProcessError!void {
+        return process_kqueue.watch(self, handle, udata);
+    }
+
+    /// End a process watch on a descriptor that stays open. Unwatched
+    /// handles are a no-op; before closing, `purgeFd` is enough.
+    pub fn unwatchProcess(self: *EvPort, handle: Handle) void {
+        process_kqueue.unwatch(self, handle);
+    }
+
     /// Internal hook for timer_kqueue.zig and signal_kqueue.zig: stage an
     /// arbitrary change for the next wait(). Never call kevent() to
     /// register; an allocation failure is stashed like any other stage.
@@ -320,6 +348,7 @@ pub const EvPort = struct {
         else
             std.c.kevent(self.kq, self.changes.items.ptr, @intCast(self.changes.items.len), &kbuf, @intCast(cap), tsp);
         self.changes.clearRetainingCapacity();
+        process_kqueue.flushed(self);
         if (n < 0) {
             const e = std.posix.errno(@as(isize, n));
             if (e == .INTR) return 0;
@@ -348,6 +377,8 @@ pub const EvPort = struct {
                 timer_kqueue.observe(self, kev)
             else if (kev.filter == EVFILT_SIGNAL)
                 signal_kqueue.observe(self, kev)
+            else if (process_kqueue.have_procdesc and kev.filter == process_kqueue.EVFILT_PROCDESC)
+                process_kqueue.observe(self, kev)
             else
                 true;
             if (!keep) continue;
@@ -386,6 +417,11 @@ pub const EvPort = struct {
             } else {
                 ev.err = true;
             }
+        } else if (process_kqueue.have_procdesc and kev.filter == process_kqueue.EVFILT_PROCDESC) {
+            ev.exited = true;
+            // NOTE_EXIT data is the wait(2) status, which is always an exit.
+            ev.exit = types.ProcessExit.fromWaitStatus(@truncate(@as(u64, @bitCast(@as(i64, kev.data)))));
+            if (ev.exit == null) ev.err = true;
         }
         return ev;
     }
@@ -706,6 +742,39 @@ test "kqueue: timer and signal kevents translate to their event fields" {
     counted.filter = EVFILT_WRITE;
     counted.data = 4096;
     try std.testing.expectEqual(@as(usize, 0), EvPort.translate(counted).avail);
+}
+
+test "kqueue: process descriptor kevents translate to the exit fields" {
+    if (!process_kqueue.have_procdesc) return error.SkipZigTest;
+    var tag: u8 = 1;
+    var kev = EvPort.change(5, process_kqueue.EVFILT_PROCDESC, EV_ADD | EV_EOF, &tag);
+    kev.data = 7 << 8;
+    const coded = EvPort.translate(kev);
+    try std.testing.expect(coded.exited and !coded.err and !coded.readable and !coded.timer);
+    try std.testing.expectEqual(types.ProcessExit{ .code = 7 }, coded.exit.?);
+    kev.data = std.posix.SIG.KILL;
+    try std.testing.expectEqual(types.ProcessExit{ .signal = std.posix.SIG.KILL }, EvPort.translate(kev).exit.?);
+    // A refused watch is an error, never an exit.
+    kev.flags = EV_ERROR;
+    kev.data = @intFromEnum(std.posix.E.BADF);
+    const refused = EvPort.translate(kev);
+    try std.testing.expect(refused.err and !refused.exited and refused.exit == null);
+    // Other filters leave the exit fields inert.
+    const read = EvPort.translate(EvPort.change(5, EVFILT_READ, EV_ADD, &tag));
+    try std.testing.expect(!read.exited and read.exit == null);
+}
+
+test "kqueue: purgeFd drops a staged process watch" {
+    if (!process_kqueue.have_procdesc) return error.SkipZigTest;
+    var port = try EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    var events: [4]Event = undefined;
+    _ = try port.wait(&events, 0);
+    var tag: u8 = 1;
+    try port.watchProcess(901, &tag);
+    port.purgeFd(901);
+    try std.testing.expectEqual(@as(usize, 0), port.changes.items.len);
+    try std.testing.expect(!port.processes.live.contains(901));
 }
 
 test "kqueue: stageRaw timer is submitted by the next wait and fires once" {

@@ -62,6 +62,35 @@ pub const SignalError = error{
     OutOfMemory,
 };
 
+/// `EvPort.watchProcess`, the same on every backend.
+pub const ProcessError = error{
+    /// Process watches are not available on this backend or target.
+    Unsupported,
+    /// epoll only: the handle is not open, or is not a pollable descriptor.
+    /// kqueue reports a refused watch from wait() as Event.err.
+    BadHandle,
+    /// The kernel refused a watch resource (the epoll process set).
+    SystemResources,
+    OutOfMemory,
+};
+
+/// How a watched process ended (`Event.exit`).
+pub const ProcessExit = union(enum) {
+    /// exit(2) status, 0 to 255.
+    code: u8,
+    /// Number of the signal that terminated the process.
+    signal: u8,
+
+    /// Decodes a wait(2) status word. Null for a stopped or continued
+    /// status, which is not an exit.
+    pub fn fromWaitStatus(status: u32) ?ProcessExit {
+        const sig: u8 = @intCast(status & 0x7f);
+        if (sig == 0) return .{ .code = @intCast((status >> 8) & 0xff) };
+        if (sig == 0x7f) return null;
+        return .{ .signal = sig };
+    }
+};
+
 pub const Event = struct {
     udata: ?*anyopaque = null,
     readable: bool = false, // unused on IOCP (the conn classifies)
@@ -89,4 +118,10 @@ pub const Event = struct {
     /// IOCP ever report. Pass the event to `PlainNb.hintReadable` or
     /// `Listener.hintReadable` to skip the trailing EAGAIN call.
     avail: usize = 0,
+    /// A watched process exited; `udata` is the watch's. The watch ends
+    /// with this event. With `err` clear, `exit` says how it ended; with
+    /// `err` set (epoll: the status could not be collected), `exit` is null
+    /// and `err_no` holds the errno.
+    exited: bool = false,
+    exit: ?ProcessExit = null,
 };
