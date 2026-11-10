@@ -8,16 +8,18 @@
 //! it deletes the knote, so the exit event ends the watch. A watch added
 //! after the process exited fires at once.
 //!
-//! The kernel keeps the zombie until the last process descriptor is closed
-//! (`Child.close`), whether or not an exit was harvested; closing the
-//! descriptor of a running process kills it with SIGKILL and its reaper
-//! collects it. Born never reaps on kqueue.
+//! The kernel keeps the zombie until the last process descriptor is closed,
+//! unless another caller reaps it with pdwait/wait6. Closing that last
+//! reference to a running process kills it with SIGKILL and init collects
+//! it. Born never calls a wait function on kqueue.
 //!
-//! State tracks watched descriptors and whether their add has reached the
-//! kernel, so `unwatch` stages EV_DELETE only for a knote that exists and
-//! drops a still-staged add instead. Deliveries for a descriptor that is no
-//! longer watched (a delete that could not be staged) are suppressed, as is
-//! the ENOENT of a delete that found no knote.
+//! State tracks watched descriptors and marks their adds submitted after
+//! every kevent attempt, so `unwatch` stages EV_DELETE only for a marked add
+//! and drops a still-staged add instead. If eventlist exhaustion makes
+//! kevent abandon a suffix, `flushed` marks its unprocessed adds submitted
+//! too (#66), so the mark does not prove that a knote exists. Deliveries for
+//! a descriptor that is no longer watched (a delete that could not be staged)
+//! are suppressed, as is the ENOENT of a delete that found no knote.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -27,6 +29,7 @@ const EvPort = kq.EvPort;
 const Kevent = kq.Kevent;
 const ProcessError = types.ProcessError;
 
+/// Whether the target provides FreeBSD process descriptors and EVFILT_PROCDESC.
 pub const have_procdesc = builtin.os.tag == .freebsd;
 /// EVFILT_PROCDESC, or 0 where it does not exist (never compared there).
 pub const EVFILT_PROCDESC = if (have_procdesc) std.c.EVFILT.PROCDESC else 0;
@@ -40,13 +43,15 @@ const ENOENT = @intFromEnum(std.posix.E.NOENT);
 
 /// Per-port watch bookkeeping, a field of EvPort (`processes`).
 pub const State = struct {
-    /// Watched descriptors; the value is true once a wait() has submitted
-    /// the add, so a knote exists.
+    /// Watched descriptors; the value is true after a wait() attempts to
+    /// submit the add. Eventlist exhaustion can make this true without a
+    /// corresponding knote (#66).
     live: std.AutoHashMapUnmanaged(c_int, bool) = .empty,
-    /// Descriptors whose add is staged and not yet submitted.
-    unflushed: std.ArrayListUnmanaged(c_int) = .empty,
+    /// Descriptors whose add is staged and has not been attempted.
+    unflushed: std.ArrayList(c_int) = .empty,
 
-    /// Closing the kqueue drops every knote; only the bookkeeping is freed.
+    /// Frees bookkeeping; EvPort closes the kqueue separately, dropping its
+    /// knotes. Process descriptors and children remain caller-owned.
     pub fn deinit(self: *State, port: *EvPort) void {
         self.live.deinit(port.alloc);
         self.unflushed.deinit(port.alloc);
@@ -56,9 +61,11 @@ pub const State = struct {
 
 /// Stages the watch for the next wait(). Allocation happens up front, so
 /// OutOfMemory leaves the port unchanged. Watching a watched descriptor
-/// replaces its udata. A kernel refusal (EBADF, or a descriptor that is not
-/// a process descriptor) arrives at wait() as Event{ .err, .err_no } with
-/// the watch's udata and ends the watch.
+/// replaces its udata. When the change is processed, a kernel refusal (EBADF,
+/// or a descriptor that is not a process descriptor) arrives at wait() as
+/// Event{ .err, .err_no } with the watch's udata and ends the watch.
+/// Eventlist exhaustion can instead abandon the change with the rest of the
+/// batch (#66).
 pub fn watch(port: *EvPort, fd: c_int, udata: ?*anyopaque) ProcessError!void {
     if (!have_procdesc) return ProcessError.Unsupported;
     if (fd < 0) return ProcessError.BadHandle;
@@ -74,7 +81,7 @@ pub fn watch(port: *EvPort, fd: c_int, udata: ?*anyopaque) ProcessError!void {
 }
 
 /// Ends a watch on a descriptor that stays open. A staged add is dropped;
-/// a submitted one gets a staged EV_DELETE. Unwatched descriptors are a
+/// one marked submitted gets a staged EV_DELETE. Unwatched descriptors are a
 /// no-op. For a descriptor about to be closed, `EvPort.purgeFd` is enough.
 pub fn unwatch(port: *EvPort, fd: c_int) void {
     if (!have_procdesc) return;
@@ -90,7 +97,9 @@ pub fn purge(port: *EvPort, fd: c_int) void {
     _ = port.processes.live.remove(fd);
 }
 
-/// wait() hook after the changelist reached the kernel.
+/// wait() hook after every kevent attempt, including a failed one. Marks all
+/// staged adds submitted; an eventlist-overflow suffix can therefore be marked
+/// without its knote being installed (#66).
 pub fn flushed(port: *EvPort) void {
     const st = &port.processes;
     for (st.unflushed.items) |fd| {

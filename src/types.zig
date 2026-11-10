@@ -79,10 +79,11 @@ pub const SignalError = error{
 pub const ProcessError = error{
     /// Process watches are not available on this backend or target.
     Unsupported,
-    /// The handle is not open, or not a process descriptor (pidfd): both
-    /// backends refuse a negative handle at watch time, and on epoll a
-    /// probe also refuses other pollable descriptors. On kqueue a surviving
-    /// kernel refusal is reported from wait() as Event.err.
+    /// The handle is not open or not a process descriptor. Supported FreeBSD
+    /// and epoll paths reject negative handles immediately; epoll also rejects
+    /// non-pidfds with a signal-0 probe. An ordinary FreeBSD kernel refusal is
+    /// deferred to `wait()` as `err=true`, native `err_no`, `exited=false`,
+    /// and `exit=null`, ending that watch.
     BadHandle,
     /// The kernel refused a watch resource (the epoll process set).
     SystemResources,
@@ -119,9 +120,10 @@ pub const Event = struct {
     eof: bool = false,
     /// A native error or registration rejection was reported.
     err: bool = false,
-    /// Optional native error payload: kqueue errno for a rejected change, or
-    /// IOCP NTSTATUS from the completion's `Internal` field. Zero when no
-    /// payload is available, including epoll readiness errors.
+    /// Optional native error payload: kqueue errno for a rejected change,
+    /// epoll `waitid` errno for a process-harvest failure, or IOCP NTSTATUS
+    /// from the completion's `Internal` field. Zero when no payload is
+    /// available, including epoll readiness errors.
     err_no: usize = 0,
     /// Cross-thread wakeup requested through `wake()` or an IOCP wake post.
     wake: bool = false,

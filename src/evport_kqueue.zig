@@ -96,6 +96,7 @@ pub const InitError = error{ KqueueFailed, PipeFailed };
 pub const WaitError = error{ WaitFailed, OutOfMemory };
 pub const TimerError = types.TimerError;
 pub const SignalError = types.SignalError;
+/// Errors returned by process-watch operations.
 pub const ProcessError = types.ProcessError;
 /// Every error this backend can return.
 pub const Error = InitError || WaitError || TimerError || SignalError || ProcessError;
@@ -179,7 +180,9 @@ pub const EvPort = struct {
         }
     }
 
-    /// Restore signal state and release the kqueue, wake source, and bookkeeping.
+    /// Restore signal state and release port-owned descriptors and bookkeeping.
+    /// Caller-owned `Child.handle` values stay open, and child lifetime and
+    /// final reaping remain the caller's responsibility.
     pub fn deinit(self: *EvPort) void {
         // Signal dispositions are process-wide: restore them while the
         // port can still describe what it changed.
@@ -298,9 +301,11 @@ pub const EvPort = struct {
         signal_kqueue.unwatch(self, sig);
     }
 
-    /// Deliver the exit of the process behind `handle` (a process
-    /// descriptor) as Event.exited, staged into the next wait(). FreeBSD
-    /// only; see process_kqueue.zig.
+    /// Deliver one exit event for the child behind `handle`, a FreeBSD process
+    /// descriptor, staged into the next non-empty `wait()`. Invalid negative
+    /// handles and allocation failures are immediate call errors; ordinary
+    /// kernel refusals arrive as `Event.err` with native `err_no`, `exited=false`,
+    /// and `exit=null`. Exit delivery ends the watch but does not reap the child.
     pub fn watchProcess(self: *EvPort, handle: Handle, udata: ?*anyopaque) ProcessError!void {
         return process_kqueue.watch(self, handle, udata);
     }

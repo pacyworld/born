@@ -5,8 +5,8 @@ readiness, so its socket companions own and drive overlapped operations.
 
 ## Association and completion
 
-`associate` attaches an overlappable handle to the completion port. The legacy
-`monitorRead` operation also associates a handle; it does not submit a read.
+`associate` attaches an overlappable handle to the completion port. The
+portable `monitorRead` call also associates a handle; it does not submit a read.
 The TCP stream and listener companions associate their own handles during
 startup, and callers must not associate them again.
 
@@ -39,6 +39,17 @@ per post rather than coalescing wakeups. Timer and console helper threads only
 post completions; they never mutate loop-owned state. Their stops are
 completed before the port closes.
 
-Anonymous pipes created by standard child-process APIs are not overlappable.
-Use explicitly created overlappable named pipes or a blocking-pipe relay that
-posts completions to the port.
+## Child processes
+
+`born.process.supported` is false on Windows. `process.spawn` and
+`watchProcess` return `error.Unsupported`, and `unwatchProcess` is a no-op.
+IOCP has no process-watch state, process-exit source, or child reaper, and port
+deinitialization has no child-process cleanup to perform. The portable event
+fields remain inert: `Event.exited` is false and `Event.exit` is null for every
+IOCP completion and post.
+
+Anonymous pipes created for application-launched children by APIs such as
+`std.process.Child` are not overlappable. This does not refer to children made
+by `born.process.spawn`, which is unsupported on Windows. Use explicitly
+created overlappable named pipes or a blocking-pipe relay that posts
+completions to the port.

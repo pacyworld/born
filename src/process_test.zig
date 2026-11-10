@@ -28,8 +28,9 @@ fn sh(comptime script: [:0]const u8) [*:null]const ?[*:0]const u8 {
 
 const sleep_long = [_:null]?[*:0]const u8{ "/bin/sleep", "30" };
 
-/// Waits up to `window_ms` for the exit event carrying `udata`, failing on
-/// any other event that is not `allowed`.
+/// Waits up to `window_ms` for the exit event carrying `udata`. Wake events
+/// are ignored; any other event must be that exit, with no readiness, timer,
+/// or signal fields set.
 fn waitExit(port: *born.EvPort, udata: *anyopaque, window_ms: u64) !Event {
     var events: [8]Event = undefined;
     var timer = try std.time.Timer.start();

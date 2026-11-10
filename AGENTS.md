@@ -98,7 +98,7 @@ summary line into the pull request.
 
 ### README results table
 
-The README's "Runtime evidence" table records evidence runs by backend and
+The README's "Runtime evidence" table records the last run per backend and
 primitive: backend, primitive, run, date, commit. Only runs that happened
 on that OS go in it. When a primitive's contract tests stop skipping, add
 its run in the same pull request. Cells must not start with a backtick:

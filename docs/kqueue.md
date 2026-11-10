@@ -23,13 +23,60 @@ for descriptors that remain open.
 
 ## Errors and regular files
 
-A kernel-rejected changelist entry arrives as an event with `err` set and the
-native errno in `err_no`; readiness bits remain clear. An allocation failure
-before submission is stashed and returned as `error.OutOfMemory` from the next
-non-empty `wait()`. Registration failures are never discarded.
+While eventlist space remains, the kernel copies each rejected change as
+`EV_ERROR` and continues processing changes in order. If a rejected change
+finds no eventlist slot, `kevent()` returns `-1` with that change's errno and
+leaves subsequent changes unprocessed. Earlier changes and copied error
+records are not rolled back. `EV_RECEIPT` records consume the same slots.
+
+Born submits the entire staged changelist with at most 64 event slots and
+clears it even after `-1`. Until overflow handling is fixed, more rejections
+than available slots can therefore surface only `error.WaitFailed`, discard
+the copied error events, and drop the unprocessed suffix. An allocation
+failure before submission is instead stashed and returned as
+`error.OutOfMemory` from the next non-empty `wait()`.
 
 Regular files are native kqueue readiness sources and remain perpetually
 ready. Consumers stop monitoring them at EOF to avoid a busy wait.
+
+## Child processes
+
+Process descriptors are available only on FreeBSD. On macOS, NetBSD, OpenBSD,
+and other kqueue targets, `born.process.supported` is false, `process.spawn`
+and `watchProcess` return `error.Unsupported`, and `unwatchProcess` is a no-op.
+
+FreeBSD `process.spawn` uses `pdfork(PD_CLOEXEC)` and returns a close-on-exec
+process descriptor. `Child.kill` signals through that descriptor with `pdkill`,
+so it cannot signal a recycled PID. `watchProcess` stages an `EV_ADD` for
+`EVFILT_PROCDESC` with `NOTE_EXIT`; the next non-empty `wait()` submits it with
+the ordinary changelist. Re-watching replaces the event's `udata`.
+`unwatchProcess` drops a staged add or stages a delete for a live knote, while
+`purgeFd` forgets the watch before the descriptor is closed.
+
+At exit, the kernel marks the knote `EV_EOF | EV_ONESHOT` and puts the wait
+status in its data field. Born translates this into one event with `exited`
+set, `exit` containing the exit code or terminating signal, and `eof` clear;
+the event ends the watch. Watching an already-exited process fires at the next
+`wait()`. A rejected process-watch add instead ends the watch with an error
+event: `err` is set, `err_no` contains the native errno, `exited` is false, and
+`exit` is null. Both event shapes carry the watch's `udata`.
+
+Born does not reap through kqueue. Unless another caller reaps with
+`pdwait`/`wait6`, an exited child remains a zombie until its last process
+descriptor is closed, whether or not its exit event was harvested. If the last
+descriptor closes while the child is running, the kernel kills it
+with `SIGKILL` and leaves init to reap it asynchronously; the close does not
+wait for that reap. A `pdfork` child sends no `SIGCHLD` and is invisible to a
+generic `wait(2)` for children.
+
+Process changes share the eventlist-overflow caveat above. In particular, the
+current `wait()` marks staged process adds as submitted before checking for a
+`kevent()` failure, so eventlist exhaustion can discard an unprocessed process
+add while its bookkeeping says that it reached the kernel.
+
+`EvPort.deinit` closes the kqueue, which drops its knotes, and frees watch
+bookkeeping. It does not close caller-owned `Child.handle` values or perform
+the child's final reap; that remains the caller's responsibility.
 
 ## Wakeups and companion primitives
 

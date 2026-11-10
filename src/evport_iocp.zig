@@ -21,6 +21,10 @@
 //! only post completions keyed by internalKey, with a payload in the byte
 //! count. wait hands those completions to the owning module's harvest function
 //! on the event-loop thread.
+//!
+//! Process watches are unsupported. watchProcess returns error.Unsupported,
+//! unwatchProcess is a no-op, and native IOCP events leave Event.exited false
+//! and Event.exit null.
 
 const std = @import("std");
 const windows = std.os.windows;
@@ -52,6 +56,7 @@ pub const AssociateError = error{AssociateFailed};
 pub const WaitError = error{ WaitFailed, AssociateFailed, PostFailed, OutOfMemory };
 pub const TimerError = types.TimerError;
 pub const SignalError = types.SignalError;
+/// Errors returned by process-watch operations.
 pub const ProcessError = types.ProcessError;
 /// Every error this backend can return.
 pub const Error = InitError || AssociateError || WaitError || TimerError || SignalError || ProcessError;
@@ -204,7 +209,9 @@ pub const EvPort = struct {
         signal_windows.unwatch(self, sig);
     }
 
-    /// Process watches are not implemented on IOCP.
+    /// Always returns `error.Unsupported` without associating `handle` or
+    /// changing bookkeeping. `handle` and `udata` are ignored, and native IOCP
+    /// events never acquire process exit fields through this method.
     pub fn watchProcess(self: *EvPort, handle: Handle, udata: ?*anyopaque) ProcessError!void {
         _ = self;
         _ = handle;

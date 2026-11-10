@@ -54,6 +54,7 @@ pub const InitError = error{InitFailed};
 pub const WaitError = error{ WaitFailed, RegisterFailed, SourceFailed, OutOfMemory };
 pub const TimerError = types.TimerError;
 pub const SignalError = types.SignalError;
+/// Errors returned by process-watch operations.
 pub const ProcessError = types.ProcessError;
 /// Every error this backend can return.
 pub const Error = InitError || WaitError || TimerError || SignalError || ProcessError;
@@ -63,7 +64,14 @@ pub const Error = InitError || WaitError || TimerError || SignalError || Process
 pub const blockSignals = signal_epoll.blockSignals;
 
 /// Internal source kinds; each owns one slot in EvPort.internal.
-pub const InternalKind = enum { timer, signal, process };
+pub const InternalKind = enum {
+    /// timerfd deadline source.
+    timer,
+    /// signalfd signal source.
+    signal,
+    /// Inner epoll set of pidfds.
+    process,
+};
 
 /// Stable addresses used as epoll data for internal sources, one per kind.
 /// They cannot collide with a caller's udata, which never points here.
@@ -147,7 +155,9 @@ pub const EvPort = struct {
         return self;
     }
 
-    /// Release internal sources, the epoll instance, eventfd, and bookkeeping.
+    /// Release port-owned internal sources, descriptors, and bookkeeping.
+    /// Caller-owned `Child.handle` values stay open, and child lifetime and
+    /// final reaping remain the caller's responsibility.
     pub fn deinit(self: *EvPort) void {
         self.signals.deinit(self);
         self.timers.deinit(self);
@@ -232,15 +242,17 @@ pub const EvPort = struct {
         signal_epoll.unwatch(self, sig);
     }
 
-    /// Deliver the exit of the process behind `handle` (a pidfd of a child
-    /// of this process) as Event.exited; the wait() that reports it reaps
-    /// the child. See process_epoll.zig.
+    /// Deliver one exit event for the child behind `handle`, a pidfd. A
+    /// signal-0 probe rejects non-pidfds immediately. Successful harvest reaps
+    /// the child and ends the watch. Uncollectable status instead produces an
+    /// error event with `exit=null`. See process_epoll.zig.
     pub fn watchProcess(self: *EvPort, handle: Handle, udata: ?*anyopaque) ProcessError!void {
         return process_epoll.watch(self, handle, udata);
     }
 
-    /// End a process watch on a pidfd that stays open. Unwatched handles
-    /// are a no-op; before closing, `purgeFd` is enough.
+    /// End a process watch on a pidfd that stays open. Unwatched handles are a
+    /// no-op; before closing, `purgeFd` is enough. A removal failure is
+    /// deferred as `error.RegisterFailed` from the next non-empty `wait()`.
     pub fn unwatchProcess(self: *EvPort, handle: Handle) void {
         process_epoll.unwatch(self, handle);
     }

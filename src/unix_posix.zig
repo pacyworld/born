@@ -272,6 +272,8 @@ const testing = std.testing;
 const test_tmp_root = ".zig-cache" ++ std.fs.path.sep_str ++ "tmp" ++ std.fs.path.sep_str;
 
 /// A socket path relative to the workspace, short enough for BSD sun_path.
+/// The root mirrors std.testing.tmpDir's `.zig-cache/tmp` layout. Tests run
+/// from a writable working directory; manual runs create that layout there.
 const TestPath = struct {
     buf: [64]u8 = undefined,
     len: usize = 0,

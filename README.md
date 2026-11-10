@@ -24,10 +24,10 @@ selection alone is not a compilation or runtime guarantee.
 ### Runtime evidence
 
 CI runs the test suite on FreeBSD, Linux and Windows for every push and pull
-request (procedure in `AGENTS.md`). This table records runtime evidence by
-backend and primitive, and lists real runs only.
+request (procedure in `AGENTS.md`). This table records the last run on each
+OS per primitive, and lists real runs only.
 
-| backend | primitive | runtime run | date | commit |
+| backend | primitive | last runtime run | date | commit |
 |---|---|---|---|---|
 | kqueue, FreeBSD 15 (runner01) | event port, wake, plain TCP stream | [run 39, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/39/jobs/0): Debug and ReleaseSafe, 29 passed, 26 skipped, 0 failed | 2026-10-18 | [3ed3785](https://pacyworld.dev/pacyworld/born/commit/3ed378538592c0f8c3a0598c957409dd6becfd57) |
 | epoll, Linux 6.8 (runner03, Ubuntu 24.04) | event port, wake, plain TCP stream | [run 39, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/39/jobs/1): ReleaseSafe, 28 passed, 26 skipped, 0 failed | 2026-10-18 | [3ed3785](https://pacyworld.dev/pacyworld/born/commit/3ed378538592c0f8c3a0598c957409dd6becfd57) |
@@ -76,7 +76,7 @@ remove its staged changes/bookkeeping. Never apply stale changes after closing
 or recycling a descriptor. `unmonitorRead` and `cancelWrite` are for descriptors
 that remain open.
 
-**A failed registration is never silent, on any backend.** A rejected
+**Registration failure reporting.** A rejected
 registration, including `EBADF` for a dead descriptor or any other refusal
 epoll or kqueue might return, is stashed and returned as
 `error.RegisterFailed` from the next non-empty `wait()` on epoll (an empty
@@ -87,6 +87,12 @@ errno in `.err_no` (and
 `.readable`/`.writable` stay clear on such events), while an allocation failure
 before the change ever reaches the kernel is stashed and returned as
 `error.OutOfMemory` the same way epoll stashes its rejections.
+
+On kqueue, a rejected change that finds no eventlist slot makes `kevent()`
+return `-1` and leaves subsequent changes unprocessed. Born currently clears
+the submitted changelist in this case, so `error.WaitFailed` can hide copied
+error events and the unprocessed suffix. See [kqueue backend
+rationale](docs/kqueue.md) for the complete contract.
 
 **Regular files work identically on every POSIX backend.** I/O on a regular
 file never blocks, so "always ready" is the correct answer. kqueue accepts
@@ -102,7 +108,7 @@ backends, or `wait()` keeps answering instantly (true under kqueue already).
 `monitorRead` associates an overlappable handle with the port; **it does not
 submit a read**. New low-level callers can use fallible `associate` directly.
 The socket companion associates its own handle at startup; callers must not
-associate it again. A failed legacy `monitorRead` is reported by the next
+associate it again. A failed `monitorRead` association is reported by the next
 nonempty `wait`, rather than silently dropped.
 `wantWrite`, `cancelWrite`, `unmonitorRead` and `purgeFd` do not submit or cancel
 Windows operations. `wait()` harvests completions with
@@ -123,9 +129,11 @@ inline-successful Winsock operation queues a completion. On teardown, call
 `deinit` and free the stream. Closing the handle alone does not end the lifetime
 of its `OVERLAPPED` storage.
 
-Windows anonymous pipes from `std.process.Child` are **not overlappable**.
-The TCP companion does not make those pipes IOCP-capable: use explicitly created
-overlappable named pipes or a blocking-pipe relay, as mcp-bridge does.
+Windows anonymous pipes for application-created children, such as those from
+`std.process.Child`, are **not overlappable**. The TCP companion does not make
+those pipes IOCP-capable: use explicitly created overlappable named pipes or a
+blocking-pipe relay, as mcp-bridge does. This is separate from
+`born.process.spawn`, which is unsupported on Windows.
 
 ### Common event surface
 
@@ -258,6 +266,10 @@ echo and about two less per connection in the accept storm.
 
 ## Child processes
 
+`born.process.supported` reports compile-time target support on FreeBSD and
+Linux. Linux additionally probes the required pidfd and `waitid(P_PIDFD)`
+facilities at spawn and returns `error.Unsupported` on kernels older than 5.4.
+
 `born.process.spawn(argv, envp, opts)` starts a program and returns a
 `Child{ .handle, .pid }`; `ep.watchProcess(child.handle, udata)` delivers its
 exit through `wait()` as `Event{ .exited = true, .exit = .{ .code = n } }` or
@@ -277,46 +289,67 @@ child.close();
 
 | backend | descriptor | exit event | reaping |
 |---|---|---|---|
-| kqueue, FreeBSD | process descriptor from `pdfork(PD_CLOEXEC)` | EVFILT_PROCDESC NOTE_EXIT, staged into the next `wait()` | the zombie stays until `close`, which reaps it |
+| kqueue, FreeBSD | process descriptor from `pdfork(PD_CLOEXEC)` | EVFILT_PROCDESC NOTE_EXIT, staged into the next `wait()` | unless externally reaped, the zombie stays until the last process descriptor closes; born never calls `wait(2)` |
 | epoll, Linux 5.4+ | pidfd from `clone(CLONE_PIDFD)` | pidfd readable, harvested through one internal epoll set | the `wait()` that reports the exit reaps it with `waitid(P_PIDFD)` |
 | IOCP; kqueue on macOS, NetBSD, OpenBSD | none | spawn and watch return `error.Unsupported` | n/a |
 
-- **spawn** allocates nothing: argv and envp are the caller's
-  NUL-terminated arrays, there is no PATH search (`opts.path` or argv[0] is
-  the program), and between fork and execve the child makes only
-  async-signal-safe calls, so a multi-threaded program may call it. The
-  child gets `stdin`, `stdout` and `stderr` as asked (`.inherit`, `.devnull`
-  or a handle) and `opts.fds[i]` as fd 3 + i, up to `born.process.max_fds`;
-  every other descriptor is closed. It starts with every signal at its
-  default disposition and an empty signal mask, whatever the parent blocks
-  or ignores (a parent that blocks signals for epoll's signalfd still has
-  children that SIGTERM ends).
+- **Born's successful spawn and setup path takes no allocator and performs no
+  user-space heap allocation:** argv and envp are the caller's NUL-terminated arrays, and the
+  fixed descriptor plan is ready before the fork. There is no PATH search
+  (`opts.path` or argv[0] is the program). Between fork and execve the child
+  makes only async-signal-safe calls. FreeBSD libthr also runs the
+  application's `pthread_atfork` handlers around `pdfork`; born registers
+  none, and application handlers must obey the same child-side rule for a
+  multi-threaded caller to be safe.
+- **The child starts with a controlled descriptor and signal state:** it gets
+  `stdin`, `stdout` and `stderr` as asked (`.inherit`, `.devnull` or a handle)
+  and `opts.fds[i]` as fd 3 + i, up to `born.process.max_fds`; every other
+  descriptor is closed. It resets signal dispositions to their defaults and
+  enters execve with an empty signal mask, whatever the parent blocks or
+  ignores, except that FreeBSD accepts `EINVAL` for libthr-reserved signals
+  whose dispositions cannot be reset. A parent that blocks signals for epoll's
+  signalfd still has children that SIGTERM ends.
 - **Errors are never lost:** a close-on-exec pipe carries a setup or execve
   failure back, so `spawn` returns `FileNotFound`, `AccessDenied`,
-  `InvalidExe`, `SetupFailed` (for example a mapped handle that is not
-  open), `SystemResources` or `ExecFailed` and reaps the failed child. It
-  therefore returns once the child has called execve, as `posix_spawn` does.
+  `InvalidExe`, `SetupFailed` (for example a mapped handle that is not open),
+  `SystemResources` or `ExecFailed`. It calls `Child.close` for the failed
+  child, applying the descriptor-close rules below instead of returning a live
+  handle. On success it returns once the child has called execve, as
+  `posix_spawn` does.
 - **The watch ends with the exit event**, which arrives once. A watch added
   after the process exited fires at the next `wait()`. Re-watching replaces
   the udata; `unwatchProcess` ends a watch on a handle that stays open, and
-  before closing, `purgeFd(handle)` is enough, as for any descriptor.
-  Stale exit events are tolerated as for timers and signals.
-- **Closing the descriptor of a running child kills it** (SIGKILL), and
-  `close` never blocks the caller. FreeBSD leaves the exit to the child's
-  reaper (init). Linux reaps on the spot when a status is already waiting
-  and hands a still-exiting child's pidfd to a lazily spawned background
-  reaper thread (only an allocation failure there degrades to a blocking
-  reap). Loop code should `child.kill(sig)`, wait for the exit event, then
-  `purgeFd` and `close`, which keeps reaping on the spot. No zombie is left
-  either way.
+  before closing, `purgeFd(handle)` is enough, as for any descriptor. Stale
+  exit events are tolerated as for timers and signals.
+- **Descriptor close has platform-specific reaping rules.** FreeBSD retains an
+  exited child as a zombie until its last process descriptor closes, even
+  after an exit event. Closing the last descriptor of a running child kills it
+  with SIGKILL and leaves init to reap it asynchronously. Linux `close` sends
+  SIGKILL, makes a nonblocking `waitid` attempt, and reaps on the spot when a
+  status is already available. A still-exiting child's pidfd goes to a lazily
+  spawned detached reaper thread. If that thread cannot be spawned or its
+  queue cannot allocate space, `close` itself falls back to a blocking reap;
+  it is therefore not unconditionally nonblocking, and the fallback is not
+  allocation-only. The reaper drains oldest-first, so one stalled exit delays
+  later entries (#52). Loop code should `child.kill(sig)`, wait for the exit
+  event, then `purgeFd` and `close`, which keeps reaping on the spot.
 - **kill** signals through the descriptor, so it never reaches a recycled
-  pid. After a reported exit, Linux answers `error.Exited` (the child is
-  reaped); a FreeBSD zombie accepts and ignores signals until `close`.
+  pid. After born reaps a reported exit, or after an external wait reaps the
+  child, Linux answers `error.Exited`; a FreeBSD zombie accepts and ignores
+  signals while it remains.
 - **wait(2) elsewhere in the program:** a pdfork child sends no SIGCHLD and
-  is invisible to a wait for any child. A Linux pidfd child is an ordinary
-  child: a `waitpid(-1)` elsewhere can reap it first, and its exit event
-  then arrives with `err` set, `exit` null and `err_no` = ECHILD. A failed
-  harvest of the internal process set is `error.SourceFailed` from `wait()`.
+  is invisible to a generic wait for children. A Linux pidfd child is an
+  ordinary child and sends SIGCHLD as usual: a `waitpid(-1)` elsewhere can reap
+  it first, and its exit event then arrives with `exited` and `err` set, `exit`
+  null and `err_no` = ECHILD. A readable pidfd whose status belongs to a tracer
+  produces the same event shape with `err_no` = 0. Either error event ends the
+  watch. A failed harvest of the internal process set is `error.SourceFailed`
+  from `wait()`.
+- **Ownership stays explicit:** `EvPort.deinit` releases port-owned watch
+  sources and bookkeeping but does not close `Child.handle`, kill the child,
+  or perform its final reap. The caller purges and closes the child unless a
+  successful Linux reaper handoff has already transferred descriptor ownership
+  to that reaper.
 
 ## Timers, signals, listeners, and Unix sockets
 

@@ -27,13 +27,6 @@ const SignalSet = std.EnumSet(Signal);
 const signal_count = std.meta.fields(Signal).len;
 const Siginfo = linux.signalfd_siginfo;
 
-// POSIX permits a null oldset; Zig 0.15's std.c declaration does not.
-extern "c" fn pthread_sigmask(
-    how: c_int,
-    set: *const std.posix.sigset_t,
-    oldset: ?*std.posix.sigset_t,
-) c_int;
-
 /// Owning port id per signal, 0 when unwatched. Guarded by `owners_lock`
 /// because ports on different threads watch and unwatch concurrently.
 var owners = [_]u64{0} ** signal_count;
@@ -213,8 +206,9 @@ pub fn harvest(port: *EvPort, out: []Event) usize {
 pub fn blockSignals(sigs: []const Signal) SignalError!void {
     var set = std.posix.sigemptyset();
     for (sigs) |sig| std.posix.sigaddset(&set, sig.toPosix());
+    var old: std.posix.sigset_t = undefined;
     // pthread_sigmask fails only with EINVAL for an invalid `how`.
-    if (pthread_sigmask(std.posix.SIG.BLOCK, &set, null) != 0)
+    if (std.c.pthread_sigmask(std.posix.SIG.BLOCK, &set, &old) != 0)
         return SignalError.SystemResources;
 }
 
@@ -222,7 +216,7 @@ pub fn blockSignals(sigs: []const Signal) SignalError!void {
 fn blockedInThread(sig: Signal) SignalError!bool {
     const none = std.posix.sigemptyset();
     var cur: std.posix.sigset_t = undefined;
-    if (pthread_sigmask(std.posix.SIG.BLOCK, &none, &cur) != 0)
+    if (std.c.pthread_sigmask(std.posix.SIG.BLOCK, &none, &cur) != 0)
         return SignalError.SystemResources;
     return std.posix.sigismember(&cur, sig.toPosix());
 }
@@ -265,12 +259,13 @@ const MaskGuard = struct {
         var g: MaskGuard = undefined;
         var set_: std.posix.sigset_t = std.posix.sigemptyset();
         for (sigs) |sig| std.posix.sigaddset(&set_, sig.toPosix());
-        std.debug.assert(pthread_sigmask(@intCast(how), &set_, &g.saved) == 0);
+        std.debug.assert(std.c.pthread_sigmask(@intCast(how), &set_, &g.saved) == 0);
         return g;
     }
 
     fn restore(self: *const MaskGuard) void {
-        std.debug.assert(pthread_sigmask(std.posix.SIG.SETMASK, &self.saved, null) == 0);
+        var ignored: std.posix.sigset_t = undefined;
+        std.debug.assert(std.c.pthread_sigmask(std.posix.SIG.SETMASK, &self.saved, &ignored) == 0);
     }
 };
 

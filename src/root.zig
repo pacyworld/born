@@ -20,16 +20,17 @@
 //!   completion before moving or freeing overlapped storage.
 //! - `wake()` signals the loop from another thread. POSIX wakeups coalesce;
 //!   IOCP posts one completion per wake. `Event.wake` identifies either form.
-//! - Registration failures are never silent. epoll and IOCP `monitorRead`
-//!   failures are deferred to the next non-empty `wait()`; IOCP `associate`
-//!   fails immediately. kqueue reports kernel rejections as `Event.err` and
-//!   `Event.err_no`, and stashes allocation failures for the same deferred
-//!   channel. IOCP post and wake failures use that channel too.
+//! - Registration failures use backend-specific reporting. epoll and IOCP
+//!   `monitorRead` failures are deferred to the next non-empty `wait()`; IOCP
+//!   `associate` fails immediately. kqueue reports kernel rejections as
+//!   `Event.err` and `Event.err_no`, and stashes allocation failures for the
+//!   same deferred channel. IOCP post and wake failures use that channel too.
+//!   The kqueue eventlist-overflow exception is documented in docs/kqueue.md.
 //! - Regular files are portable readiness sources. kqueue reports them ready
 //!   natively, and epoll emulates that with always-ready pseudo registrations.
 //! - Process exits from `EvPort.watchProcess` arrive as `Event.exited` and
-//!   `Event.exit`: EVFILT_PROCDESC on FreeBSD, pidfds on Linux, and
-//!   `error.Unsupported` elsewhere.
+//!   `Event.exit`: EVFILT_PROCDESC on FreeBSD, pidfds on Linux 5.4+ after a
+//!   spawn-time probe, and `error.Unsupported` elsewhere.
 //! - Timers, signals, TCP listeners, and Unix sockets share `wait()`. Windows
 //!   Unix socket operations currently return `error.Unsupported`.
 //!

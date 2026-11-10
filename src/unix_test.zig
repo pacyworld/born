@@ -15,6 +15,8 @@ const is_windows = builtin.os.tag == .windows;
 const test_tmp_root = ".zig-cache" ++ std.fs.path.sep_str ++ "tmp" ++ std.fs.path.sep_str;
 
 /// A unique workspace-relative socket path short enough for BSD sun_path.
+/// The root mirrors std.testing.tmpDir's `.zig-cache/tmp` layout. Tests run
+/// from a writable working directory; manual runs create that layout there.
 const SockPath = struct {
     buf: [std.fs.max_path_bytes]u8 = undefined,
     len: usize = 0,
