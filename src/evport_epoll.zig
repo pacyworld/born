@@ -30,7 +30,8 @@
 //   - purgeFd drops only the port's bookkeeping; the kernel removes a
 //     closed fd's registration itself.
 //   - Internal sources (timer_epoll.zig's timerfd, signal_epoll.zig's
-//     signalfd): at most one fd per kind per port, registered
+//     signalfd, process_epoll.zig's inner epoll set of pidfds): at most
+//     one fd per kind per port, registered
 //     level-triggered with a kind sentinel as epoll data. wait() hands a
 //     ready one to its kind's harvest(), which drains it into Events. A
 //     source left ready (the caller's buffer filled) is re-reported by the
@@ -41,6 +42,7 @@ const linux = std.os.linux;
 const types = @import("types.zig");
 const timer_epoll = @import("timer_epoll.zig");
 const signal_epoll = @import("signal_epoll.zig");
+const process_epoll = @import("process_epoll.zig");
 
 pub const Handle = types.Handle;
 pub const Event = types.Event;
@@ -49,20 +51,21 @@ pub const TimerMode = types.TimerMode;
 
 pub const InitError = error{InitFailed};
 /// RegisterFailed and OutOfMemory are stashed registration failures;
-/// SourceFailed is an internal source (timerfd, signalfd) that could not
-/// be harvested or re-armed.
+/// SourceFailed is an internal source (timerfd, signalfd, the process set)
+/// that could not be harvested or re-armed.
 pub const WaitError = error{ WaitFailed, RegisterFailed, SourceFailed, OutOfMemory };
 pub const TimerError = types.TimerError;
 pub const SignalError = types.SignalError;
+pub const ProcessError = types.ProcessError;
 /// Every error this backend can return.
-pub const Error = InitError || WaitError || TimerError || SignalError;
+pub const Error = InitError || WaitError || TimerError || SignalError || ProcessError;
 
 /// Block `sigs` in the calling thread; signalfd only sees blocked signals.
 /// Call it in `main` before spawning threads; see signal_epoll.zig.
 pub const blockSignals = signal_epoll.blockSignals;
 
 /// Internal source kinds; each owns one slot in EvPort.internal.
-pub const InternalKind = enum { timer, signal };
+pub const InternalKind = enum { timer, signal, process };
 
 /// Stable addresses used as epoll data for internal sources, one per kind.
 /// They cannot collide with a caller's udata, which never points here.
@@ -115,6 +118,8 @@ pub const EvPort = struct {
     timers: timer_epoll.State = .{},
     /// Signal-watch bookkeeping, owned by signal_epoll.zig.
     signals: signal_epoll.State = .{},
+    /// Process-watch bookkeeping, owned by process_epoll.zig.
+    processes: process_epoll.State = .{},
 
     pub fn init(alloc: std.mem.Allocator) InitError!EvPort {
         // Raw linux syscalls do not set libc errno; decode the return value
@@ -144,6 +149,7 @@ pub const EvPort = struct {
     pub fn deinit(self: *EvPort) void {
         self.signals.deinit(self);
         self.timers.deinit(self);
+        self.processes.deinit(self);
         if (self.ep >= 0) _ = std.c.close(self.ep);
         if (self.wake_fd >= 0) _ = std.c.close(self.wake_fd);
         self.ep = -1;
@@ -188,8 +194,10 @@ pub const EvPort = struct {
     }
 
     /// The fd is being closed: drop the port's bookkeeping (the kernel
-    /// removes the registration on close(2) itself).
+    /// removes the registration on close(2) itself). A pidfd's process
+    /// watch ends here too.
     pub fn purgeFd(self: *EvPort, fd: Handle) void {
+        process_epoll.purge(self, fd);
         const kv = self.fds.fetchRemove(fd) orelse return;
         if (kv.value.pseudo) self.pseudo_count -= 1;
     }
@@ -220,6 +228,19 @@ pub const EvPort = struct {
     /// Stop watching `sig`. Unwatched signals are a no-op.
     pub fn unwatchSignal(self: *EvPort, sig: Signal) void {
         signal_epoll.unwatch(self, sig);
+    }
+
+    /// Deliver the exit of the process behind `handle` (a pidfd of a child
+    /// of this process) as Event.exited; the wait() that reports it reaps
+    /// the child. See process_epoll.zig.
+    pub fn watchProcess(self: *EvPort, handle: Handle, udata: ?*anyopaque) ProcessError!void {
+        return process_epoll.watch(self, handle, udata);
+    }
+
+    /// End a process watch on a pidfd that stays open. Unwatched handles
+    /// are a no-op; before closing, `purgeFd` is enough.
+    pub fn unwatchProcess(self: *EvPort, handle: Handle) void {
+        process_epoll.unwatch(self, handle);
     }
 
     /// Internal hook: register `fd` as the port's `kind` source,
@@ -376,6 +397,7 @@ pub const EvPort = struct {
                 out += switch (kind) {
                     .timer => timer_epoll.harvest(self, room),
                     .signal => signal_epoll.harvest(self, room),
+                    .process => process_epoll.harvest(self, room),
                 };
                 continue;
             }

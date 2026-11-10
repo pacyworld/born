@@ -44,6 +44,9 @@ OS per primitive, and lists real runs only.
 | epoll, Linux 6.8 (runner03, Ubuntu 24.04) | readiness hints without counts (drain contract) | [run 102, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/102/jobs/1): ReleaseSafe, 87 passed, 6 skipped, 0 failed | 2026-10-22 | [0b1ec8e](https://pacyworld.dev/pacyworld/born/commit/0b1ec8edb100dd8484f002227bc2a5544ec548ef) |
 | kqueue, macOS 26 arm64 (macinotsh-desktop, manual) | event port, readiness counts, EVFILT_USER wake | zig build test, Debug: 92 passed, 6 skipped, 0 failed | 2026-10-22 | [622ee3c](https://pacyworld.dev/pacyworld/born/commit/622ee3c) |
 | IOCP | Unix sockets | none: not implemented yet, their contract tests skip | n/a | n/a |
+| kqueue, FreeBSD 15 (runner01) | process descriptors (pdfork, EVFILT_PROCDESC) | [run 127, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/127/jobs/0): Debug and ReleaseSafe, 108 passed, 8 skipped, 0 failed | 2026-11-09 | [6f4f6ed](https://pacyworld.dev/pacyworld/born/commit/6f4f6ed776306c37e5beaa4cd238263cb980d1be) |
+| epoll, Linux 6.8 (runner03, Ubuntu 24.04) | process descriptors (pidfd, waitid) | [run 127, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/127/jobs/1): ReleaseSafe, 104 passed, 7 skipped, 0 failed | 2026-11-09 | [6f4f6ed](https://pacyworld.dev/pacyworld/born/commit/6f4f6ed776306c37e5beaa4cd238263cb980d1be) |
+| IOCP | process descriptors | none: error.Unsupported on Windows, the contract tests skip | n/a | n/a |
 
 Commit 3ed3785 changes only the CI workflow; its library and tests are
 those of master d1017b8. Skips are platform-only tests and the 0.3.0
@@ -129,16 +132,19 @@ overlappable named pipes or a blocking-pipe relay, as mcp-bridge does.
 `overlapped: ?*std.os.windows.OVERLAPPED`, `bytes: usize`, and the 0.3.0
 fields `timer: bool`, `signal: ?born.Signal` and `fired: u32` (see
 [Planned in 0.3.0](#planned-in-030)), which stay false, null and zero for
-every other event, and `avail: usize`, the readiness count (see
-[Readiness counts](#readiness-counts)).
+every other event, `avail: usize`, the readiness count (see
+[Readiness counts](#readiness-counts)), and `exited: bool` with
+`exit: ?born.ProcessExit` for a watched process (see
+[Child processes](#child-processes)).
 Completion fields are null/zero on POSIX. Error numbers are native errno on
 kqueue and NTSTATUS on IOCP, not a portable error enumeration.
 
 Each `EvPort` operation returns its own error set: `born.InitError` from
 `init`, `born.WaitError` from `wait`, `born.TimerError` and
-`born.SignalError` from the 0.3.0 calls. `born.Error` is their union. `wait`
-reports only loop failures (including stashed registration failures), never
-a refused timer or signal.
+`born.SignalError` from the 0.3.0 calls, `born.ProcessError` from
+`watchProcess`. `born.Error` is their union. `wait` reports only loop
+failures (including stashed registration failures), never a refused timer,
+signal or process watch.
 
 `wake()` may be called from another thread and produces `Event{ .wake = true }`.
 POSIX wakeups coalesce; IOCP queues one completion per post. All other event-port
@@ -242,6 +248,68 @@ anything arriving after the kernel took the count raises a new edge.
 
 Measured on the loopback benchmark (`bench/RESULTS.md`): one syscall less per
 echo and about two less per connection in the accept storm.
+
+## Child processes
+
+`born.process.spawn(argv, envp, opts)` starts a program and returns a
+`Child{ .handle, .pid }`; `ep.watchProcess(child.handle, udata)` delivers its
+exit through `wait()` as `Event{ .exited = true, .exit = .{ .code = n } }` or
+`.exit = .{ .signal = n }`. `src/process_test.zig` is the usage reference.
+
+```zig
+const argv = [_:null]?[*:0]const u8{ "/usr/local/bin/role", "--worker" };
+var child = try born.process.spawn(&argv, envp, .{
+    .stdin = .devnull,
+    .fds = &.{ listener_fd, control_fd }, // the child's fds 3 and 4
+});
+try ep.watchProcess(child.handle, &role);
+// ... wait() returns Event{ .exited = true, .exit = ..., .udata = &role }
+ep.purgeFd(child.handle);
+child.close();
+```
+
+| backend | descriptor | exit event | reaping |
+|---|---|---|---|
+| kqueue, FreeBSD | process descriptor from `pdfork(PD_CLOEXEC)` | EVFILT_PROCDESC NOTE_EXIT, staged into the next `wait()` | the zombie stays until `close`, which reaps it |
+| epoll, Linux 5.4+ | pidfd from `clone(CLONE_PIDFD)` | pidfd readable, harvested through one internal epoll set | the `wait()` that reports the exit reaps it with `waitid(P_PIDFD)` |
+| IOCP; kqueue on macOS, NetBSD, OpenBSD | none | spawn and watch return `error.Unsupported` | n/a |
+
+- **spawn** allocates nothing: argv and envp are the caller's
+  NUL-terminated arrays, there is no PATH search (`opts.path` or argv[0] is
+  the program), and between fork and execve the child makes only
+  async-signal-safe calls, so a multi-threaded program may call it. The
+  child gets `stdin`, `stdout` and `stderr` as asked (`.inherit`, `.devnull`
+  or a handle) and `opts.fds[i]` as fd 3 + i, up to `born.process.max_fds`;
+  every other descriptor is closed. It starts with every signal at its
+  default disposition and an empty signal mask, whatever the parent blocks
+  or ignores (a parent that blocks signals for epoll's signalfd still has
+  children that SIGTERM ends).
+- **Errors are never lost:** a close-on-exec pipe carries a setup or execve
+  failure back, so `spawn` returns `FileNotFound`, `AccessDenied`,
+  `InvalidExe`, `SetupFailed` (for example a mapped handle that is not
+  open), `SystemResources` or `ExecFailed` and reaps the failed child. It
+  therefore returns once the child has called execve, as `posix_spawn` does.
+- **The watch ends with the exit event**, which arrives once. A watch added
+  after the process exited fires at the next `wait()`. Re-watching replaces
+  the udata; `unwatchProcess` ends a watch on a handle that stays open, and
+  before closing, `purgeFd(handle)` is enough, as for any descriptor.
+  Stale exit events are tolerated as for timers and signals.
+- **Closing the descriptor of a running child kills it** (SIGKILL), and
+  `close` never blocks the caller. FreeBSD leaves the exit to the child's
+  reaper (init). Linux reaps on the spot when a status is already waiting
+  and hands a still-exiting child's pidfd to a lazily spawned background
+  reaper thread (only an allocation failure there degrades to a blocking
+  reap). Loop code should `child.kill(sig)`, wait for the exit event, then
+  `purgeFd` and `close`, which keeps reaping on the spot. No zombie is left
+  either way.
+- **kill** signals through the descriptor, so it never reaches a recycled
+  pid. After a reported exit, Linux answers `error.Exited` (the child is
+  reaped); a FreeBSD zombie accepts and ignores signals until `close`.
+- **wait(2) elsewhere in the program:** a pdfork child sends no SIGCHLD and
+  is invisible to a wait for any child. A Linux pidfd child is an ordinary
+  child: a `waitpid(-1)` elsewhere can reap it first, and its exit event
+  then arrives with `err` set, `exit` null and `err_no` = ECHILD. A failed
+  harvest of the internal process set is `error.SourceFailed` from `wait()`.
 
 ## Planned in 0.3.0
 

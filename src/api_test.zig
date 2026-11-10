@@ -35,26 +35,30 @@ test "reactor has exact non-generic handle and event API" {
     try std.testing.expect(@TypeOf(Port.watchSignal) == fn (*Port, types.Signal, ?*anyopaque) types.SignalError!void);
     try std.testing.expect(@TypeOf(Port.unwatchSignal) == fn (*Port, types.Signal) void);
     try std.testing.expect(@TypeOf(backend.blockSignals) == fn ([]const types.Signal) types.SignalError!void);
+    try std.testing.expect(@TypeOf(Port.watchProcess) == fn (*Port, Handle, ?*anyopaque) types.ProcessError!void);
+    try std.testing.expect(@TypeOf(Port.unwatchProcess) == fn (*Port, Handle) void);
     // wait() reports only loop failures; primitive refusals stay with the
     // call that caused them.
-    inline for (.{ "Unsupported", "InvalidArgument", "SignalInUse", "SignalNotBlocked" }) |name| {
+    inline for (.{ "Unsupported", "InvalidArgument", "SignalInUse", "SignalNotBlocked", "BadHandle" }) |name| {
         inline for (@typeInfo(backend.WaitError).error_set.?) |e| {
             try std.testing.expect(!std.mem.eql(u8, e.name, name));
         }
     }
-    try std.testing.expect(backend.Error == (backend.InitError || backend.WaitError || types.TimerError || types.SignalError ||
+    try std.testing.expect(backend.Error == (backend.InitError || backend.WaitError || types.TimerError || types.SignalError || types.ProcessError ||
         (if (builtin.os.tag == .windows) backend.AssociateError else error{})));
     const event = backend.Event{};
     try std.testing.expect(@TypeOf(event.udata) == ?*anyopaque);
     try std.testing.expect(@TypeOf(event.err_no) == usize);
     try std.testing.expect(@TypeOf(event.overlapped) == ?*std.os.windows.OVERLAPPED);
     try std.testing.expect(@TypeOf(event.bytes) == usize);
-    inline for (.{ "readable", "writable", "eof", "err", "wake", "timer" }) |name| {
+    inline for (.{ "readable", "writable", "eof", "err", "wake", "timer", "exited" }) |name| {
         try std.testing.expect(@TypeOf(@field(event, name)) == bool);
         try std.testing.expect(!@field(event, name));
     }
     try std.testing.expect(@TypeOf(event.signal) == ?types.Signal);
     try std.testing.expect(event.signal == null);
+    try std.testing.expect(@TypeOf(event.exit) == ?types.ProcessExit);
+    try std.testing.expect(event.exit == null);
     try std.testing.expect(@TypeOf(event.fired) == u32);
     try std.testing.expectEqual(@as(u32, 0), event.fired);
     try std.testing.expect(event.udata == null);

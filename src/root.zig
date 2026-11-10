@@ -29,6 +29,9 @@
 //!     readiness sources: kqueue reports them perpetually ready natively,
 //!     and epoll emulates exactly that with always-ready pseudo
 //!     registrations (raw epoll_ctl would refuse them with EPERM).
+//!   - Process exits (EvPort.watchProcess on a born.process.Child handle)
+//!     arrive as Event.exited/.exit: EVFILT_PROCDESC on FreeBSD, pidfds on
+//!     Linux, error.Unsupported elsewhere.
 //!   - 0.3.0 timers, signals, TCP listeners and Unix sockets are declared
 //!     with their final signatures and return error.Unsupported until each
 //!     backend's implementation lands (README, "Planned in 0.3.0").
@@ -76,18 +79,22 @@ pub const Handle = @import("types.zig").Handle;
 pub const Event = @import("types.zig").Event;
 pub const Signal = @import("types.zig").Signal;
 pub const TimerMode = @import("types.zig").TimerMode;
+pub const ProcessExit = @import("types.zig").ProcessExit;
 /// Per-operation error sets. Each EvPort method returns only its own set;
 /// `Error` is their union.
 pub const InitError = impl.InitError;
 pub const WaitError = impl.WaitError;
 pub const TimerError = impl.TimerError;
 pub const SignalError = impl.SignalError;
+pub const ProcessError = impl.ProcessError;
 pub const Error = impl.Error;
 /// Block signals in the calling thread before watching them. Required on
 /// epoll (signalfd), a no-op on kqueue and Windows. Call it in `main`
 /// before spawning threads.
 pub const blockSignals = impl.blockSignals;
 pub const socket = @import("socket.zig");
+/// Child processes behind a descriptor, for `EvPort.watchProcess`.
+pub const process = @import("process.zig");
 
 /// Which backend this build selected. Useful in diagnostics so a program can
 /// report what it is actually running on rather than what it assumes.
@@ -114,4 +121,6 @@ test {
     _ = @import("unix_test.zig");
     _ = @import("io_types.zig");
     _ = @import("hint_test.zig");
+    _ = @import("process.zig");
+    _ = @import("process_test.zig");
 }
