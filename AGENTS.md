@@ -9,6 +9,9 @@
 - Native runtime gates:
   - `zig build test -Doptimize=Debug --summary all`
   - `zig build test -Doptimize=ReleaseSafe --summary all`
+- API documentation gate: `zig build docs --summary all`, producing
+  `zig-out/docs/index.html`. A separate `addObject` step requests
+  `-femit-docs` and consumes only `getEmittedDocs()`, so no binary is emitted.
 - Semantic cross-target gate: `zig build check-targets --summary all`.
   The single `supported_targets` list in `build.zig` contains exactly:
   `x86_64-freebsd`, `x86_64-linux-gnu`, `aarch64-macos`, `x86_64-macos`,
@@ -39,7 +42,7 @@ and pull request; the manual hosts below are the fallback.
 
 | Job | Runner (`runs-on`) | What it does |
 |---|---|---|
-| `build` | runner01, FreeBSD 15 (`FreeBSD`) | Rejects any Zig but 0.15.2; native Debug and ReleaseSafe tests (kqueue); `check-targets`; cross-builds both `born-tests` executables and uploads them with their sha256 |
+| `build` | runner01, FreeBSD 15 (`FreeBSD`) | Rejects any Zig but 0.15.2; native Debug and ReleaseSafe tests (kqueue); `check-targets`; API documentation build; cross-builds both `born-tests` executables and uploads them with their sha256 |
 | `linux-runtime` | runner03, Ubuntu 24.04 (`ubuntu-24.04`) | Runs the Linux executable in a `node:24-bookworm` container on the runner's kernel (epoll) |
 | `windows-runtime` | runner02, Windows Server 2022 (`windows-2022`) | Runs `born-tests.exe` on the host (IOCP) |
 
@@ -95,7 +98,7 @@ summary line into the pull request.
 
 ### README results table
 
-The README's "Runtime evidence" table records the last run per backend and
+The README's "Runtime evidence" table records evidence runs by backend and
 primitive: backend, primitive, run, date, commit. Only runs that happened
 on that OS go in it. When a primitive's contract tests stop skipping, add
 its run in the same pull request. Cells must not start with a backtick:

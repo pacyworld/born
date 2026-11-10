@@ -3,14 +3,14 @@
 An event port for Zig: one small, uniform seam over the platform's native
 readiness/completion notification mechanism.
 
-Named for the Born rule — I/O waits in potential until `wait()` collapses it
+Named for the Born rule: I/O waits in potential until `wait()` collapses it
 into a concrete event.
 
 | checked target triple | backend | runtime status |
 |---|---|---|
 | `x86_64-freebsd` | kqueue | original backend in production since 2026-08 |
 | `x86_64-linux-gnu` | epoll + eventfd | original backend in production since 2026-08 |
-| `aarch64-macos` | kqueue | **compile-only, not tested on hardware** |
+| `aarch64-macos` | kqueue | tested on macOS 26 arm64; see runtime evidence |
 | `x86_64-macos` | kqueue | **compile-only, not tested on hardware** |
 | `x86_64-windows-gnu` | IOCP | original backend in production since 2026-08 |
 | `x86_64-netbsd` | kqueue | **compile-only, not tested on hardware** |
@@ -24,10 +24,10 @@ selection alone is not a compilation or runtime guarantee.
 ### Runtime evidence
 
 CI runs the test suite on FreeBSD, Linux and Windows for every push and pull
-request (procedure in `AGENTS.md`). This table records the last run on each
-OS per primitive, and lists real runs only.
+request (procedure in `AGENTS.md`). This table records runtime evidence by
+backend and primitive, and lists real runs only.
 
-| backend | primitive | last runtime run | date | commit |
+| backend | primitive | runtime run | date | commit |
 |---|---|---|---|---|
 | kqueue, FreeBSD 15 (runner01) | event port, wake, plain TCP stream | [run 39, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/39/jobs/0): Debug and ReleaseSafe, 29 passed, 26 skipped, 0 failed | 2026-10-18 | [3ed3785](https://pacyworld.dev/pacyworld/born/commit/3ed378538592c0f8c3a0598c957409dd6becfd57) |
 | epoll, Linux 6.8 (runner03, Ubuntu 24.04) | event port, wake, plain TCP stream | [run 39, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/39/jobs/1): ReleaseSafe, 28 passed, 26 skipped, 0 failed | 2026-10-18 | [3ed3785](https://pacyworld.dev/pacyworld/born/commit/3ed378538592c0f8c3a0598c957409dd6becfd57) |
@@ -49,14 +49,16 @@ OS per primitive, and lists real runs only.
 | IOCP | process descriptors | none: error.Unsupported on Windows, the contract tests skip | n/a | n/a |
 
 Commit 3ed3785 changes only the CI workflow; its library and tests are
-those of master d1017b8. Skips are platform-only tests and the 0.3.0
-contract tests that wait for their implementations.
+those of master d1017b8. Skips identify platform exclusions or primitives
+not implemented at the recorded commit.
 
 ## Programming model
 
 The raw event port has a uniform **type surface**, not identical I/O semantics.
 Use `born.socket.PlainNb` for the portable plain-TCP companion. TLS, certificate
-validation, HTTP and application logging are outside born.
+validation, HTTP and application logging are outside born. Backend-specific
+design rationale is in [docs/](docs/README.md); `zig build docs` generates
+declaration-level API documentation.
 
 ### kqueue and epoll: readiness
 
@@ -74,12 +76,13 @@ or recycling a descriptor. `unmonitorRead` and `cancelWrite` are for descriptors
 that remain open.
 
 **A failed registration is never silent, on any backend.** A rejected
-registration — `EBADF` for a dead descriptor, or any other refusal epoll or
-kqueue might return — is stashed and returned as `error.RegisterFailed` from
-the next non-empty `wait()` on epoll (an empty `wait` neither consumes nor
-reports it), matching how IOCP reports a failed association as
-`error.AssociateFailed`. kqueue stages changes: a kernel-rejected change comes
-back as an `Event` with `.err` set and the native errno in `.err_no` (and
+registration, including `EBADF` for a dead descriptor or any other refusal
+epoll or kqueue might return, is stashed and returned as
+`error.RegisterFailed` from the next non-empty `wait()` on epoll (an empty
+`wait` neither consumes nor reports it), matching how IOCP reports a failed
+association as `error.AssociateFailed`. kqueue stages changes: a
+kernel-rejected change comes back as an `Event` with `.err` set and the native
+errno in `.err_no` (and
 `.readable`/`.writable` stay clear on such events), while an allocation failure
 before the change ever reaches the kernel is stashed and returned as
 `error.OutOfMemory` the same way epoll stashes its rejections.
@@ -87,10 +90,10 @@ before the change ever reaches the kernel is stashed and returned as
 **Regular files work identically on every POSIX backend.** I/O on a regular
 file never blocks, so "always ready" is the correct answer. kqueue accepts
 regular files natively; epoll's raw `epoll_ctl` refuses them with `EPERM`, so
-the epoll backend emulates kqueue: a regular file is detected at registration
-(`fstat`/`S_ISREG`), kept out of the kernel's epoll set, and reported ready —
-readable and/or writable per its interest — by every `wait()`. Consumers must
-therefore stop registering a regular file once it reaches EOF, on both
+the epoll backend emulates kqueue: the `EPERM` refusal classifies an
+unpollable descriptor, which is kept out of the kernel's epoll set and reported
+ready by every `wait()`, readable and/or writable per its interest. Consumers
+must therefore stop registering a regular file once it reaches EOF, on both
 backends, or `wait()` keeps answering instantly (true under kqueue already).
 
 ### IOCP: completion
@@ -104,8 +107,8 @@ nonempty `wait`, rather than silently dropped.
 Windows operations. `wait()` harvests completions with
 `GetQueuedCompletionStatusEx`. Raw `Event.readable` and `Event.writable` remain
 false. The owning stream must absorb `overlapped`, `bytes` and any error before
-retrying its I/O state machine. `post()` — including `wake()` — is callable from
-any thread; a failed `PostQueuedCompletionStatus` is never dropped silently: it
+retrying its I/O state machine. `post()` and `wake()` are callable from any
+thread; a failed `PostQueuedCompletionStatus` is never dropped silently: it
 is stashed atomically and returned as `error.PostFailed` from the next non-empty
 `wait()` (when the failed post was itself a wake, the error arrives with the
 next naturally-arriving completion).
@@ -129,10 +132,10 @@ overlappable named pipes or a blocking-pipe relay, as mcp-bridge does.
 `std.os.windows.HANDLE`). Every backend uses it for descriptor arguments.
 `born.Event` has the same fields on every backend: `udata`, `readable`,
 `writable`, `eof`, `err`, `err_no: usize`, `wake`,
-`overlapped: ?*std.os.windows.OVERLAPPED`, `bytes: usize`, and the 0.3.0
-fields `timer: bool`, `signal: ?born.Signal` and `fired: u32` (see
-[Planned in 0.3.0](#planned-in-030)), which stay false, null and zero for
-every other event, `avail: usize`, the readiness count (see
+`overlapped: ?*std.os.windows.OVERLAPPED`, `bytes: usize`, the timer and
+signal fields `timer: bool`, `signal: ?born.Signal` and `fired: u32` (see
+[primitive contracts](#primitive-contracts)), which stay false, null and zero
+for every other event, `avail: usize`, the readiness count (see
 [Readiness counts](#readiness-counts)), and `exited: bool` with
 `exit: ?born.ProcessExit` for a watched process (see
 [Child processes](#child-processes)).
@@ -140,11 +143,11 @@ Completion fields are null/zero on POSIX. Error numbers are native errno on
 kqueue and NTSTATUS on IOCP, not a portable error enumeration.
 
 Each `EvPort` operation returns its own error set: `born.InitError` from
-`init`, `born.WaitError` from `wait`, `born.TimerError` and
-`born.SignalError` from the 0.3.0 calls, `born.ProcessError` from
+`init`, `born.WaitError` from `wait`, `born.TimerError` from timer calls,
+`born.SignalError` from signal calls, and `born.ProcessError` from
 `watchProcess`. `born.Error` is their union. `wait` reports only loop
 failures (including stashed registration failures), never a refused timer,
-signal or process watch.
+signal, or process watch.
 
 `wake()` may be called from another thread and produces `Event{ .wake = true }`.
 POSIX wakeups coalesce; IOCP queues one completion per post. All other event-port
@@ -182,6 +185,8 @@ var events: [64]born.Event = undefined;
 const n = try ep.wait(&events, timeout_ms);
 ```
 
+A non-null `timeout_ms` must be nonnegative; `null` waits indefinitely.
+
 `born.backend_name` reports which backend the build selected, so a program can
 say what it is actually running on rather than what it assumes.
 
@@ -193,8 +198,9 @@ one error set per operation: `ConnectError` (`startConnectInto`),
 (`writeNb`). Each holds exactly what that call can return, so a consumer can
 switch over it with no `else` prong and a later change in born fails the
 consumer's build instead of reaching `unreachable`. `IoError` (also
-`PlainNb.Error`) is their union, a catch-all that may grow. It does not
-depend on OpenSSL, Schannel or mcp-bridge.
+`PlainNb.Error`) is their union, including Unix connects and accepted-stream
+adoption, and is a catch-all that may grow. It does not depend on OpenSSL,
+Schannel or mcp-bridge.
 
 1. Initialize a stable `PlainNb{}` and call
    `startConnectInto(allocator, host, port, &ep, user_data)`.
@@ -311,38 +317,40 @@ child.close();
   then arrives with `err` set, `exit` null and `err_no` = ECHILD. A failed
   harvest of the internal process set is `error.SourceFailed` from `wait()`.
 
-## Planned in 0.3.0
+## Timers, signals, listeners, and Unix sockets
 
-The 0.3.0 workstream ([#24](https://pacyworld.dev/pacyworld/born/issues/24))
-adds four primitives. Their signatures are in place and documented in the
-source, but every backend still returns `error.Unsupported` until the
-implementation issue for that backend lands. The contract tests
-(`src/timer_test.zig`, `src/signal_test.zig`, `src/listener_test.zig`,
-`src/unix_test.zig`) skip until then.
+Born's timer, signal, TCP listener, and Unix domain socket primitives share
+the event port's `wait()` model. Their contract tests (`src/timer_test.zig`,
+`src/signal_test.zig`, `src/listener_test.zig`, and `src/unix_test.zig`)
+exercise each implemented backend. Windows Unix domain sockets return
+`error.Unsupported` and their contract tests skip on that backend.
 
-- **Timers:** `EvPort.addTimer(id, udata, after_ms, .once or .repeat)` and
-  `cancelTimer(id)`, delivered as `Event{ .timer = true, .fired = n }`.
-  kqueue ([#12](https://pacyworld.dev/pacyworld/born/issues/12)), epoll
-  ([#13](https://pacyworld.dev/pacyworld/born/issues/13)) and IOCP
-  ([#14](https://pacyworld.dev/pacyworld/born/issues/14)), with a shared
-  deadline heap ([#11](https://pacyworld.dev/pacyworld/born/issues/11)).
-- **Signals:** `EvPort.watchSignal(sig, udata)`, `unwatchSignal(sig)` and
-  `born.blockSignals(sigs)`, delivered as `Event{ .signal = sig, .fired = n }`
-  for `interrupt`, `terminate`, `hangup`, `user1` and `user2`. kqueue
-  ([#15](https://pacyworld.dev/pacyworld/born/issues/15)), epoll
-  ([#16](https://pacyworld.dev/pacyworld/born/issues/16)) and Windows console
-  events ([#17](https://pacyworld.dev/pacyworld/born/issues/17)).
-- **TCP listeners:** `born.socket.Listener.openTcp(addr, opts)`, `register`,
-  `acceptNb(stream, key)` until `.want_accept`, `localAddress` and `close`,
-  with `ListenOptions.reuse_port = .balanced`. POSIX
-  ([#18](https://pacyworld.dev/pacyworld/born/issues/18)) and Windows
-  AcceptEx ([#19](https://pacyworld.dev/pacyworld/born/issues/19)).
-- **Unix domain stream sockets:** `Listener.openUnix(path, opts)` and
-  `PlainNb.startConnectUnixInto(path, ...)`. POSIX
-  ([#20](https://pacyworld.dev/pacyworld/born/issues/20)) and Windows
-  ([#21](https://pacyworld.dev/pacyworld/born/issues/21), may follow 0.3.0).
+### Timers
 
-Rules every implementation follows:
+`EvPort.addTimer(id, udata, after_ms, .once or .repeat)` and `cancelTimer(id)`
+deliver `Event{ .timer = true, .fired = n }` through `wait()`.
+
+### Signals
+
+`EvPort.watchSignal(sig, udata)`, `unwatchSignal(sig)`, and
+`born.blockSignals(sigs)` deliver `Event{ .signal = sig, .fired = n }` for
+`interrupt`, `terminate`, `hangup`, `user1`, and `user2`. Windows maps console
+control events onto this surface and rejects signals it cannot represent.
+
+### TCP listeners
+
+`born.socket.Listener.openTcp(addr, opts)`, `register`,
+`acceptNb(stream, key)`, `localAddress`, and `close` provide non-blocking TCP
+accept on POSIX and Windows. `ListenOptions.reuse_port = .balanced` requests
+kernel-balanced listener sharing where supported.
+
+### Unix domain stream sockets
+
+POSIX provides `Listener.openUnix(path, opts)` and
+`PlainNb.startConnectUnixInto(path, ...)`. Windows returns
+`error.Unsupported` for these operations.
+
+### Primitive contracts
 
 - **Timers are for deadlines, never for driving I/O:** idle timeouts, expiry
   sweeps, periodic aggregation. Born's rule against timer-driven I/O stands.
@@ -396,9 +404,8 @@ Rules every implementation follows:
 
 ## Use
 
-The original `v0.1.0` archive contains only the raw event port. Use a revision
-containing the socket companion. Fetch the archive with `zig fetch` for its hash;
-replace `master` with a full commit ID when pinning a consumer reproducibly.
+Fetch the archive with `zig fetch` for its hash. Replace `master` with a full
+commit ID when pinning a consumer reproducibly.
 
 ```zig
 // build.zig.zon
@@ -420,40 +427,26 @@ zig build            # library
 zig build test       # backend, public API and socket tests for the selected target
 zig build test -Doptimize=ReleaseSafe
 zig build check-targets   # semantic compilation of test bodies for all seven triples
+zig build docs            # API documentation in zig-out/docs/index.html
 zig build test-bin -Dtarget=x86_64-windows-gnu --prefix zig-out/windows
 zig build test-bin -Dtarget=x86_64-linux-gnu --prefix zig-out/linux
 ```
 
 Requires Zig 0.15.2. The module propagates its libc or Winsock/kernel32 linkage.
 Forgejo CI checks the exact toolchain version, runs FreeBSD Debug/ReleaseSafe
-tests, compiles the seven-target test matrix, links the Linux/Windows test
-executables and runs them on an Ubuntu 24.04 and a Windows Server 2022 runner.
+tests, compiles the seven-target test matrix, generates API documentation,
+links the Linux/Windows test executables and runs them on an Ubuntu 24.04 and
+a Windows Server 2022 runner.
 `check-targets` is deliberately compile-only, not evidence that target
 libraries link or that tests ran on those operating systems. Outside CI, run
 the `test-bin` output on its matching platform (hosts in `AGENTS.md`).
 
 ## Provenance
 
-Extracted from [mcp-bridge](https://pacyworld.dev/buenapp/mcp-bridge), where
-these backends have run in production since August 2026. They carry the scar
-tissue to prove it:
-
-- **epoll `EPOLLET` write deadlock.** Edge-triggering applies to the whole
-  registration, so `EPOLLOUT` becomes edge-triggered once connect completes.
-  The rule that fixes it: attempt writes first, wait only on a real
-  `want_write`.
-- **kqueue changelist batching.** A single rejected changelist entry makes the
-  kernel abandon the rest of the batch — a 128-change batch can be silently
-  truncated by one bad fd.
-- **epoll swallowed `epoll_ctl` failures.** A rejected registration returned
-  success and the event loop then waited forever on interest that was never
-  armed — found in practice when a consumer's stdout was redirected to a
-  regular file and `epoll_ctl` refused it with `EPERM` (issue #4). Registration
-  rejections are now surfaced as hard errors on every backend, and regular
-  files specifically are carried as always-ready pseudo registrations so the
-  redirected-stdout case works on Linux exactly as under kqueue.
-- **FreeBSD loopback connect** can return `ECONNREFUSED` *synchronously* under
-  load, so a non-blocking connect path must handle both refusal modes.
+Born was extracted from [mcp-bridge](https://pacyworld.dev/buenapp/mcp-bridge),
+where these backends have run in production since August 2026. The backend
+chapters in [docs/](docs/README.md) describe their current registration,
+error-surfacing, and object-lifetime contracts.
 
 ## Licence
 
