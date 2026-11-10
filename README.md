@@ -293,14 +293,15 @@ child.close();
   after the process exited fires at the next `wait()`. Re-watching replaces
   the udata; `unwatchProcess` ends a watch on a handle that stays open, and
   before closing, `purgeFd(handle)` is enough, as for any descriptor.
-  Stale exit events are tolerated as for timers and signals. On kqueue the
-  exit event also has `eof` set.
-- **Closing the descriptor of a running child kills it.** FreeBSD sends
-  SIGKILL and lets init reap it, without waiting. Linux sends SIGKILL and
-  `close` reaps the child, waiting for the kernel to finish it (the child
-  cannot delay that). Loop code should `child.kill(sig)`, wait for the exit
-  event, then `purgeFd` and `close`, which then never blocks. No zombie is
-  left either way.
+  Stale exit events are tolerated as for timers and signals.
+- **Closing the descriptor of a running child kills it** (SIGKILL), and
+  `close` never blocks the caller. FreeBSD leaves the exit to the child's
+  reaper (init). Linux reaps on the spot when a status is already waiting
+  and hands a still-exiting child's pidfd to a lazily spawned background
+  reaper thread (only an allocation failure there degrades to a blocking
+  reap). Loop code should `child.kill(sig)`, wait for the exit event, then
+  `purgeFd` and `close`, which keeps reaping on the spot. No zombie is left
+  either way.
 - **kill** signals through the descriptor, so it never reaches a recycled
   pid. After a reported exit, Linux answers `error.Exited` (the child is
   reaped); a FreeBSD zombie accepts and ignores signals until `close`.

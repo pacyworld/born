@@ -66,8 +66,10 @@ pub const SignalError = error{
 pub const ProcessError = error{
     /// Process watches are not available on this backend or target.
     Unsupported,
-    /// epoll only: the handle is not open, or is not a pollable descriptor.
-    /// kqueue reports a refused watch from wait() as Event.err.
+    /// The handle is not open, or not a process descriptor (pidfd): both
+    /// backends refuse a negative handle at watch time, and on epoll a
+    /// probe also refuses other pollable descriptors. On kqueue a surviving
+    /// kernel refusal is reported from wait() as Event.err.
     BadHandle,
     /// The kernel refused a watch resource (the epoll process set).
     SystemResources,

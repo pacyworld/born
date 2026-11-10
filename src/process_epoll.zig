@@ -14,8 +14,13 @@
 //! `Child.close` reaps one that was never reported. waitid needs the
 //! process to be a child of the caller: when it cannot collect a status
 //! (ECHILD because someone else reaped it), the event still arrives with
-//! `exited` and `err` set and the errno in `err_no`. A failed epoll_wait on
-//! the inner set is stashed as error.SourceFailed for the next wait().
+//! `exited` and `err` set and the errno in `err_no`. A pidfd that is
+//! readable with nothing collectable (si_pid stays zero) carries the same
+//! meaning with `err_no` zero: the status belongs to someone else, e.g. a
+//! tracer that attached to the child. The event ends the watch either way,
+//! because a level-triggered pidfd without a collectible status would keep
+//! wait() ready forever. A failed epoll_wait on the inner set is stashed as
+//! error.SourceFailed for the next wait().
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -66,9 +71,20 @@ pub const State = struct {
 };
 
 /// Adds the pidfd to the inner set. Watching a watched pidfd replaces its
-/// udata. OutOfMemory and every refusal leave the watches as they were.
+/// udata. OutOfMemory and every refusal leave the watches as they were. A
+/// non-pidfd pollable descriptor (a pipe, say) is refused up front:
+/// signal 0 probes the descriptor, and pidfd_send_signal exists since
+/// 5.1, well below the 5.4 floor from `process.spawn`.
 pub fn watch(port: *EvPort, fd: i32, udata: ?*anyopaque) ProcessError!void {
     if (fd < 0) return ProcessError.BadHandle;
+    // ESRCH (an exited child is still watchable) and EPERM both confirm a
+    // real pidfd; EINVAL marks any other pollable descriptor.
+    switch (linux.E.init(linux.pidfd_send_signal(fd, 0, null, 0))) {
+        .SUCCESS, .SRCH, .PERM => {},
+        .NOSYS => return ProcessError.Unsupported,
+        .BADF, .INVAL => return ProcessError.BadHandle,
+        else => return ProcessError.SystemResources,
+    }
     const st = &port.processes;
     try st.ensureFd(port);
     const gop = st.watches.getOrPut(port.alloc, fd) catch return ProcessError.OutOfMemory;
@@ -107,8 +123,9 @@ pub fn purge(port: *EvPort, fd: i32) void {
 }
 
 /// Turns ready pidfds into at most `out.len` (>= 1) exit events and returns
-/// the count. A pidfd that is ready but whose process has not exited yet
-/// (waitid reports no child state) stays watched and emits nothing.
+/// the count. A pidfd that is ready but whose status is not collectable
+/// (owned by a tracer or a racing wait) is reported once with err set and
+/// leaves the set, so wait() cannot spin on it.
 pub fn harvest(port: *EvPort, out: []Event) usize {
     const st = &port.processes;
     if (st.fd == -1) return 0;
@@ -139,10 +156,18 @@ pub fn harvest(port: *EvPort, out: []Event) usize {
         };
         switch (linux.E.init(wrc)) {
             .SUCCESS => {
-                // WNOHANG with nothing to collect leaves si_pid zero.
-                if (info.fields.common.first.piduid.pid == 0) continue;
-                ev.exit = exitOf(info);
-                if (ev.exit == null) ev.err = true;
+                // WNOHANG with nothing to collect leaves si_pid zero: the
+                // status belongs to someone else (a tracer, or a racing
+                // wait in this process). The pidfd stays level-triggered
+                // readable with nothing ever collectable, so dropping this
+                // onto the floor would spin wait(); report the exit once
+                // with err set and err_no zero, and end the watch.
+                if (info.fields.common.first.piduid.pid == 0) {
+                    ev.err = true;
+                } else {
+                    ev.exit = exitOf(info);
+                    if (ev.exit == null) ev.err = true;
+                }
             },
             else => |e| {
                 ev.err = true;
@@ -197,20 +222,34 @@ test "process_epoll: a descriptor epoll cannot poll is BadHandle" {
 test "process_epoll: unwatch and purge forget the pidfd" {
     var port = try EvPort.init(testing.allocator);
     defer port.deinit();
+    // Own-pid pidfd: real pidfd (5.3, below the floor is fine here), and
+    // this process never exits, so nothing becomes readable.
+    const prc = linux.pidfd_open(linux.getpid(), 0);
+    try testing.expectEqual(linux.E.SUCCESS, linux.E.init(prc));
+    const fd: i32 = @intCast(prc);
+    defer _ = std.c.close(fd);
+    var tag: u8 = 1;
+    try watch(&port, fd, &tag);
+    try watch(&port, fd, &tag);
+    unwatch(&port, fd);
+    try testing.expect(!port.processes.watches.contains(fd));
+    try watch(&port, fd, &tag);
+    purge(&port, fd);
+    try testing.expect(!port.processes.watches.contains(fd));
+    var events: [4]Event = undefined;
+    try testing.expectEqual(@as(usize, 0), try port.wait(&events, 0));
+}
+
+test "process_epoll: a pollable non-pidfd (pipe) is BadHandle" {
+    var port = try EvPort.init(testing.allocator);
+    defer port.deinit();
     const fds = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
     defer std.posix.close(fds[0]);
     defer std.posix.close(fds[1]);
     var tag: u8 = 1;
-    // Any pollable descriptor joins the set; only harvest needs a pidfd.
-    try watch(&port, fds[0], &tag);
-    try watch(&port, fds[0], &tag);
-    unwatch(&port, fds[0]);
+    // Epoll would take the pipe; the probe refuses it like kqueue does.
+    try testing.expectError(ProcessError.BadHandle, watch(&port, fds[0], &tag));
     try testing.expect(!port.processes.watches.contains(fds[0]));
-    try watch(&port, fds[1], &tag);
-    purge(&port, fds[1]);
-    try testing.expect(!port.processes.watches.contains(fds[1]));
-    var events: [4]Event = undefined;
-    try testing.expectEqual(@as(usize, 0), try port.wait(&events, 0));
 }
 
 test "process_epoll: siginfo decodes to an exit" {

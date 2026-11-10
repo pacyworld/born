@@ -270,7 +270,31 @@ test "process: watching a child that already exited fires at once" {
     defer port.deinit();
     var child = try spawnOrSkip(sh("exit 0"), .{});
     defer child.close();
-    std.Thread.sleep(100 * std.time.ns_per_ms);
+    // Establish the exit without reaping, so the premise is never a race.
+    // Linux: a blocking WNOWAIT waitid (does not reap). FreeBSD: harvest
+    // the exit on a first port (which ends that watch), then the zombie is
+    // known good for the second watch below.
+    switch (builtin.os.tag) {
+        .linux => {
+            const linux = std.os.linux;
+            var info: linux.siginfo_t = undefined;
+            while (linux.E.init(linux.waitid(.PIDFD, child.handle, &info, linux.W.EXITED | linux.W.NOWAIT)) == .INTR) {}
+        },
+        .freebsd => {
+            var first = try born.EvPort.init(alloc);
+            try first.watchProcess(child.handle, null);
+            var events: [4]Event = undefined;
+            var saw = false;
+            var clock = try std.time.Timer.start();
+            while (!saw and clock.read() < 5 * std.time.ns_per_s) {
+                const n = try first.wait(&events, 1000);
+                for (events[0..n]) |ev| saw = saw or ev.exited;
+            }
+            first.deinit();
+            try std.testing.expect(saw);
+        },
+        else => return error.SkipZigTest,
+    }
     var tag: u8 = 0;
     try port.watchProcess(child.handle, &tag);
     const ev = try waitExit(&port, &tag, 5000);

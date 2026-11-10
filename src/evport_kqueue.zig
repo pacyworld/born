@@ -418,6 +418,9 @@ pub const EvPort = struct {
                 ev.err = true;
             }
         } else if (process_kqueue.have_procdesc and kev.filter == process_kqueue.EVFILT_PROCDESC) {
+            // An exit is not end-of-file; epoll never sets it. One event
+            // contract on every backend.
+            ev.eof = false;
             ev.exited = true;
             // NOTE_EXIT data is the wait(2) status, which is always an exit.
             ev.exit = types.ProcessExit.fromWaitStatus(@truncate(@as(u64, @bitCast(@as(i64, kev.data)))));

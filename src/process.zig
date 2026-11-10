@@ -2,14 +2,17 @@
 //! a `Child` whose handle `EvPort.watchProcess` turns into an exit event.
 //!
 //!   FreeBSD  pdfork(PD_CLOEXEC) process descriptor, pdkill
-//!   Linux    clone(CLONE_PIDFD) pidfd, pidfd_send_signal
+//!   Linux    clone(CLONE_PIDFD) pidfd, pidfd_send_signal; kernel 5.4+,
+//!            probed at spawn (CLONE_PIDFD is 5.2, waitid(P_PIDFD) is 5.4)
 //!   others   error.Unsupported
 //!
 //! `spawn` allocates nothing: argv, envp and the descriptor map are ready
 //! before the fork, and between fork and execve the child makes only
 //! async-signal-safe calls (libc calls after libthr's pdfork on FreeBSD, raw
-//! syscalls after a raw clone on Linux), so a multi-threaded caller is safe.
-//! The child:
+//! syscalls after a raw clone on Linux). On FreeBSD libthr runs the
+//! program's pthread_atfork handlers around pdfork, so any handler must
+//! obey the same rule; born registers none. A multi-threaded caller is
+//! safe. The child:
 //!   - starts with every signal at its default disposition and an empty
 //!     signal mask, whatever the parent ignores, handles or blocks;
 //!   - gets `stdin`, `stdout`, `stderr` as asked and `fds[i]` as fd 3 + i;
@@ -25,13 +28,15 @@
 //!     reaping to its reaper (init), without waiting. A pdfork child sends
 //!     no SIGCHLD and is invisible to wait(2) for any child.
 //!   - Linux: the wait() that reports a watched child's exit reaps it.
-//!     `Child.close` reaps a child that was never reported; a running one is
-//!     sent SIGKILL first and close waits for the kernel to finish it, which
-//!     the child cannot delay. The parent gets SIGCHLD as usual, and a
-//!     wait(2) for any child elsewhere in the program can steal the status
-//!     (the exit event then arrives with `err` set).
-//! Event-loop code should `kill`, wait for the exit event, then `purgeFd`
-//! and `close`, which then never blocks.
+//!     `Child.close` reaps a child that was never reported and never blocks
+//!     the caller: an exited child is collected on the spot, a running one
+//!     gets SIGKILL and its pidfd goes to a lazily spawned background
+//!     reaper thread (only an allocation failure there degrades to a
+//!     blocking reap). The parent gets SIGCHLD as usual, and a wait(2) for
+//!     any child elsewhere in the program can steal the status (the exit
+//!     event then arrives with `err` set).
+//! Event-loop code should still `kill`, wait for the exit event, then
+//! `purgeFd` and `close`, which keeps every reap on the spot.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -39,6 +44,7 @@ const types = @import("types.zig");
 const Handle = types.Handle;
 
 const os = builtin.os.tag;
+/// Process descriptors exist on this target (FreeBSD and Linux).
 pub const supported = os == .freebsd or os == .linux;
 
 /// Most caller handles `SpawnOptions.fds` may map.
@@ -54,11 +60,16 @@ pub const Stdio = union(enum) {
     handle: Handle,
 };
 
+/// Spawn-time options; the module comment describes the child's starting
+/// state. All fields default to inheriting the parent.
 pub const SpawnOptions = struct {
     /// Program to execute; argv[0] when null. No PATH search.
     path: ?[*:0]const u8 = null,
+    /// The child's fd 0.
     stdin: Stdio = .inherit,
+    /// The child's fd 1.
     stdout: Stdio = .inherit,
+    /// The child's fd 2.
     stderr: Stdio = .inherit,
     /// Caller handles that become the child's fds 3, 4, ... in order. They
     /// need not be inheritable; the child gets its own copies.
@@ -67,8 +78,9 @@ pub const SpawnOptions = struct {
 
 /// `spawn`.
 pub const SpawnError = error{
-    /// No process descriptors on this target, or a Linux kernel without
-    /// CLONE_PIDFD (5.2).
+    /// No process descriptors on this target, or a Linux kernel too old
+    /// for pidfd child watching: both features are probed at spawn
+    /// (CLONE_PIDFD needs 5.2, waitid(P_PIDFD) needs 5.4).
     Unsupported,
     /// No program (null `path` and empty argv), more than `max_fds`
     /// handles, or a negative handle.
@@ -102,6 +114,8 @@ pub const KillError = error{
     AccessDenied,
 };
 
+/// A spawned child: its descriptor (watchable with `EvPort.watchProcess`)
+/// and pid. See the module comment for lifetime and reaping.
 pub const Child = struct {
     /// Process descriptor (FreeBSD) or pidfd (Linux); pass it to
     /// `EvPort.watchProcess`. Close-on-exec in the parent.
@@ -406,7 +420,34 @@ const linux_impl = struct {
             else => return SpawnError.SystemResources,
         }
         if (rc == 0) runChild(ChildSide, plan);
-        return .{ .handle = pidfd, .pid = @intCast(rc) };
+        const pid: i32 = @intCast(rc);
+        if (!pidfdUsable(pidfd, pid)) return SpawnError.Unsupported;
+        return .{ .handle = pidfd, .pid = pid };
+    }
+
+    /// True when the child is fully watchable. Legacy clone ignores flags
+    /// it does not know, so below 5.2 a successful clone stores no pidfd,
+    /// and waitid learned P_PIDFD only in 5.4; both are probed here. An
+    /// unwatchable child is killed by pid and reaped (a spawn error path
+    /// only, never on a loop).
+    fn pidfdUsable(pidfd: i32, pid: i32) bool {
+        if (pidfd >= 0) {
+            var probe: linux.siginfo_t = undefined;
+            while (true) {
+                // A running child answers success with si_pid set to zero.
+                const prc = linux.waitid(.PIDFD, pidfd, &probe, linux.W.EXITED | linux.W.NOHANG);
+                switch (linux.E.init(prc)) {
+                    .INTR => continue,
+                    .SUCCESS => return true,
+                    else => break,
+                }
+            }
+        }
+        _ = linux.kill(pid, linux.SIG.KILL);
+        var info: linux.siginfo_t = undefined;
+        while (linux.E.init(linux.waitid(.PID, pid, &info, linux.W.EXITED)) == .INTR) {}
+        if (pidfd >= 0) _ = std.c.close(pidfd);
+        return false;
     }
 
     fn kill(fd: i32, sig: u8) KillError!void {
@@ -421,14 +462,69 @@ const linux_impl = struct {
         };
     }
 
-    /// SIGKILL (ESRCH once the child has exited), reap (ECHILD once the
-    /// child was reaped), close.
+    /// SIGKILL (ESRCH once the child has exited), then reap without
+    /// waiting on the caller: a collected status reaps here, an already
+    /// reaped child is ECHILD, and a child that still runs goes to the
+    /// reaper thread. Only an allocation failure in `reaper.take` degrades
+    /// to a blocking reap.
     fn close(fd: i32) void {
         _ = linux.pidfd_send_signal(fd, linux.SIG.KILL, null, 0);
         var info: linux.siginfo_t = undefined;
+        var werr: linux.E = .INTR;
+        while (werr == .INTR) {
+            info = undefined;
+            werr = linux.E.init(linux.waitid(.PIDFD, fd, &info, linux.W.EXITED | linux.W.NOHANG));
+        }
+        // Anything but a successful WNOHANG with nothing collected is
+        // finished work; a zero si_pid means the SIGKILLed child is still
+        // exiting (address-space teardown takes time), and its reaping is
+        // handed off below.
+        if (werr != .SUCCESS or info.fields.common.first.piduid.pid != 0) {
+            _ = std.c.close(fd);
+            return;
+        }
+        if (reaper.take(fd)) return;
         while (linux.E.init(linux.waitid(.PIDFD, fd, &info, linux.W.EXITED)) == .INTR) {}
         _ = std.c.close(fd);
     }
+
+    /// A lazily spawned thread that reaps children whose pidfds a caller
+    /// closed while they still ran: close never blocks a loop thread. The
+    /// list is protected by the mutex; page_allocator is thread-safe.
+    const reaper = struct {
+        var lock: std.Thread.Mutex = .{};
+        var ready: std.Thread.Condition = .{};
+        var pending: std.ArrayListUnmanaged(i32) = .empty;
+        var started = false;
+
+        /// Moves the pidfd to the reaper; false (and the caller keeps it)
+        /// only when spawning the thread or queuing the fd fails.
+        fn take(fd: i32) bool {
+            lock.lock();
+            defer lock.unlock();
+            if (!started) {
+                const t = std.Thread.spawn(.{}, run, .{}) catch return false;
+                t.setName("born-reaper") catch {};
+                t.detach();
+                started = true;
+            }
+            pending.append(std.heap.page_allocator, fd) catch return false;
+            ready.signal();
+            return true;
+        }
+
+        fn run() void {
+            while (true) {
+                lock.lock();
+                while (pending.items.len == 0) ready.wait(&lock);
+                const fd = pending.orderedRemove(0);
+                lock.unlock();
+                var info: linux.siginfo_t = undefined;
+                while (linux.E.init(linux.waitid(.PIDFD, fd, &info, linux.W.EXITED)) == .INTR) {}
+                _ = std.c.close(fd);
+            }
+        }
+    };
 
     /// Raw syscalls only: glibc is never entered after the raw clone.
     const ChildSide = struct {
