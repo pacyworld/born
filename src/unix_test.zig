@@ -1,6 +1,7 @@
-//! Unix domain stream socket contract (born 0.3.0). Every test calls the
-//! real API and skips while the backend returns error.Unsupported; a Unix
-//! socket implementation issue is done when these run and pass on its OS.
+//! Unix domain stream socket contract tests. Tests that require a working
+//! backend skip when `Listener.openUnix` reports `error.Unsupported`.
+//! A Windows-only test instead requires that error from both public entry
+//! points and verifies that connect failure leaves the output stream unchanged.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -11,22 +12,22 @@ const PlainNb = socket.PlainNb;
 const alloc = std.testing.allocator;
 const is_windows = builtin.os.tag == .windows;
 
-/// A short unique socket path. POSIX uses /tmp so the path fits sun_path
-/// (104 bytes on BSD and macOS) wherever the checkout lives.
+const test_tmp_root = ".zig-cache" ++ std.fs.path.sep_str ++ "tmp" ++ std.fs.path.sep_str;
+
+/// A unique workspace-relative socket path short enough for BSD sun_path.
 const SockPath = struct {
     buf: [std.fs.max_path_bytes]u8 = undefined,
     len: usize = 0,
     tmp: ?std.testing.TmpDir = null,
 
     fn init(self: *SockPath) !void {
-        const id = std.crypto.random.int(u64);
-        if (is_windows) {
-            self.tmp = std.testing.tmpDir(.{});
-            const dir = try self.tmp.?.dir.realpath(".", &self.buf);
-            self.len = (try std.fmt.bufPrint(self.buf[dir.len..], "\\{x}.sock", .{id})).len + dir.len;
-        } else {
-            self.len = (try std.fmt.bufPrint(&self.buf, "/tmp/born-ut-{x}.sock", .{id})).len;
-        }
+        self.tmp = std.testing.tmpDir(.{});
+        errdefer self.tmp.?.cleanup();
+        self.len = (try std.fmt.bufPrint(
+            &self.buf,
+            test_tmp_root ++ "{s}" ++ std.fs.path.sep_str ++ "s",
+            .{self.tmp.?.sub_path},
+        )).len;
     }
 
     fn get(self: *const SockPath) []const u8 {
@@ -34,8 +35,8 @@ const SockPath = struct {
     }
 
     fn deinit(self: *SockPath) void {
-        std.fs.deleteFileAbsolute(self.get()) catch {};
-        if (self.tmp) |*t| t.cleanup();
+        std.fs.cwd().deleteFile(self.get()) catch {};
+        if (self.tmp) |*tmp| tmp.cleanup();
     }
 };
 
@@ -148,6 +149,40 @@ test "unix: API shape is the same on every target" {
     try std.testing.expect(opts.unlink_stale);
 }
 
+test "unix: Windows returns Unsupported without changing the output stream" {
+    if (comptime is_windows) {
+        var path: SockPath = .{};
+        try path.init();
+        defer path.deinit();
+
+        // Call both public entry points directly and compare the complete
+        // output stream, including its overlapped state and buffers.
+        try std.testing.expectError(
+            error.Unsupported,
+            Listener.openUnix(alloc, path.get(), .{}),
+        );
+        var port = try born.EvPort.init(alloc);
+        defer port.deinit();
+
+        // Current defaults are zero except sock. Initialize the complete
+        // representation so the snapshot covers unions and padding too.
+        var out: PlainNb = undefined;
+        @memset(std.mem.asBytes(&out), 0);
+        out.sock = std.os.windows.ws2_32.INVALID_SOCKET;
+        defer out.deinit();
+        @memset(&out.recv_buf, 0xa5);
+        @memset(&out.send_buf, 0x5a);
+        const before = std.mem.asBytes(&out).*;
+        try std.testing.expectError(
+            error.Unsupported,
+            out.startConnectUnixInto(alloc, path.get(), &port, &out),
+        );
+        try std.testing.expectEqualSlices(u8, &before, std.mem.asBytes(&out));
+    } else {
+        return error.SkipZigTest;
+    }
+}
+
 test "unix: connect and echo" {
     try wsaStart();
     defer wsaStop();
@@ -172,7 +207,7 @@ test "unix: connect and echo" {
 }
 
 test "unix: a stale socket file is replaced, a live listener is refused" {
-    if (is_windows) return error.SkipZigTest; // POSIX fixture; #21 adds its own
+    if (is_windows) return error.SkipZigTest; // POSIX filesystem fixture
     try requireUnix();
     var path: SockPath = .{};
     try path.init();
@@ -198,7 +233,7 @@ test "unix: a non-socket file at the path is refused and kept" {
     var path: SockPath = .{};
     try path.init();
     defer path.deinit();
-    const f = try std.fs.createFileAbsolute(path.get(), .{});
+    const f = try std.fs.cwd().createFile(path.get(), .{});
     f.close();
     try std.testing.expectError(error.PathNotASocket, Listener.openUnix(alloc, path.get(), .{}));
     const st = try std.posix.fstatat(std.posix.AT.FDCWD, path.get(), 0);
@@ -224,7 +259,7 @@ test "unix: an over-long path is an error, never truncated" {
     try requireUnix();
     var long: [300]u8 = undefined;
     @memset(&long, 'a');
-    const prefix = if (is_windows) "C:\\" else "/tmp/";
+    const prefix = "born-";
     @memcpy(long[0..prefix.len], prefix);
     try std.testing.expectError(error.NameTooLong, Listener.openUnix(alloc, &long, .{}));
     var port = try born.EvPort.init(alloc);

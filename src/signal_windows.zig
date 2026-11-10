@@ -1,5 +1,4 @@
-//! Signals on Windows: console control events. Owned by born#17: this file
-//! plus the EvPort.watchSignal/unwatchSignal bodies in evport_iocp.zig.
+//! Signals on Windows: console control events.
 //!
 //! One SetConsoleCtrlHandler routine serves the process. It maps
 //! CTRL_C_EVENT to `.interrupt` and CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT and
@@ -23,23 +22,21 @@
 //!
 //! CTRL+C: the routine is only called while the process does not ignore
 //! CTRL+C. A process started with CREATE_NEW_PROCESS_GROUP, or by a parent
-//! that ignores CTRL+C, has the ignore flag set (born-tests.exe under
-//! OpenSSH on win11-dev starts with it). Watching `.interrupt` clears the
-//! flag (SetConsoleCtrlHandler(NULL, FALSE)); its last unwatch sets it
+//! that ignores CTRL+C, has the ignore flag set. Watching `.interrupt` clears
+//! the flag (SetConsoleCtrlHandler(NULL, FALSE)); its last unwatch sets it
 //! again if it was set, mirroring the POSIX backends' disposition restore.
 //!
 //! Ownership is process-wide like on kqueue and epoll: at most one port
 //! watches a signal, and a second port gets error.SignalInUse until the
 //! first unwatches it or is deinitialized. The routine is installed by the
 //! first watch in the process and removed by the last unwatch, which
-//! State.deinit runs before the port handle closes (the #5 lifetime rule).
+//! State.deinit runs before the port handle closes.
 //! A port must not move while it watches a signal: the routine posts
 //! through the port's address.
 //!
 //! Locking: the routine runs on a system thread while the console's
 //! handler-list lock is held, and every SetConsoleCtrlHandler call waits
-//! for that lock (measured on Windows 11 26100: an add waited 1.8 s behind
-//! a handler that slept 2 s). So:
+//! for that lock, so:
 //!   - `owners_lock` guards the owner table. The routine reads the owner
 //!     and posts with it held, and unwatch clears the owner with it held,
 //!     so once unwatch returns no routine posts to that port: a routine
@@ -58,8 +55,8 @@
 //!
 //! Changing the process's console (FreeConsole, AllocConsole,
 //! AttachConsole) clears its handler list, so a routine installed before
-//! the change is gone (Windows 11 26100). No API reports it, and the
-//! parameter block's console handle can have the same value on the new
+//! the change is gone. No API reports it, and the parameter block's
+//! console handle can have the same value on the new
 //! console, so born cannot detect it. Change consoles before watching, or
 //! unwatch every signal afterwards (the routine's removal then fails and
 //! the next watch installs it again) and watch again.
@@ -97,6 +94,7 @@ pub const State = struct {
     watched: std.EnumSet(Signal) = .initEmpty(),
     udata: std.EnumArray(Signal, ?*anyopaque) = .initFill(null),
 
+    /// Returns state with no watched signals.
     pub fn init(alloc: std.mem.Allocator) State {
         _ = alloc;
         return .{};

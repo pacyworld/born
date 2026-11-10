@@ -1,6 +1,5 @@
 //! Portable deadline heap for backends with one kernel timer per port
-//! (timer_epoll.zig, timer_iocp.zig). Owned by born#11: this file and its
-//! unit tests. kqueue does not use it (native EVFILT_TIMER per timer).
+//! (timer_epoll.zig, timer_iocp.zig). kqueue uses native EVFILT_TIMER per timer.
 //!
 //! A binary min-heap of { deadline_ns, id, udata, period_ns } plus an
 //! id -> heap position index, so add, cancel and each popped entry of
@@ -49,11 +48,14 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 
+/// Allocation failures from heap growth.
 pub const Error = Allocator.Error;
 
 /// One timer returned by `expire`.
 pub const Expired = struct {
+    /// Timer identifier supplied to `TimerHeap.add`.
     id: u32,
+    /// Caller token supplied to `TimerHeap.add`.
     udata: ?*anyopaque,
     /// Expirations since this timer was last reported: 1 for a one-shot,
     /// 1 + missed periods for a repeating timer. Saturates at maxInt(u32).
@@ -74,15 +76,18 @@ const Entry = struct {
     }
 };
 
+/// Binary min-heap of timers indexed by caller-supplied identifiers.
 pub const TimerHeap = struct {
-    heap: std.ArrayListUnmanaged(Entry) = .empty,
+    heap: std.ArrayList(Entry) = .empty,
     /// id -> position in `heap`. An array hash map removes without
     /// tombstones, so lookups stay O(1) under add/cancel churn.
     index: std.AutoArrayHashMapUnmanaged(u32, u32) = .empty,
     seq: u64 = 0,
 
+    /// Empty heap with no allocated storage.
     pub const empty: TimerHeap = .{};
 
+    /// Frees all storage. Reassign `.empty` before using the heap again.
     pub fn deinit(self: *TimerHeap, gpa: Allocator) void {
         self.heap.deinit(gpa);
         self.index.deinit(gpa);
@@ -95,10 +100,12 @@ pub const TimerHeap = struct {
         try self.index.ensureTotalCapacity(gpa, n);
     }
 
+    /// Number of live timers.
     pub fn count(self: *const TimerHeap) usize {
         return self.heap.items.len;
     }
 
+    /// Whether `id` is a live timer.
     pub fn contains(self: *const TimerHeap, id: u32) bool {
         return self.index.contains(id);
     }
@@ -454,6 +461,38 @@ test "timer_heap: expire stops at out.len and leaves the rest due" {
     // Equal deadlines expire in the order they were added.
     try testing.expectEqualSlices(u32, &.{ 0, 1, 2, 3, 4, 9 }, order[0..n]);
     try testing.expectEqual(@as(?u64, 20), h.next());
+}
+
+test "timer_heap: ensureTotalCapacity preserves timers and covers later adds" {
+    var failing = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const gpa = failing.allocator();
+    var h: TimerHeap = .empty;
+    defer h.deinit(gpa);
+
+    try h.add(gpa, 0, 7, tag(7), 70, 0);
+    try h.add(gpa, 0, 8, tag(8), 30, 0);
+    try h.ensureTotalCapacity(gpa, 8);
+    try validate(&h);
+    try testing.expectEqual(@as(usize, 2), h.count());
+    try testing.expectEqual(@as(?u64, 30), h.next());
+    try testing.expectEqual(@as(?u64, 30), h.deadlineOf(8));
+    try testing.expectEqual(@as(?u64, 70), h.deadlineOf(7));
+
+    // The reservation covers both structures for every subsequent new id.
+    failing.fail_index = failing.alloc_index;
+    failing.resize_fail_index = failing.resize_index;
+    for (0..6) |i| try h.add(gpa, 0, @intCast(i), tag(i), (i + 1) * 10, 0);
+    try testing.expectEqual(@as(usize, 8), h.count());
+    try validate(&h);
+
+    var out: [8]Expired = undefined;
+    try testing.expectEqual(@as(usize, out.len), h.expire(100, &out));
+    const want = [_]u32{ 0, 1, 8, 2, 3, 4, 5, 7 };
+    for (want, out) |id, expired| {
+        try testing.expectEqual(id, expired.id);
+        try testing.expectEqual(tag(id), expired.udata);
+    }
+    try testing.expect(!failing.has_induced_failure);
 }
 
 test "timer_heap: no allocation in steady state with a fixed timer count" {

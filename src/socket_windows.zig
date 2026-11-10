@@ -1,3 +1,21 @@
+//! Plaintext stream sockets over Windows overlapped I/O. `Listener` in
+//! listener_windows.zig is the accept-side companion.
+//!
+//! Unlike the POSIX readiness backend, this backend completes posted ConnectEx,
+//! WSARecv, WSASend, and AcceptEx operations through IOCP. Feed each stream
+//! completion to `absorbCompletion` before reading or writing again.
+//!
+//! The POSIX resolving connect convenience returns `PlainNb` by value. Windows
+//! instead constructs a stream in place because its OVERLAPPED storage must
+//! remain at a stable address. Do not move or free a stream while operations
+//! are pending, including after cancellation or socket closure. Drain with
+//! `absorbCompletion` until `pendingOps() == 0`.
+//!
+//! Listener accept slots have the same lifetime rule, but their OVERLAPPED and
+//! address buffers live in a separate stable allocation, so the listener value
+//! itself may move. The Unix domain methods reserve the AF_UNIX companion API
+//! and currently return `error.Unsupported` rather than emulating Unix sockets.
+
 const std = @import("std");
 const windows = std.os.windows;
 const ws2 = windows.ws2_32;
@@ -10,9 +28,6 @@ const NbWrite = io.NbWrite;
 const IoError = io.IoError;
 const CompletionKind = io.CompletionKind;
 const unix_windows = @import("unix_windows.zig");
-
-const SIO_GET_EXTENSION_FUNCTION_POINTER: u32 = 0xC8000006;
-const SO_UPDATE_CONNECT_CONTEXT: i32 = 0x7010;
 
 const ConnectExFn = *const fn (
     s: ws2.SOCKET,
@@ -42,7 +57,7 @@ fn connectEx(sock: ws2.SOCKET) error{SocketError}!ConnectExFn {
     var ret: u32 = 0;
     const rc = ws2.WSAIoctl(
         sock,
-        SIO_GET_EXTENSION_FUNCTION_POINTER,
+        ws2.SIO_GET_EXTENSION_FUNCTION_POINTER,
         &WSAID_CONNECTEX,
         @sizeOf(windows.GUID),
         @ptrCast(&connect_ex_ptr),
@@ -55,7 +70,10 @@ fn connectEx(sock: ws2.SOCKET) error{SocketError}!ConnectExFn {
     return connect_ex_ptr.?;
 }
 
-/// Non-blocking TCP stream over overlapped WSA sockets. Owns the socket.
+/// Plaintext stream socket (TCP and Unix where supported) over overlapped I/O.
+///
+/// The stream owns its socket. Its storage must remain stable and allocated
+/// until all overlapped completions have been absorbed, even after close.
 pub const PlainNb = struct {
     /// Every stream error; each method returns its own narrower set.
     pub const Error = IoError;
@@ -88,15 +106,15 @@ pub const PlainNb = struct {
     send_just_done: ?usize = null,
     send_err: ?usize = null,
 
+    /// Returns the underlying socket handle without transferring ownership.
     pub fn handle(self: *const PlainNb) types.Handle {
         return @ptrCast(self.sock);
     }
 
-    /// Overlapped connect to host:port, CONSTRUCTED IN PLACE at `dest`
-    /// (the OVERLAPPED structs are registered with in-flight ops — a
-    /// by-value return would orphan the connect completion's address).
-    /// The socket is associated with the event port (`key` = the conn)
-    /// before ConnectEx posts.
+    /// Resolves `host` and constructs an overlapped TCP connect in `self`.
+    /// `self` must remain at a stable address until its connect completion is
+    /// absorbed. The socket is associated with `evp` under `key` before
+    /// ConnectEx posts. On failure, `self` is left empty.
     pub fn startConnectInto(self: *PlainNb, alloc: std.mem.Allocator, host: []const u8, port: u16, evp: *evport.EvPort, key: ?*anyopaque) io.ConnectError!void {
         std.debug.assert(self.sock == ws2.INVALID_SOCKET and self.pendingOps() == 0 and !self.wsa_started);
         self.* = .{};
@@ -123,9 +141,9 @@ pub const PlainNb = struct {
         return last_err;
     }
 
-    /// Overlapped connect to an already resolved `addr`, CONSTRUCTED IN
-    /// PLACE like `startConnectInto`, with no resolver and no allocation:
-    /// the call to use from an event loop. Same completion contract.
+    /// Constructs an overlapped connect to an already resolved `addr` in
+    /// `self`, with no resolver or allocation. It has the same stable-storage
+    /// and completion contract as `startConnectInto`.
     pub fn startConnectAddrInto(self: *PlainNb, addr: std.net.Address, evp: *evport.EvPort, key: ?*anyopaque) io.ConnectAddrError!void {
         std.debug.assert(self.sock == ws2.INVALID_SOCKET and self.pendingOps() == 0 and !self.wsa_started);
         self.* = .{};
@@ -146,8 +164,8 @@ pub const PlainNb = struct {
         if (s == ws2.INVALID_SOCKET) return error.Unusable;
 
         // ConnectEx requires the socket bound first (wildcard, target's
-        // address family — use a std.net.Address so the layout is
-        // target-correct).
+        // address family); use a std.net.Address so the layout is
+        // target-correct.
         const any_addr = switch (addr.any.family) {
             ws2.AF.INET => std.net.Address.parseIp4("0.0.0.0", 0) catch unreachable,
             else => std.net.Address.parseIp6("::", 0) catch unreachable,
@@ -176,10 +194,10 @@ pub const PlainNb = struct {
         self.connect_pending = true;
     }
 
-    /// Adopt a socket accepted by `Listener.acceptNb` (AcceptEx, accept
-    /// context already updated), CONSTRUCTED IN PLACE at `self`, and
-    /// associate it with `evp` under `key`. Takes ownership of `h`: on
-    /// failure it is closed and `self` stays empty. `evp` is required here.
+    /// Adopts a socket accepted by `Listener.acceptNb` in `self` and associates
+    /// it with `evp` under `key`. The accept context is already updated. Takes
+    /// ownership of `h`: on failure it is closed and `self` stays empty. `evp`
+    /// is required, and `self` must remain stable while operations are pending.
     pub fn adoptAccepted(self: *PlainNb, h: types.Handle, evp: ?*evport.EvPort, key: ?*anyopaque) io.AcceptError!void {
         std.debug.assert(self.sock == ws2.INVALID_SOCKET and self.pendingOps() == 0 and !self.wsa_started);
         const s: ws2.SOCKET = @ptrCast(h);
@@ -199,13 +217,13 @@ pub const PlainNb = struct {
     }
 
     fn postConnectSetup(self: *PlainNb) error{SocketError}!void {
-        if (ws2.setsockopt(self.sock, ws2.SOL.SOCKET, SO_UPDATE_CONNECT_CONTEXT, null, 0) != 0) return error.SocketError;
+        if (ws2.setsockopt(self.sock, ws2.SOL.SOCKET, ws2.SO.UPDATE_CONNECT_CONTEXT, null, 0) != 0) return error.SocketError;
     }
 
-    /// Non-blocking connect to a Unix stream socket at `path`, completed
-    /// through the same absorbCompletion + connectDone contract as TCP.
-    /// `self` is left untouched on failure. Implemented in unix_windows.zig
-    /// (born#21).
+    /// Unix domain stream connect at `path`. This API is intended to use
+    /// AF_UNIX with the same `absorbCompletion` and `connectDone` contract as
+    /// TCP, but currently always returns `error.Unsupported` and leaves `self`
+    /// untouched.
     pub fn startConnectUnixInto(self: *PlainNb, alloc: std.mem.Allocator, path: []const u8, evp: *evport.EvPort, key: ?*anyopaque) io.ConnectUnixError!void {
         return unix_windows.connectInto(self, alloc, path, evp, key);
     }
@@ -255,6 +273,9 @@ pub const PlainNb = struct {
         return .unknown;
     }
 
+    /// Returns bytes from a completed receive, or posts an overlapped receive
+    /// and returns `.want_read`. Absorb that completion before calling again.
+    /// An empty buffer returns zero bytes without posting an operation.
     pub fn readNb(self: *PlainNb, out: []u8) io.ReadError!NbRead {
         if (self.sock == ws2.INVALID_SOCKET or self.recv_err != null) return error.SocketError;
         if (out.len == 0) return .{ .data = 0 };
@@ -281,10 +302,14 @@ pub const PlainNb = struct {
         return error.SocketError;
     }
 
+    /// Reports a completed send, returns `.want_write` while one is pending, or
+    /// copies up to the internal buffer capacity and posts an overlapped send.
+    /// A posted send reports its byte count after its completion is absorbed and
+    /// this method is called again. An empty new write is a no-op.
     pub fn writeNb(self: *PlainNb, data: []const u8) io.WriteError!NbWrite {
         if (self.sock == ws2.INVALID_SOCKET or self.send_err != null) return error.SocketError;
         // Account for a completed pending send first (completions carry the
-        // byte count — inline WSASend success still queues a completion).
+        // byte count; inline WSASend success still queues a completion).
         if (self.send_just_done) |n| {
             self.send_just_done = null;
             return .{ .done = n };
@@ -319,8 +344,8 @@ pub const PlainNb = struct {
         return n;
     }
 
-    /// Abort in-flight ops (their completions still arrive — absorbed as
-    /// errors) and close the socket.
+    /// Aborts in-flight operations and closes the socket. Their completions
+    /// still arrive and are absorbed as errors.
     pub fn cancelAndClose(self: *PlainNb) void {
         if (self.sock != ws2.INVALID_SOCKET) {
             _ = kernel32.CancelIoEx(self.handle(), null);
@@ -330,10 +355,16 @@ pub const PlainNb = struct {
         self.releaseWsaIfClosed();
     }
 
+    /// Intentionally does nothing. Overlapped teardown starts with
+    /// `cancelAndClose` and finishes by absorbing completions, not by a
+    /// readiness close notification.
     pub fn closeNotify(self: *PlainNb) void {
         _ = self;
     }
 
+    /// Cancels and closes the socket through `cancelAndClose`. Keep `self` at a
+    /// stable address and continue absorbing completions until `pendingOps()`
+    /// returns zero before freeing or reusing its storage.
     pub fn deinit(self: *PlainNb) void {
         self.cancelAndClose();
     }

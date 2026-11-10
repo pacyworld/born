@@ -1,64 +1,40 @@
-//! born -- an event port for Zig.
+//! born: an event port for Zig.
 //!
 //! One small, uniform seam over the platform's native readiness/completion
 //! notification mechanism. Named for the Born rule: I/O waits in potential
 //! until `wait()` collapses it into a concrete event.
 //!
-//!   FreeBSD / macOS / *BSD  kqueue   (evport_kqueue.zig)
-//!   Linux                   epoll + eventfd  (evport_epoll.zig)
-//!   Windows                 IOCP     (evport_iocp.zig)
+//! - FreeBSD, macOS, and other supported BSD targets use kqueue.
+//! - Linux uses epoll and eventfd.
+//! - Windows uses IOCP.
 //!
-//! ## Programming models (see README for the portable socket companion)
+//! ## Programming models
 //!
-//!   - kqueue batches registrations and events in one kevent call; epoll
-//!     applies registrations immediately with epoll_ctl. IOCP harvests completions.
-//!   - POSIX socket reads are persistent and edge-triggered: fully drain.
-//!     kqueue writes are one-shot; epoll writes remain armed until canceled.
-//!     IOCP users submit overlapped operations, not readiness registrations.
-//!   - POSIX: purge staged changes before closing at the end-of-batch reap
-//!     point. unmonitorRead/cancelWrite apply to handles that remain open.
-//!     Windows: cancel/close, then drain every pending completion before
-//!     moving or freeing the stream's OVERLAPPED storage.
-//!   - wake() signals the loop from another thread. POSIX wakeups coalesce;
-//!     IOCP posts a completion per wake. Event.wake identifies either form.
-//!   - A failed registration is never silent: epoll/IOCP return it as an
-//!     error from the next non-empty wait(); kqueue delivers kernel
-//!     rejections as Event.err/err_no and stashes allocation failures the
-//!     same deferred way. IOCP post()/wake() failures (error.PostFailed)
-//!     take the same deferred channel. Regular files are portable
-//!     readiness sources: kqueue reports them perpetually ready natively,
-//!     and epoll emulates exactly that with always-ready pseudo
-//!     registrations (raw epoll_ctl would refuse them with EPERM).
-//!   - Process exits (EvPort.watchProcess on a born.process.Child handle)
-//!     arrive as Event.exited/.exit: EVFILT_PROCDESC on FreeBSD, pidfds on
-//!     Linux, error.Unsupported elsewhere.
-//!   - 0.3.0 timers, signals, TCP listeners and Unix sockets are declared
-//!     with their final signatures and return error.Unsupported until each
-//!     backend's implementation lands (README, "Planned in 0.3.0").
+//! - kqueue batches registrations and events in one kevent call; epoll applies
+//!   registrations immediately with epoll_ctl. IOCP harvests completions.
+//! - POSIX socket reads are persistent and edge-triggered: fully drain. kqueue
+//!   writes are one-shot; epoll writes remain armed until canceled. IOCP users
+//!   submit overlapped operations, not readiness registrations.
+//! - POSIX callers purge staged changes before closing at the end-of-batch reap
+//!   point. Windows callers cancel and close, then drain every pending
+//!   completion before moving or freeing overlapped storage.
+//! - `wake()` signals the loop from another thread. POSIX wakeups coalesce;
+//!   IOCP posts one completion per wake. `Event.wake` identifies either form.
+//! - Registration failures are never silent. epoll and IOCP `monitorRead`
+//!   failures are deferred to the next non-empty `wait()`; IOCP `associate`
+//!   fails immediately. kqueue reports kernel rejections as `Event.err` and
+//!   `Event.err_no`, and stashes allocation failures for the same deferred
+//!   channel. IOCP post and wake failures use that channel too.
+//! - Regular files are portable readiness sources. kqueue reports them ready
+//!   natively, and epoll emulates that with always-ready pseudo registrations.
+//! - Process exits from `EvPort.watchProcess` arrive as `Event.exited` and
+//!   `Event.exit`: EVFILT_PROCDESC on FreeBSD, pidfds on Linux, and
+//!   `error.Unsupported` elsewhere.
+//! - Timers, signals, TCP listeners, and Unix sockets share `wait()`. Windows
+//!   Unix socket operations currently return `error.Unsupported`.
 //!
-//! ## Provenance
-//!
-//! Extracted from mcp-bridge, where these backends have been in production
-//! since 2026-08 and carry the scar tissue to prove it: the epoll `EPOLLET`
-//! write deadlock (edge-triggering applies to the whole registration, so
-//! EPOLLOUT goes edge-triggered after connect completes), the kqueue
-//! changelist rule that one rejected entry makes the kernel abandon the rest
-//! of the batch, and FreeBSD loopback connect returning ECONNREFUSED
-//! synchronously under load.
-//!
-//! ## Platform status
-//!
-//!   freebsd            production (mcp-bridge, since 2026-08)
-//!   linux              production (mcp-bridge, since 2026-08)
-//!   windows            production (mcp-bridge, since 2026-08)
-//!   aarch64/x86_64 macos: compile-only, NOT yet run on hardware
-//!   x86_64 netbsd / openbsd: compile-only, NOT yet run on hardware
-//!   Other selected OS tags are outside the checked target matrix.
-//!
-//! The checked triples are listed in build.zig and README. CI compiles
-//! the actual test bodies rather than relying on lazy library analysis.
-//! Cross-compilation is not runtime verification. Do not claim a platform
-//! has been tested without executing its tests on that platform.
+//! The checked target triples and runtime evidence are listed in the README.
+//! Cross-compilation is not runtime verification.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -74,24 +50,35 @@ const impl = switch (builtin.os.tag) {
     else => @compileError("born: no event port backend for this OS"),
 };
 
+/// Event port for the compile-time-selected native backend.
 pub const EvPort = impl.EvPort;
+/// Native descriptor or Windows handle used by the event port.
 pub const Handle = @import("types.zig").Handle;
+/// Notification harvested by `EvPort.wait`.
 pub const Event = @import("types.zig").Event;
+/// Signal that can be watched through `EvPort`.
 pub const Signal = @import("types.zig").Signal;
+/// One-shot or repeating timer mode.
 pub const TimerMode = @import("types.zig").TimerMode;
+/// Exit status reported for a watched child process.
 pub const ProcessExit = @import("types.zig").ProcessExit;
-/// Per-operation error sets. Each EvPort method returns only its own set;
-/// `Error` is their union.
+/// Errors produced while initializing an event port.
 pub const InitError = impl.InitError;
+/// Event-loop and deferred registration or post errors from `EvPort.wait`.
 pub const WaitError = impl.WaitError;
+/// Errors produced by timer operations.
 pub const TimerError = impl.TimerError;
+/// Errors produced by signal operations.
 pub const SignalError = impl.SignalError;
+/// Errors produced by process watch operations.
 pub const ProcessError = impl.ProcessError;
+/// Union of event-port operation error sets.
 pub const Error = impl.Error;
 /// Block signals in the calling thread before watching them. Required on
 /// epoll (signalfd), a no-op on kqueue and Windows. Call it in `main`
 /// before spawning threads.
 pub const blockSignals = impl.blockSignals;
+/// Portable plaintext stream and listener companions.
 pub const socket = @import("socket.zig");
 /// Child processes behind a descriptor, for `EvPort.watchProcess`.
 pub const process = @import("process.zig");
@@ -107,14 +94,11 @@ pub const backend_name: []const u8 = switch (builtin.os.tag) {
 };
 
 test {
-    // Pull in the selected backend's own tests.
+    // Supplement real calls with declaration analysis for the selected backend.
     std.testing.refAllDecls(impl);
-    _ = impl;
     _ = @import("api_test.zig");
     _ = @import("socket_test.zig");
     _ = @import("timer_heap.zig");
-    // 0.3.0 contract tests: they skip while the backend returns
-    // error.Unsupported and run once the implementation issue lands.
     _ = @import("timer_test.zig");
     _ = @import("signal_test.zig");
     _ = @import("listener_test.zig");

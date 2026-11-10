@@ -1,6 +1,5 @@
 //! Timers on epoll: one timerfd per port plus the deadline heap
-//! (timer_heap.zig). Owned by born#13: this file plus the
-//! EvPort.addTimer/cancelTimer bodies in evport_epoll.zig.
+//! (timer_heap.zig).
 //!
 //! The first `add` creates a CLOCK_MONOTONIC timerfd and registers it with
 //! `EvPort.addInternal(.timer, fd)` (level-triggered). The timerfd is kept
@@ -37,6 +36,7 @@ pub const State = struct {
     /// while it is disarmed or has already fired and been read.
     armed: ?u64 = null,
 
+    /// Returns state with no timerfd and an empty heap.
     pub fn init(alloc: std.mem.Allocator) State {
         _ = alloc;
         return .{};

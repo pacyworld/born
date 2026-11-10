@@ -1,6 +1,6 @@
-//! Unix domain stream sockets on POSIX (born#20): `Listener.openUnix` (via
-//! `listen`) and `PlainNb.startConnectUnixInto` (via `connectInto`).
-//! Accepted streams use the TCP listener's accept path (#18) unchanged.
+//! Unix domain stream sockets on POSIX: `Listener.openUnix` (via `listen`)
+//! and `PlainNb.startConnectUnixInto` (via `connectInto`). Accepted streams
+//! use the same accept path as TCP listeners.
 //!
 //! Paths: checked against `sun_path` (104 bytes on BSD and macOS, 108 on
 //! Linux, counting the NUL) and refused with error.NameTooLong, never
@@ -13,17 +13,19 @@
 //! before `opts.mode` is in place. The umask is not touched: it is
 //! process-wide, and changing it would race other threads creating files.
 //! fchmodat goes by path with AT_SYMLINK_NOFOLLOW (on Linux before 6.6
-//! through std's /proc fallback); keep the socket in a directory that
-//! untrusted users cannot write, as for any socket file. `opts.mode` takes
+//! through std's /proc fallback). The socket's parent directory must be
+//! writable only by trusted users: bind, fchmodat, ownership checks, and
+//! unlink are separate operations, so an untrusted directory writer could
+//! replace the path between operations. `opts.mode` takes
 //! permission bits only (0o777); anything else is error.SocketError.
 //!
 //! Stale paths (`unlink_stale`): when bind reports EADDRINUSE, the path is
 //! classified before anything is removed:
 //!   - not a socket (a symlink included): error.PathNotASocket, kept;
 //!   - a socket file: probed with a datagram connect. No socket attached
-//!     to the file answers ECONNREFUSED: stale, unlinked once (if it is
-//!     still the same file) and bind is retried once. Any bound socket
-//!     answers EPROTOTYPE (another type) or accepts the connect: live,
+//!     to the file answers ECONNREFUSED: stale, checked again before one
+//!     unlink, and bind is retried once. Any bound socket answers
+//!     EPROTOTYPE (another type) or accepts the connect: live,
 //!     error.AddressInUse. A datagram probe never touches the accept queue,
 //!     so it also classifies a live listener whose backlog is full (FreeBSD
 //!     and macOS refuse a stream connect to it with ECONNREFUSED) and one
@@ -49,14 +51,18 @@ const Ino = @FieldType(posix.Stat, "ino");
 /// Unix-only listener state, a field of Listener (`unix`): the path this
 /// process bound, and the identity of the file bind created.
 ///
-/// `close` (through `deinit`) unlinks the path only when all of these hold,
-/// so it never removes a path a different listener now owns:
+/// `close` (through `deinit`) checks all of these conditions before
+/// unlinking the path:
 ///   - this listener created the file (openUnix bound it);
 ///   - the caller is the process that bound it: a child that inherited the
 ///     listener across fork closes its copy without unlinking;
 ///   - the path still names that file (same device and inode, checked
 ///     before the descriptor closes, while the socket keeps the inode
 ///     alive, so the pair cannot have been reused).
+///
+/// The parent directory must be writable only by trusted users because the
+/// identity check and unlink are separate pathname operations.
+///
 /// If the unlink fails (permissions changed), the file stays as a stale
 /// socket that the next openUnix with `unlink_stale` replaces.
 pub const ListenerState = struct {
@@ -107,6 +113,11 @@ fn sockPtr(un: *const posix.sockaddr.un) *const posix.sockaddr {
 
 const addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.un);
 
+/// Open a Unix stream listener at `path` with `opts`.
+///
+/// The parent directory must be writable only by trusted users. See the
+/// module documentation for path validation, stale-path handling, and the
+/// ownership checks used during cleanup.
 pub fn listen(alloc: std.mem.Allocator, path: []const u8, opts: io.UnixOptions) io.ListenError!Listener {
     _ = alloc;
     if (opts.mode & ~@as(u16, 0o777) != 0) return io.ListenError.SocketError;
@@ -176,8 +187,8 @@ fn removeStale(un: *const posix.sockaddr.un, path: []const u8) io.ListenError!vo
         .stale => {},
     }
 
-    // Unlink only the file that was probed; a replacement belongs to
-    // whoever created it.
+    // Leave an already-replaced path alone. Replacement after this check is
+    // possible, so the parent directory must be writable only by trusted users.
     const now = try lstat(path) orelse return;
     if (now.dev != before.dev or now.ino != before.ino) return io.ListenError.AddressInUse;
     switch (posix.errno(std.c.unlink(@ptrCast(&un.path)))) {
@@ -258,13 +269,23 @@ pub fn connectInto(stream: *PlainNb, alloc: std.mem.Allocator, path: []const u8,
 
 const testing = std.testing;
 
+const test_tmp_root = ".zig-cache" ++ std.fs.path.sep_str ++ "tmp" ++ std.fs.path.sep_str;
+
+/// A socket path relative to the workspace, short enough for BSD sun_path.
 const TestPath = struct {
     buf: [64]u8 = undefined,
     len: usize = 0,
+    tmp: ?std.testing.TmpDir = null,
 
     fn init() !TestPath {
         var p: TestPath = .{};
-        p.len = (try std.fmt.bufPrint(&p.buf, "/tmp/born-up-{x}.sock", .{std.crypto.random.int(u64)})).len;
+        p.tmp = std.testing.tmpDir(.{});
+        errdefer p.tmp.?.cleanup();
+        p.len = (try std.fmt.bufPrint(
+            &p.buf,
+            test_tmp_root ++ "{s}" ++ std.fs.path.sep_str ++ "s",
+            .{p.tmp.?.sub_path},
+        )).len;
         return p;
     }
 
@@ -272,8 +293,9 @@ const TestPath = struct {
         return self.buf[0..self.len];
     }
 
-    fn deinit(self: *const TestPath) void {
+    fn deinit(self: *TestPath) void {
         posix.unlink(self.get()) catch {};
+        if (self.tmp) |*tmp| tmp.cleanup();
     }
 };
 
@@ -291,7 +313,7 @@ fn rawConnect(path: []const u8) !bool {
 }
 
 test "unix_posix: a socket bound but not yet listening is live, not stale" {
-    const p = try TestPath.init();
+    var p = try TestPath.init();
     defer p.deinit();
     const un = try sockAddr(p.get());
     const raw = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
@@ -303,7 +325,7 @@ test "unix_posix: a socket bound but not yet listening is live, not stale" {
 }
 
 test "unix_posix: a live listener with a full backlog is not stale" {
-    const p = try TestPath.init();
+    var p = try TestPath.init();
     defer p.deinit();
     const un = try sockAddr(p.get());
     const srv = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
@@ -334,8 +356,8 @@ test "unix_posix: a live listener with a full backlog is not stale" {
     try testing.expect(exists(p.get()));
 }
 
-test "unix_posix: close removes its own path, never a successor's" {
-    const p = try TestPath.init();
+test "unix_posix: close removes its own path and preserves a successor's" {
+    var p = try TestPath.init();
     defer p.deinit();
     var first = try Listener.openUnix(testing.allocator, p.get(), .{});
     // Another instance takes the path over (removed by hand, rebound).
@@ -349,7 +371,7 @@ test "unix_posix: close removes its own path, never a successor's" {
 }
 
 test "unix_posix: a copy inherited by another process does not unlink" {
-    const p = try TestPath.init();
+    var p = try TestPath.init();
     defer p.deinit();
     var l = try Listener.openUnix(testing.allocator, p.get(), .{});
     l.unix.pid +%= 1; // as seen from a forked child
@@ -358,13 +380,19 @@ test "unix_posix: a copy inherited by another process does not unlink" {
 }
 
 test "unix_posix: a symlink at the path is refused and kept" {
-    const p = try TestPath.init();
+    var p = try TestPath.init();
     defer p.deinit();
-    const target = try TestPath.init();
+    var target = try TestPath.init();
     defer target.deinit();
     var l = try Listener.openUnix(testing.allocator, target.get(), .{});
     defer l.close();
-    try posix.symlink(target.get(), p.get());
+    var link_buf: [64]u8 = undefined;
+    const link = try std.fmt.bufPrint(
+        &link_buf,
+        ".." ++ std.fs.path.sep_str ++ "{s}" ++ std.fs.path.sep_str ++ "s",
+        .{target.tmp.?.sub_path},
+    );
+    try posix.symlink(link, p.get());
     try testing.expectError(error.PathNotASocket, Listener.openUnix(testing.allocator, p.get(), .{}));
     const st = try posix.fstatat(posix.AT.FDCWD, p.get(), posix.AT.SYMLINK_NOFOLLOW);
     try testing.expect(posix.S.ISLNK(st.mode));
@@ -373,7 +401,7 @@ test "unix_posix: a symlink at the path is refused and kept" {
 test "unix_posix: empty paths and embedded NULs are refused" {
     var port = try evport.EvPort.init(testing.allocator);
     defer port.deinit();
-    for ([_][]const u8{ "", "/tmp/born\x00cut" }) |bad| {
+    for ([_][]const u8{ "", "born\x00cut" }) |bad| {
         try testing.expectError(error.SocketError, Listener.openUnix(testing.allocator, bad, .{}));
         var s: PlainNb = .{};
         try testing.expectError(error.ConnectFailed, connectInto(&s, testing.allocator, bad, &port, null));
@@ -382,8 +410,14 @@ test "unix_posix: empty paths and embedded NULs are refused" {
 }
 
 test "unix_posix: the longest path that fits sun_path works, one more byte does not" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
     var buf: [sun_path_len]u8 = undefined;
-    const prefix = try std.fmt.bufPrint(&buf, "/tmp/born-up-{x}-", .{std.crypto.random.int(u64)});
+    const prefix = try std.fmt.bufPrint(
+        &buf,
+        test_tmp_root ++ "{s}" ++ std.fs.path.sep_str,
+        .{tmp.sub_path},
+    );
     @memset(buf[prefix.len..], 'x');
     const fits = buf[0 .. sun_path_len - 1];
     defer posix.unlink(fits) catch {};

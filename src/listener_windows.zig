@@ -1,12 +1,9 @@
-//! Listening stream sockets on Windows (AcceptEx). Owned by born#19 (TCP:
-//! openTcp, register, acceptNb, absorbCompletion, pendingOps, localAddress,
-//! close) apart from `openUnix` and the `unix` field, which belong to
-//! born#21 in unix_windows.zig.
+//! Listening stream sockets on Windows using AcceptEx and IOCP.
 //!
-//! Model: `register` associates the listening socket with the port and
-//! posts `ListenOptions.accept_depth` AcceptEx operations, each with its own
-//! pre-created accept socket, address buffer and OVERLAPPED. The slots live
-//! in one heap block owned by the Listener, so the Listener value itself
+//! `register` associates the listening socket with the port and posts
+//! `ListenOptions.accept_depth` AcceptEx operations, each with its own
+//! pre-created accept socket, address buffer, and OVERLAPPED. The slots live in
+//! one stable heap block owned by the listener, so the listener value itself
 //! may move. Feed each listener completion to `absorbCompletion`, then call
 //! `acceptNb` until `.want_accept`: it hands over completed sockets as
 //! `PlainNb` streams and re-posts their AcceptEx.
@@ -27,8 +24,9 @@
 //! slots), then `acceptNb` until `.want_accept`. `unmonitorRead` is a
 //! no-op on IOCP, so the pause step needs no special case.
 //!
-//! An AF_UNIX listener (born#21) is the same machinery: bind and listen
-//! its socket, then `adoptListening` with its family and protocol.
+//! AF_UNIX support is intended to bind and listen a Unix socket, then reuse
+//! this machinery through `adoptListening`. `openUnix` currently returns
+//! `error.Unsupported`.
 
 const std = @import("std");
 const windows = std.os.windows;
@@ -85,6 +83,11 @@ const Slot = struct {
     }
 };
 
+/// Overlapped stream listener with stable AcceptEx slots.
+///
+/// The listener value may move because its slots are separately allocated.
+/// After `close`, keep absorbing completions until `pendingOps()` returns zero
+/// so the slot allocation can be released safely.
 pub const Listener = struct {
     sock: ws2.SOCKET = ws2.INVALID_SOCKET,
     /// Unix-socket state (e.g. the bound path), owned by unix_windows.zig.
@@ -127,7 +130,8 @@ pub const Listener = struct {
         return adoptListening(alloc, s, family, ws2.IPPROTO.TCP, opts.accept_depth);
     }
 
-    /// Unix stream listener at `path`; see unix_windows.zig.
+    /// Unix domain stream listener at `path`. This API is intended to use
+    /// AF_UNIX, but currently always returns `error.Unsupported`.
     pub fn openUnix(alloc: std.mem.Allocator, path: []const u8, opts: io.UnixOptions) io.ListenError!Listener {
         return unix_windows.listen(alloc, path, opts);
     }
@@ -280,6 +284,7 @@ pub const Listener = struct {
         }
     }
 
+    /// Returns the listening socket handle without transferring ownership.
     pub fn handle(self: *const Listener) types.Handle {
         return @ptrCast(self.sock);
     }

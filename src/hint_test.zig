@@ -19,6 +19,21 @@ test "hint: API shape is the same on every target" {
     try std.testing.expect(@TypeOf(socket.Listener.hintReadable) == fn (*socket.Listener, born.Event) void);
 }
 
+test "hint: IOCP no-op hints preserve empty stream and listener state" {
+    if (!is_windows) return error.SkipZigTest;
+    var stream: socket.PlainNb = .{};
+    defer stream.deinit();
+    var listener: socket.Listener = .{};
+    defer listener.close();
+    const ev: born.Event = .{};
+
+    stream.hintReadable(ev);
+    listener.hintReadable(ev);
+
+    try std.testing.expectEqual(@as(usize, 0), stream.pendingOps());
+    try std.testing.expectEqual(@as(usize, 0), listener.pendingOps());
+}
+
 /// Wait for the next readable event on `udata`.
 fn nextReadable(port: *born.EvPort, udata: *anyopaque) !born.Event {
     var events: [8]born.Event = undefined;

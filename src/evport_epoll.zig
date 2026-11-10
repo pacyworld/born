@@ -1,41 +1,39 @@
-// Linux event port: epoll + eventfd backend (issue #7).
-//
-// Same contract as the kqueue backend:
-//   - Sockets: read interest is persistent edge-triggered (EPOLLIN |
-//     EPOLLET | EPOLLRDHUP; handlers fully drain — the EV_CLEAR
-//     equivalent). EPOLLRDHUP gives half-close as an event.
-//   - Write interest is on-demand "level-triggered" EPOLLOUT: armed by
-//     wantWrite, disarmed by cancelWrite when the queue drains. NOTE:
-//     EPOLLET in the shared mask applies to the fd's WHOLE registration,
-//     so with read interest armed (always, for conns) EPOLLOUT is
-//     effectively EDGE-triggered: a still-writable socket produces no
-//     second writable event after connect. Conn write paths must attempt
-//     the write FIRST and wait only after an actual want_write (EAGAIN) —
-//     see driveWrite / driveProxyTunnel. (EPOLLONESHOT is unusable here
-//     because it disarms the fd's WHOLE registration, including the
-//     persistent read side.)
-//   - Registrations apply immediately (epoll_ctl has no batching); the
-//     kqueue-side "staged changelist" rule is kqueue-specific. A rejected
-//     registration (e.g. EBADF for a dead descriptor) is NEVER a silent
-//     no-op: like the IOCP backend's, a failure is stashed and returned as
-//     error.RegisterFailed from the next non-empty wait().
-//   - epoll_ctl answers EPERM for any descriptor with no poll
-//     implementation — regular files, character devices such as
-//     /dev/null, directories. Their I/O never blocks, so "always ready"
-//     is the correct — and kqueue-matching — answer. These are pseudo
-//     registrations: kept out of the kernel's set and reported ready by
-//     every wait(). The kernel does the classifying: EPERM from the ADD
-//     is the signal, so no descriptor-type list has to be maintained.
-//   - Cross-thread wakeup: eventfd (the pipe trick's Linux twin).
-//   - purgeFd drops only the port's bookkeeping; the kernel removes a
-//     closed fd's registration itself.
-//   - Internal sources (timer_epoll.zig's timerfd, signal_epoll.zig's
-//     signalfd, process_epoll.zig's inner epoll set of pidfds): at most
-//     one fd per kind per port, registered
-//     level-triggered with a kind sentinel as epoll data. wait() hands a
-//     ready one to its kind's harvest(), which drains it into Events. A
-//     source left ready (the caller's buffer filled) is re-reported by the
-//     next wait(), so nothing is dropped.
+//! Linux event port backed by epoll and eventfd.
+//!
+//! Socket read interest is persistent and edge-triggered with EPOLLIN,
+//! EPOLLET, and EPOLLRDHUP. Handlers must fully drain readable data, and
+//! EPOLLRDHUP reports half-close as an event.
+//!
+//! Write interest is on-demand EPOLLOUT, armed by wantWrite and disarmed by
+//! cancelWrite when the output queue drains. EPOLLET applies to the whole
+//! descriptor registration, so EPOLLOUT is also edge-triggered when read
+//! interest is armed. A still-writable socket therefore produces no second
+//! writable event after connect. Stream writers must attempt to write first
+//! and wait for write interest only after an actual EAGAIN. EPOLLONESHOT is
+//! unsuitable because it disarms the whole registration, including persistent
+//! read interest.
+//!
+//! Registrations apply immediately through epoll_ctl; there is no staged
+//! changelist. A rejected registration, such as EBADF for a dead descriptor,
+//! is stashed and returned as error.RegisterFailed from the next non-empty
+//! wait instead of becoming a silent no-op.
+//!
+//! epoll_ctl returns EPERM for descriptors with no poll implementation,
+//! including regular files, character devices such as /dev/null, and
+//! directories. Their I/O never blocks, so they become pseudo registrations:
+//! they stay out of the kernel set and every wait reports them ready, matching
+//! kqueue. EPERM from the add operation performs the classification, so no
+//! descriptor-type list is needed.
+//!
+//! eventfd provides cross-thread wakeup. purgeFd drops only the port's
+//! bookkeeping; closing a descriptor removes its kernel registration.
+//!
+//! timer_epoll.zig, signal_epoll.zig, and process_epoll.zig each own at most
+//! one timerfd, signalfd, or inner process epoll set per port. These internal
+//! sources are level-triggered and use kind sentinels as epoll data. wait hands
+//! a ready source to its harvest function, which drains it into events. A
+//! source left ready because the caller's buffer filled is reported again by
+//! the next wait, so nothing is dropped.
 
 const std = @import("std");
 const linux = std.os.linux;
@@ -94,12 +92,14 @@ const FdState = struct {
     udata: ?*anyopaque = null,
     read: bool = false,
     write: bool = false, // EPOLLOUT currently in the mask
-    /// Regular file: tracked in the map only, never in epoll. I/O on a
-    /// regular file never blocks, so wait() reports it ready on every call
-    /// — the same observable behaviour kqueue gives natively.
+    /// Unpollable descriptor: tracked in the map only, never in epoll. Its
+    /// I/O never blocks, so wait reports it ready on every call, matching
+    /// kqueue's observable behavior.
     pseudo: bool = false,
 };
 
+/// An epoll event port with immediate kernel registrations and always-ready
+/// pseudo registrations for descriptors that epoll cannot poll.
 pub const EvPort = struct {
     ep: i32 = -1,
     alloc: std.mem.Allocator,
@@ -121,6 +121,7 @@ pub const EvPort = struct {
     /// Process-watch bookkeeping, owned by process_epoll.zig.
     processes: process_epoll.State = .{},
 
+    /// Create an epoll instance and eventfd, using `alloc` for port bookkeeping.
     pub fn init(alloc: std.mem.Allocator) InitError!EvPort {
         // Raw linux syscalls do not set libc errno; decode the return value
         // itself. std.posix.errno() would read libc's thread-local errno in
@@ -146,6 +147,7 @@ pub const EvPort = struct {
         return self;
     }
 
+    /// Release internal sources, the epoll instance, eventfd, and bookkeeping.
     pub fn deinit(self: *EvPort) void {
         self.signals.deinit(self);
         self.timers.deinit(self);
@@ -271,26 +273,25 @@ pub const EvPort = struct {
         return if (fd == -1) null else fd;
     }
 
-    /// Apply the fd's computed mask: ADD / MOD / DEL / pseudo as needed.
+    /// Apply the descriptor's computed mask with ADD, MOD, DEL, or a pseudo
+    /// registration as needed.
     ///
-    /// epoll_ctl answers EPERM for a descriptor it cannot poll, and
-    /// "ready" is a true statement about every such descriptor: their I/O
-    /// never blocks. Those become PSEUDO registrations — tracked in the
-    /// map only and reported ready by every wait() — the same observable
-    /// behaviour kqueue gives natively (issue #4).
+    /// epoll_ctl returns EPERM for a descriptor it cannot poll. I/O on these
+    /// descriptors never blocks, so they become pseudo registrations tracked
+    /// only in the map and reported ready by every wait, matching kqueue's
+    /// observable behavior.
     ///
-    /// EPERM from the ADD is what classifies them, rather than an fstat
-    /// against a hand-maintained list of descriptor types: the kernel's
-    /// idea of what it cannot poll is the only authority that stays
-    /// correct, and it covers character devices and directories as well
-    /// as regular files. It also saves a syscall on the common path.
+    /// EPERM from ADD classifies these descriptors directly. The kernel is the
+    /// authority on what it cannot poll, covering character devices and
+    /// directories as well as regular files without a descriptor-type list or
+    /// an extra syscall.
     ///
-    /// The map slot is reserved BEFORE any kernel call so a successful
-    /// registration can never be lost to an allocation failure afterwards
-    /// (an untracked live registration turns the next apply() into a CTL_ADD
-    /// that hits EEXIST, stranding the fd). Any other failure — OOM before
-    /// the syscall, or an fstat/epoll_ctl rejection such as EBADF — is
-    /// stashed in pending_error and leaves the map mirroring reality.
+    /// The map slot is reserved before any kernel call so a successful
+    /// registration cannot be lost to a later allocation failure. An untracked
+    /// live registration would turn the next apply into a CTL_ADD that hits
+    /// EEXIST and strands the descriptor. Any other failure, whether allocation
+    /// failure before the syscall or an epoll_ctl rejection such as EBADF, is
+    /// stashed in pending_error.
     fn apply(self: *EvPort, fd: Handle, st: FdState) void {
         if (!st.read and !st.write) {
             if (self.fds.getPtr(fd)) |cur| {
@@ -354,14 +355,15 @@ pub const EvPort = struct {
 
     // ------------------------------------------------------------ wait ----
 
-    /// Harvest events in one epoll_wait. timeout_ms: null = block until an
-    /// event; 0 = harvest without blocking. A stashed registration failure
-    /// is reported here, once, ahead of the syscall — an empty wait neither
-    /// consumes nor reports it. Pseudo registrations (regular files) are
-    /// always ready: while any exist the syscall never blocks, and they
-    /// fill whatever space the kernel left. A ready internal source goes to
-    /// its kind's harvest, which may emit several events or none (wait()
-    /// can then return 0 before its timeout).
+    /// Harvest events in one epoll_wait call. `timeout_ms` must be null or
+    /// nonnegative. null blocks until an event, zero harvests without blocking,
+    /// and positive values wait that many milliseconds. A stashed registration
+    /// failure is reported here once, ahead of the syscall. An empty wait
+    /// neither consumes nor reports it. Pseudo registrations for unpollable
+    /// descriptors are always ready: while any exist the syscall never blocks,
+    /// and they fill whatever space the kernel left. A ready internal source
+    /// goes to its kind's harvest, which may emit several events or none, so
+    /// wait can return zero before its timeout.
     pub fn wait(self: *EvPort, events: []Event, timeout_ms: ?i32) WaitError!usize {
         if (events.len == 0) return 0;
         if (self.pending_error) |err| {
@@ -458,7 +460,7 @@ test "epoll: socket read readiness + ET edge semantics" {
     try std.testing.expect(events[0].readable);
     try std.testing.expect(events[0].udata == @as(?*anyopaque, &tag));
 
-    // ET: full drain → silence until a new edge.
+    // ET: full drain -> silence until a new edge.
     var buf: [4]u8 = undefined;
     while (true) {
         _ = std.posix.read(fds[0], &buf) catch |err| switch (err) {
@@ -490,7 +492,7 @@ test "epoll: write interest arms and disarms" {
     try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));
     try std.testing.expect(events[0].writable);
 
-    // Level-triggered: still armed — a second wait re-reports writability.
+    // Level-triggered: still armed, so a second wait re-reports writability.
     try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 0));
     // Disarm: silence.
     evp.cancelWrite(fds[1]);
@@ -534,7 +536,7 @@ test "epoll: wake posts a single coalesced event" {
     try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
 }
 
-test "epoll: regular file is an always-ready pseudo registration (issue #4)" {
+test "epoll: regular file is an always-ready pseudo registration" {
     const alloc = std.testing.allocator;
     var evp = try EvPort.init(alloc);
     defer evp.deinit();
@@ -575,7 +577,7 @@ test "epoll: regular file is an always-ready pseudo registration (issue #4)" {
     try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
 }
 
-test "epoll: unpollable descriptors other than regular files are pseudo too (issue #4)" {
+test "epoll: unpollable descriptors other than regular files are pseudo too" {
     // epoll_ctl answers EPERM for character devices and directories just as
     // it does for regular files. Classifying on EPERM rather than on a
     // descriptor-type test is what keeps these working: `prog < /dev/null`
@@ -601,13 +603,13 @@ test "epoll: unpollable descriptors other than regular files are pseudo too (iss
         try std.testing.expect(!events[0].err);
     }
 
-    // A directory opened for reading is refused the same way. (An O_PATH
-    // directory fd is refused with EBADF instead, and must therefore stay
-    // a hard error — which is exactly why the classification keys on EPERM
-    // and not on "epoll_ctl said no".)
+    // A directory opened for reading is refused the same way. An O_PATH
+    // directory fd is refused with EBADF instead and must remain a hard
+    // error, so classification keys on EPERM rather than treating every
+    // epoll_ctl rejection as unpollable.
     var evp = try EvPort.init(alloc);
     defer evp.deinit();
-    const dfd = try std.posix.open("/tmp", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+    const dfd = try std.posix.open(".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
     defer std.posix.close(dfd);
 
     var tag: u8 = 8;
@@ -618,7 +620,7 @@ test "epoll: unpollable descriptors other than regular files are pseudo too (iss
     try std.testing.expect(events[0].readable and !events[0].err);
 }
 
-test "epoll: rejected descriptor is reported by the next wait, never half-recorded (issue #4)" {
+test "epoll: rejected descriptor is reported by the next wait, never half-recorded" {
     const alloc = std.testing.allocator;
     var evp = try EvPort.init(alloc);
     defer evp.deinit();
@@ -635,8 +637,8 @@ test "epoll: rejected descriptor is reported by the next wait, never half-record
     var empty: [0]Event = .{};
     try std.testing.expectEqual(@as(usize, 0), try evp.wait(&empty, null));
     try std.testing.expectError(Error.RegisterFailed, evp.wait(&events, 0));
-    // Reported exactly once, and a retry reports the same rejection — no
-    // half-recorded state to trip over.
+    // Reported exactly once, and a retry reports the same rejection. There
+    // is no half-recorded state to trip over.
     try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
     evp.wantWrite(bogus, &tag);
     try std.testing.expectError(Error.RegisterFailed, evp.wait(&events, 0));

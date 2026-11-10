@@ -1,5 +1,4 @@
-//! Timers on kqueue (EVFILT_TIMER). Owned by born#12: this file plus the
-//! EvPort.addTimer/cancelTimer bodies in evport_kqueue.zig.
+//! Timers on kqueue (EVFILT_TIMER).
 //!
 //! Each timer is one EVFILT_TIMER knote: ident = id, data = after_ms in
 //! milliseconds, udata = the caller's. Changes go through `EvPort.stageRaw`
@@ -67,6 +66,7 @@ pub const State = struct {
     /// until `observe` sees a `.once` firing.
     live: std.AutoHashMapUnmanaged(u32, TimerMode) = .empty,
 
+    /// Returns state with no live timers.
     pub fn init(alloc: std.mem.Allocator) State {
         _ = alloc;
         return .{};

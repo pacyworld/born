@@ -1,6 +1,5 @@
-//! Signals on epoll: one signalfd per port. Owned by born#16: this file plus
-//! the EvPort.watchSignal/unwatchSignal bodies in evport_epoll.zig, and
-//! `blockSignals` (exported as `born.blockSignals`).
+//! Signals on epoll: one signalfd per port. `blockSignals` is exported as
+//! `born.blockSignals`.
 //!
 //! signalfd only sees signals blocked in every thread, so programs call
 //! `blockSignals` in `main` before spawning threads, and `watch` refuses a
@@ -28,12 +27,19 @@ const SignalSet = std.EnumSet(Signal);
 const signal_count = std.meta.fields(Signal).len;
 const Siginfo = linux.signalfd_siginfo;
 
+// POSIX permits a null oldset; Zig 0.15's std.c declaration does not.
+extern "c" fn pthread_sigmask(
+    how: c_int,
+    set: *const std.posix.sigset_t,
+    oldset: ?*std.posix.sigset_t,
+) c_int;
+
 /// Owning port id per signal, 0 when unwatched. Guarded by `owners_lock`
 /// because ports on different threads watch and unwatch concurrently.
 var owners = [_]u64{0} ** signal_count;
 var owners_lock: std.Thread.Mutex = .{};
 /// Source of port ids; an id survives the port value being moved.
-var next_id = std.atomic.Value(u64).init(1);
+var next_id: std.atomic.Value(u64) = .init(1);
 
 /// Per-port watch bookkeeping, a field of EvPort (`signals`).
 pub const State = struct {
@@ -41,9 +47,10 @@ pub const State = struct {
     fd: i32 = -1,
     /// Ownership id, assigned on the first watch.
     id: u64 = 0,
-    watched: SignalSet = .{},
+    watched: SignalSet = .initEmpty(),
     udata: [signal_count]?*anyopaque = .{null} ** signal_count,
 
+    /// Returns state with no watched signals or signalfd.
     pub fn init(alloc: std.mem.Allocator) State {
         _ = alloc;
         return .{};
@@ -54,7 +61,7 @@ pub const State = struct {
     pub fn deinit(self: *State, port: *EvPort) void {
         var it = self.watched.iterator();
         while (it.next()) |sig| release(self.id, sig);
-        self.watched = .{};
+        self.watched = .initEmpty();
         self.udata = .{null} ** signal_count;
         self.closeFd(port);
     }
@@ -147,7 +154,7 @@ pub fn harvest(port: *EvPort, out: []Event) usize {
     var narrowed = false;
     while (true) {
         if (n == out.len and n < watched_count and !narrowed) {
-            var emitted: SignalSet = .{};
+            var emitted: SignalSet = .initEmpty();
             for (out[0..n]) |ev| emitted.insert(ev.signal.?);
             const mask = kernelMask(emitted);
             if (linux.E.init(linux.signalfd(st.fd, &mask, 0)) != .SUCCESS) {
@@ -206,9 +213,8 @@ pub fn harvest(port: *EvPort, out: []Event) usize {
 pub fn blockSignals(sigs: []const Signal) SignalError!void {
     var set = std.posix.sigemptyset();
     for (sigs) |sig| std.posix.sigaddset(&set, sig.toPosix());
-    var old: std.posix.sigset_t = undefined;
     // pthread_sigmask fails only with EINVAL for an invalid `how`.
-    if (std.c.pthread_sigmask(std.posix.SIG.BLOCK, &set, &old) != 0)
+    if (pthread_sigmask(std.posix.SIG.BLOCK, &set, null) != 0)
         return SignalError.SystemResources;
 }
 
@@ -216,7 +222,7 @@ pub fn blockSignals(sigs: []const Signal) SignalError!void {
 fn blockedInThread(sig: Signal) SignalError!bool {
     const none = std.posix.sigemptyset();
     var cur: std.posix.sigset_t = undefined;
-    if (std.c.pthread_sigmask(std.posix.SIG.BLOCK, &none, &cur) != 0)
+    if (pthread_sigmask(std.posix.SIG.BLOCK, &none, &cur) != 0)
         return SignalError.SystemResources;
     return std.posix.sigismember(&cur, sig.toPosix());
 }
@@ -259,13 +265,12 @@ const MaskGuard = struct {
         var g: MaskGuard = undefined;
         var set_: std.posix.sigset_t = std.posix.sigemptyset();
         for (sigs) |sig| std.posix.sigaddset(&set_, sig.toPosix());
-        std.debug.assert(std.c.pthread_sigmask(@intCast(how), &set_, &g.saved) == 0);
+        std.debug.assert(pthread_sigmask(@intCast(how), &set_, &g.saved) == 0);
         return g;
     }
 
     fn restore(self: *const MaskGuard) void {
-        var ignored: std.posix.sigset_t = undefined;
-        std.debug.assert(std.c.pthread_sigmask(std.posix.SIG.SETMASK, &self.saved, &ignored) == 0);
+        std.debug.assert(pthread_sigmask(std.posix.SIG.SETMASK, &self.saved, null) == 0);
     }
 };
 
@@ -350,7 +355,7 @@ test "signal_epoll: a full buffer leaves other signals for the next wait" {
     try raiseInThread(.hangup);
     try raiseInThread(.user2);
 
-    var seen = SignalSet{};
+    var seen: SignalSet = .initEmpty();
     var one: [1]Event = undefined;
     for (0..2) |_| {
         try std.testing.expectEqual(@as(usize, 1), try port.wait(&one, 1000));

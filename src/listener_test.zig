@@ -1,6 +1,6 @@
-//! TCP listener contract (born 0.3.0). Every test calls the real API and
-//! skips while the backend returns error.Unsupported; a listener
-//! implementation issue is done when these run and pass on its OS.
+//! TCP listener contract tests. Real API calls cover accept draining,
+//! balanced listeners, pausing and resuming, teardown, and completion
+//! lifetime on each supported backend.
 
 const std = @import("std");
 const builtin = @import("builtin");

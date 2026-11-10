@@ -1,6 +1,5 @@
-//! Timer contract (born 0.3.0). Every test calls the real API and skips
-//! while the backend returns error.Unsupported; a timer implementation
-//! issue is done when these run and pass on its OS.
+//! Timer contract tests through the public API. Tests skip only when the
+//! selected backend reports error.Unsupported.
 
 const std = @import("std");
 const born = @import("root.zig");

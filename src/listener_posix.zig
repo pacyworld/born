@@ -1,17 +1,14 @@
-//! Listening stream sockets on POSIX (kqueue and epoll targets). Owned by
-//! born#18 (TCP: openTcp, register, acceptNb, localAddress, close) apart
-//! from `openUnix` and the `unix` field, which belong to born#20 in
-//! unix_posix.zig.
+//! Listening stream sockets for POSIX readiness event ports.
 //!
-//! Model: `register` adds persistent edge-triggered read interest on the
-//! listening fd; on each read event the consumer calls `acceptNb` until
+//! `register` adds persistent edge-triggered read interest on the listening
+//! descriptor. On each read event the consumer calls `acceptNb` until
 //! `.want_accept`. Accepted streams are ordinary `PlainNb` streams.
-//! `absorbCompletion` and `pendingOps` exist for the portable IOCP shape and
-//! are no-ops here.
+//! `absorbCompletion` and `pendingOps` preserve the portable IOCP-facing shape
+//! and are intentional no-ops here.
 //!
-//! `acceptNb`, `register`, `localAddress` and `close` act on `sock` alone,
-//! whatever its address family: a Unix listener is a `Listener` whose
-//! `sock` is a listening AF_UNIX stream socket, drained the same way.
+//! `acceptNb`, `register`, `localAddress`, and `close` act on `sock` alone,
+//! whatever its address family. A Unix listener has a listening AF_UNIX stream
+//! socket in `sock` and is drained the same way as TCP.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -39,6 +36,10 @@ const balanced_option: ?u32 = switch (builtin.os.tag) {
     else => null,
 };
 
+/// Non-blocking TCP and Unix domain stream listener for readiness event ports.
+///
+/// The listener owns its descriptor. Purge event-port registrations for that
+/// descriptor before calling `close`.
 pub const Listener = struct {
     sock: posix.fd_t = -1,
     /// Unix-socket state (e.g. the bound path), owned by unix_posix.zig.
@@ -205,6 +206,7 @@ pub const Listener = struct {
         }
     }
 
+    /// Returns the listening descriptor without transferring ownership.
     pub fn handle(self: *const Listener) types.Handle {
         return self.sock;
     }
@@ -237,6 +239,7 @@ fn linuxSkip(e: posix.E) bool {
 fn setAcceptFlags(fd: posix.fd_t) io.AcceptError!void {
     errdefer posix.close(fd);
     const fl = posix.fcntl(fd, posix.F.GETFL, 0) catch return io.AcceptError.SocketError;
-    _ = posix.fcntl(fd, posix.F.SETFL, fl | @as(usize, 1 << @bitOffsetOf(posix.O, "NONBLOCK"))) catch return io.AcceptError.SocketError;
+    const nonblock: u32 = @bitCast(@as(std.posix.O, .{ .NONBLOCK = true }));
+    _ = posix.fcntl(fd, posix.F.SETFL, fl | @as(usize, nonblock)) catch return io.AcceptError.SocketError;
     _ = posix.fcntl(fd, posix.F.SETFD, posix.FD_CLOEXEC) catch return io.AcceptError.SocketError;
 }

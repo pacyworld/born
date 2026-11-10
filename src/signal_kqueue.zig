@@ -1,5 +1,4 @@
-//! Signals on kqueue (EVFILT_SIGNAL). Owned by born#15: this file plus the
-//! EvPort.watchSignal/unwatchSignal bodies in evport_kqueue.zig.
+//! Signals on kqueue (EVFILT_SIGNAL).
 //!
 //! `watch` attaches EVFILT_SIGNAL (EV_ADD | EV_CLEAR) with one immediate,
 //! non-blocking kevent() call, then sets the disposition to SIG_IGN so the
@@ -13,7 +12,7 @@
 //! they are one-time setup calls, and a staged add would leave a gap until
 //! the next wait() in which an ignored signal is discarded with nothing
 //! recording it. Descriptor, timer and every hot-path registration stay
-//! staged. libevent's kqueue backend does the same (kq_sig_add, kq_sig_del).
+//! staged.
 //!
 //! Dispositions are process-wide, so is ownership: at most one port in the
 //! process watches a given signal. A second port gets error.SignalInUse
@@ -58,6 +57,7 @@ pub const State = struct {
     /// retries the removal.
     stale: std.EnumSet(Signal) = .initEmpty(),
 
+    /// Returns state with no watched or stale signals.
     pub fn init(alloc: std.mem.Allocator) State {
         _ = alloc;
         return .{};

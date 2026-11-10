@@ -1,7 +1,5 @@
-// POSIX non-blocking socket layer for the event core (issue #7):
-// EINPROGRESS connect, WouldBlock-mapped reads/writes, MSG_NOSIGNAL sends
-// (the bridge never takes SIGPIPE). The legacy blocking streams and
-// timeout plumbing retired with the serial core.
+//! POSIX non-blocking stream sockets use EINPROGRESS connects, WouldBlock-mapped
+//! reads and writes, and MSG_NOSIGNAL sends to avoid SIGPIPE.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -24,14 +22,14 @@ const MSG_NOSIGNAL: u32 = switch (builtin.os.tag) {
     else => std.posix.MSG.NOSIGNAL,
 };
 
-/// Non-blocking plaintext TCP stream for the event core.
+/// Plaintext stream socket (TCP and Unix where supported) for readiness I/O.
+///
+/// The stream owns its descriptor. Purge event-port registrations for that
+/// descriptor before closing it.
 pub const PlainNb = struct {
     sock: std.posix.fd_t = -1,
-    /// Latched connect outcome. SO_ERROR is READ-AND-CLEAR, so the second
-    /// getsockopt returns 0 and a refused connect would look like success.
-    /// Anything that reads it first — a second connectDone(), or a caller
-    /// doing its own getsockopt — must not be able to erase the verdict
-    /// (issue #8).
+    /// Latches a refusal observed by `connectDone` because SO_ERROR is
+    /// read-and-clear.
     connect_err: bool = false,
     /// Bytes the last readable event reported; see `hintReadable`.
     hint: io.ReadyHint = .{},
@@ -39,10 +37,15 @@ pub const PlainNb = struct {
     /// Every stream error; each method returns its own narrower set.
     pub const Error = io.IoError;
 
+    /// Returns the underlying descriptor without transferring ownership.
     pub fn handle(self: *const PlainNb) types.Handle {
         return self.sock;
     }
 
+    /// Resolves `host` and starts a non-blocking TCP connect in `self`.
+    /// `evp` and `key` are unused on POSIX. Register write interest after
+    /// success, then confirm the result with `connectDone`. `self` is left
+    /// untouched on failure.
     pub fn startConnectInto(self: *PlainNb, alloc: std.mem.Allocator, host: []const u8, port: u16, evp: *evport.EvPort, key: ?*anyopaque) io.ConnectError!void {
         std.debug.assert(self.sock == -1);
         _ = evp;
@@ -82,8 +85,8 @@ pub const PlainNb = struct {
     }
 
     /// Non-blocking connect to a Unix stream socket at `path`, completed
-    /// through the same wantWrite + connectDone contract as TCP. `self` is
-    /// left untouched on failure. Implemented in unix_posix.zig (born#20).
+    /// through the same write-readiness and `connectDone` contract as TCP.
+    /// `self` is left untouched on failure.
     pub fn startConnectUnixInto(self: *PlainNb, alloc: std.mem.Allocator, path: []const u8, evp: *evport.EvPort, key: ?*anyopaque) io.ConnectUnixError!void {
         return unix_posix.connectInto(self, alloc, path, evp, key);
     }
@@ -116,8 +119,8 @@ pub const PlainNb = struct {
     }
 
     /// socket(SOCK_NONBLOCK) + connect(). On success the fd is either in
-    /// EINPROGRESS state or instantly connected (loopback) — register write
-    /// interest and confirm with connectDone() on the first write event.
+    /// EINPROGRESS state or instantly connected (loopback): register write
+    /// interest and confirm with `connectDone` on the first write event.
     pub fn startConnect(alloc: std.mem.Allocator, host: []const u8, port: u16) io.ConnectError!PlainNb {
         const addr_list = std.net.getAddressList(alloc, host, port) catch |err| return switch (err) {
             error.OutOfMemory => io.ConnectError.OutOfMemory,
@@ -154,6 +157,8 @@ pub const PlainNb = struct {
         self.hint.arm(ev);
     }
 
+    /// Reads available bytes without blocking. Drain after each readable event
+    /// until `.want_read` or `.eof`; an empty buffer returns zero bytes.
     pub fn readNb(self: *PlainNb, out: []u8) io.ReadError!NbRead {
         if (self.sock < 0) return io.ReadError.SocketError;
         if (out.len == 0) return .{ .data = 0 };
@@ -173,14 +178,12 @@ pub const PlainNb = struct {
         return .{ .data = n };
     }
 
+    /// Writes as much as possible without blocking, returning `.done` or
+    /// `.want_write`. An empty write succeeds without a system call.
     pub fn writeNb(self: *PlainNb, data: []const u8) io.WriteError!NbWrite {
         if (self.sock < 0) return io.WriteError.SocketError;
-        // An empty write is a no-op, and must not reach send(2): Linux
-        // answers EFAULT for a zero-length buffer whose pointer is the
-        // dangling one an empty slice carries, and std.posix.send maps
-        // EFAULT to unreachable — a panic, not an error. readNb and the
-        // Windows backend already guard this; POSIX writeNb was the
-        // outlier.
+        // Do not pass an empty slice to send(2): on Linux its dangling pointer
+        // can produce EFAULT, which std.posix.send treats as unreachable.
         if (data.len == 0) return .{ .done = 0 };
         const n = std.posix.send(self.sock, data, MSG_NOSIGNAL) catch |err| switch (err) {
             error.WouldBlock => return .want_write,
@@ -189,6 +192,8 @@ pub const PlainNb = struct {
         return .{ .done = n };
     }
 
+    /// Intentionally returns `.unknown` without inspecting the completion;
+    /// POSIX readiness sockets have no overlapped operations to absorb.
     pub fn absorbCompletion(self: *PlainNb, ov: ?*std.os.windows.OVERLAPPED, bytes: usize, err: ?usize) io.CompletionKind {
         _ = self;
         _ = ov;
@@ -197,19 +202,25 @@ pub const PlainNb = struct {
         return .unknown;
     }
 
+    /// Always returns zero because POSIX streams have no completions to drain.
     pub fn pendingOps(self: *const PlainNb) usize {
         _ = self;
         return 0;
     }
 
+    /// Closes the socket immediately, equivalent to `deinit` on POSIX. Call
+    /// `EvPort.purgeFd(handle())` first to remove staged registrations.
     pub fn cancelAndClose(self: *PlainNb) void {
         self.deinit();
     }
 
+    /// Intentionally does nothing; POSIX close requires no completion notice.
     pub fn closeNotify(self: *PlainNb) void {
         _ = self;
     }
 
+    /// Closes the descriptor if open and marks the socket closed. Call
+    /// `EvPort.purgeFd(handle())` first; no completion drain is required.
     pub fn deinit(self: *PlainNb) void {
         if (self.sock >= 0) std.posix.close(self.sock);
         self.sock = -1;
