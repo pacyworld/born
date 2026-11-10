@@ -71,6 +71,11 @@ jobs:
       - name: Compile tests for all seven supported targets
         run: zig build check-targets --summary all
 
+      - name: Generate API documentation
+        run: |
+          zig build docs --summary all
+          test -f zig-out/docs/index.html
+
       - name: Build Linux runtime test executable
         run: |
           zig build test-bin -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe --prefix zig-out/linux --summary all

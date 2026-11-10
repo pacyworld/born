@@ -1,6 +1,5 @@
-//! Signal contract (born 0.3.0). Every test calls the real API and skips
-//! while the backend returns error.Unsupported; a signal implementation
-//! issue is done when these run and pass on its OS.
+//! Signal contract tests through the public API. Tests skip only when the
+//! selected backend or test environment cannot support the operation.
 
 const std = @import("std");
 const builtin = @import("builtin");

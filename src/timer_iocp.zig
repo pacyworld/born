@@ -1,6 +1,5 @@
 //! Timers on IOCP: one thread-pool timer per port plus the deadline heap
-//! (timer_heap.zig). Owned by born#14: this file plus the
-//! EvPort.addTimer/cancelTimer bodies in evport_iocp.zig.
+//! (timer_heap.zig).
 //!
 //! Deadlines live in the heap, on the QueryPerformanceCounter clock
 //! (`timer_heap.nowNs`). The first `add` creates the port's thread-pool
@@ -27,7 +26,7 @@
 //! its first `addTimer` until `deinit`. `add` and `harvest` panic if it did.
 //! `State.deinit`, which EvPort.deinit calls before the port handle closes,
 //! stops the timer and waits for running callbacks, so no post can race
-//! CloseHandle (the #5 lifetime rule).
+//! CloseHandle.
 
 const std = @import("std");
 const windows = std.os.windows;
@@ -101,6 +100,7 @@ pub const State = struct {
     /// A repost completion is queued and not yet harvested.
     reposted: bool = false,
 
+    /// Returns state that allocates its deadline heap with `alloc`.
     pub fn init(alloc: std.mem.Allocator) State {
         return .{ .alloc = alloc };
     }

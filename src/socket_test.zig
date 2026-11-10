@@ -19,8 +19,7 @@ const Pair = struct {
     connected: bool = false,
     /// Set by the refusal test. epoll reports a refused connect as
     /// EPOLLOUT|EPOLLERR|EPOLLHUP, so Event.err is legitimately set there;
-    /// kqueue reports EV_EOF without EV_ERROR. The blanket !event.err
-    /// assertion below is a kqueue-shaped assumption (issue #8).
+    /// kqueue reports EV_EOF without EV_ERROR.
     expect_connect_err: bool = false,
 
     fn init(self: *Pair) !void {
@@ -68,7 +67,7 @@ const Pair = struct {
         try std.testing.expectEqual(@as(usize, 0), self.client.pendingOps());
         try self.client.connectDone();
         if (is_windows) {
-            try std.testing.expectEqual(@as(c_int, 0), windows.ws2_32.setsockopt(self.peer.sock, windows.ws2_32.SOL.SOCKET, 0x700b, @ptrCast(&self.server.?.stream.handle), @sizeOf(windows.ws2_32.SOCKET)));
+            try std.testing.expectEqual(@as(c_int, 0), windows.ws2_32.setsockopt(self.peer.sock, windows.ws2_32.SOL.SOCKET, windows.ws2_32.SO.UPDATE_ACCEPT_CONTEXT, @ptrCast(&self.server.?.stream.handle), @sizeOf(windows.ws2_32.SOCKET)));
             try self.port.associate(self.peer.handle(), &self.peer);
         } else {
             if (comptime builtin.os.tag.isDarwin()) {
@@ -87,7 +86,7 @@ const Pair = struct {
         var accept_ex: ?AcceptEx = null;
         var bytes: u32 = 0;
         const listener = self.server.?.stream.handle;
-        try std.testing.expectEqual(@as(c_int, 0), ws2.WSAIoctl(listener, 0xc8000006, &guid, @sizeOf(windows.GUID), @ptrCast(&accept_ex), @sizeOf(?AcceptEx), &bytes, null, null));
+        try std.testing.expectEqual(@as(c_int, 0), ws2.WSAIoctl(listener, ws2.SIO_GET_EXTENSION_FUNCTION_POINTER, &guid, @sizeOf(windows.GUID), @ptrCast(&accept_ex), @sizeOf(?AcceptEx), &bytes, null, null));
         self.peer.sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.TCP);
         try self.port.associate(@ptrCast(listener), self);
         const rc = accept_ex.?(listener, self.peer.sock, &self.accept_buf, 0, self.accept_buf.len / 2, self.accept_buf.len / 2, &bytes, &self.accept_ov);
@@ -218,6 +217,19 @@ test "plain socket has the same companion API on every target" {
     try std.testing.expect(socket.WriteError == error{SocketError});
     try std.testing.expect(socket.ConnectDoneError == error{ ConnectFailed, SocketError });
     try std.testing.expect(socket.ConnectError == error{ ConnectFailed, SocketError, OutOfMemory });
+    try std.testing.expect(socket.ConnectUnixError == error{
+        Unsupported,
+        NameTooLong,
+        BacklogFull,
+        ConnectFailed,
+        SocketError,
+    });
+    try std.testing.expect(socket.IoError == (socket.ConnectError ||
+        socket.ConnectUnixError ||
+        socket.AcceptError ||
+        socket.ConnectDoneError ||
+        socket.ReadError ||
+        socket.WriteError));
     try std.testing.expect(PlainNb.Error == socket.IoError);
     try std.testing.expect(@TypeOf(PlainNb.absorbCompletion) == fn (*PlainNb, ?*windows.OVERLAPPED, usize, ?usize) socket.CompletionKind);
     try std.testing.expect(@TypeOf(PlainNb.pendingOps) == fn (*const PlainNb) usize);

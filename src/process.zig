@@ -6,35 +6,38 @@
 //!            probed at spawn (CLONE_PIDFD is 5.2, waitid(P_PIDFD) is 5.4)
 //!   others   error.Unsupported
 //!
-//! `spawn` allocates nothing: argv, envp and the descriptor map are ready
-//! before the fork, and between fork and execve the child makes only
-//! async-signal-safe calls (libc calls after libthr's pdfork on FreeBSD, raw
-//! syscalls after a raw clone on Linux). On FreeBSD libthr runs the
-//! program's pthread_atfork handlers around pdfork, so any handler must
-//! obey the same rule; born registers none. A multi-threaded caller is
-//! safe. The child:
-//!   - starts with every signal at its default disposition and an empty
-//!     signal mask, whatever the parent ignores, handles or blocks;
+//! `spawn` allocates nothing on its success path: argv, envp and the
+//! descriptor map are ready before the fork, and between fork and execve the
+//! child makes only async-signal-safe calls (libc calls after libthr's pdfork
+//! on FreeBSD, raw syscalls after a raw clone on Linux). On FreeBSD libthr runs
+//! the program's pthread_atfork handlers around pdfork, so any handler must
+//! obey the same rule; born registers none. A multi-threaded caller is safe.
+//! The child:
+//!   - resets signals to their default dispositions, except FreeBSD
+//!     libthr-reserved signals such as SIGTHR, and starts with an empty signal
+//!     mask, whatever the parent ignores, handles or blocks;
 //!   - gets `stdin`, `stdout`, `stderr` as asked and `fds[i]` as fd 3 + i;
 //!   - has every other descriptor closed before execve.
 //! A close-on-exec pipe carries a setup or execve failure back, so `spawn`
-//! returns it as an error and reaps the failed child. `spawn` therefore
-//! returns once the child has called execve, as posix_spawn does.
+//! returns it as an error and cleans up the failed child, possibly
+//! asynchronously as described below. On success, `spawn` returns once the
+//! child has called execve, as posix_spawn does.
 //!
 //! Lifetime and reaping:
-//!   - FreeBSD: the kernel keeps the exited child as a zombie until
-//!     `Child.close` closes the descriptor, which reaps it. Closing the
-//!     descriptor of a running child kills it with SIGKILL and leaves the
-//!     reaping to its reaper (init), without waiting. A pdfork child sends
-//!     no SIGCHLD and is invisible to wait(2) for any child.
+//!   - FreeBSD: unless another caller reaps with pdwait/wait6, the kernel
+//!     keeps the exited child as a zombie until the last process descriptor
+//!     closes. That close reaps an exited child; if the child is running, it
+//!     sends SIGKILL and leaves the reaping to init without waiting. A pdfork
+//!     child sends no SIGCHLD and is invisible to wait(2) for any child.
 //!   - Linux: the wait() that reports a watched child's exit reaps it.
-//!     `Child.close` reaps a child that was never reported and never blocks
-//!     the caller: an exited child is collected on the spot, a running one
-//!     gets SIGKILL and its pidfd goes to a lazily spawned background
-//!     reaper thread (only an allocation failure there degrades to a
-//!     blocking reap). The parent gets SIGCHLD as usual, and a wait(2) for
-//!     any child elsewhere in the program can steal the status (the exit
-//!     event then arrives with `err` set).
+//!     `Child.close` cleans up a child that was never reported: an exited
+//!     child is collected on the spot, a running one gets SIGKILL, and one
+//!     still exiting after a nonblocking wait has its pidfd handed to a
+//!     lazily spawned background reaper thread without waiting for the exit.
+//!     If spawning that thread or queueing the pidfd fails, close instead
+//!     performs a blocking reap. The parent gets SIGCHLD as usual, and a
+//!     wait(2) for any child elsewhere in the program can steal the status
+//!     (the exit event then arrives with `err` set).
 //! Event-loop code should still `kill`, wait for the exit event, then
 //! `purgeFd` and `close`, which keeps every reap on the spot.
 
@@ -44,10 +47,11 @@ const types = @import("types.zig");
 const Handle = types.Handle;
 
 const os = builtin.os.tag;
-/// Process descriptors exist on this target (FreeBSD and Linux).
+/// Compile-time target support for process descriptors (FreeBSD and Linux).
+/// Linux kernels older than 5.4 still fail `spawn` with error.Unsupported.
 pub const supported = os == .freebsd or os == .linux;
 
-/// Most caller handles `SpawnOptions.fds` may map.
+/// Maximum number of caller handles `SpawnOptions.fds` may map.
 pub const max_fds = 64;
 
 /// What a child's standard descriptor is.
@@ -61,7 +65,8 @@ pub const Stdio = union(enum) {
 };
 
 /// Spawn-time options; the module comment describes the child's starting
-/// state. All fields default to inheriting the parent.
+/// state. By default the program comes from argv[0], standard descriptors
+/// inherit the parent's, and `fds` is empty.
 pub const SpawnOptions = struct {
     /// Program to execute; argv[0] when null. No PATH search.
     path: ?[*:0]const u8 = null,
@@ -103,14 +108,18 @@ pub const SpawnError = error{
 
 /// `Child.kill`.
 pub const KillError = error{
+    /// Process signaling is unavailable on this target or kernel.
     Unsupported,
-    /// Linux: the child has been reaped (its exit was reported or `close`
-    /// ran). FreeBSD keeps an exited child signalable, a no-op, until its
-    /// descriptor is closed, so there a signal after the exit succeeds.
+    /// Linux: the child has already been reaped by Born's exit reporting or
+    /// close, or by a wait elsewhere in the program. FreeBSD keeps an exited
+    /// child signalable, a no-op, until its descriptor is closed, so there a
+    /// signal after the exit succeeds.
     Exited,
+    /// The signal number is outside the native valid range.
     InvalidSignal,
     /// The handle is not open or not a process descriptor.
     BadHandle,
+    /// The kernel refused to signal the child, normally for lack of permission.
     AccessDenied,
 };
 
@@ -120,6 +129,7 @@ pub const Child = struct {
     /// Process descriptor (FreeBSD) or pidfd (Linux); pass it to
     /// `EvPort.watchProcess`. Close-on-exec in the parent.
     handle: Handle,
+    /// Native process ID returned by pdfork or clone, not the watch handle.
     pid: i32,
 
     /// Sends signal number `sig` (`std.posix.SIG`) through the descriptor,
@@ -140,8 +150,8 @@ pub const Child = struct {
 };
 
 /// Starts `path` (or argv[0]) with `argv` and `envp` and returns its
-/// descriptor. Returns after the child has called execve; see the module
-/// comment for the child's starting state.
+/// descriptor. On success, returns after the child has called execve; see the
+/// module comment for the child's starting state and failure cleanup.
 pub fn spawn(
     argv: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
@@ -153,7 +163,7 @@ pub fn spawn(
 
 // ----------------------------------------------------------- shared ----
 
-/// Child setup stages a failure report names.
+/// Stages named in a child setup or exec failure report.
 const Stage = enum(u32) { setup = 1, exec = 2 };
 
 /// What the child writes to the error pipe before exiting with 127.
@@ -464,11 +474,11 @@ const linux_impl = struct {
         };
     }
 
-    /// SIGKILL (ESRCH once the child has exited), then reap without
+    /// SIGKILL (ESRCH once the child has exited), then try to reap without
     /// waiting on the caller: a collected status reaps here, an already
     /// reaped child is ECHILD, and a child that still runs goes to the
-    /// reaper thread. Only an allocation failure in `reaper.take` degrades
-    /// to a blocking reap.
+    /// reaper thread. Failure to spawn that thread or queue the pidfd in
+    /// `reaper.take` falls back to a blocking reap.
     fn close(fd: i32) void {
         _ = linux.pidfd_send_signal(fd, linux.SIG.KILL, null, 0);
         var info: linux.siginfo_t = undefined;
@@ -490,16 +500,18 @@ const linux_impl = struct {
         _ = std.c.close(fd);
     }
 
-    /// A lazily spawned thread that reaps children whose pidfds a caller
-    /// closed while they still ran: close never blocks a loop thread. The
-    /// list is protected by the mutex; page_allocator is thread-safe.
+    /// A lazily spawned detached thread that reaps children whose pidfds a
+    /// caller closed while they still ran. Close normally avoids blocking a
+    /// loop thread; failure to spawn the thread or queue a pidfd falls back
+    /// to a blocking reap in the caller. The list is protected by the mutex;
+    /// page_allocator is thread-safe.
     /// Known limitation (#52): pidfds are reaped oldest-first with a
     /// blocking waitid, so a child whose exit stalls (D-state, a large
     /// exit_mmap) delays later entries until it finishes.
     const reaper = struct {
         var lock: std.Thread.Mutex = .{};
         var ready: std.Thread.Condition = .{};
-        var pending: std.ArrayListUnmanaged(i32) = .empty;
+        var pending: std.ArrayList(i32) = .empty;
         var started = false;
         /// Pid of the process the running thread belongs to; a fork keeps
         /// `started` but not the thread.

@@ -40,6 +40,17 @@ pub fn build(b: *std.Build) void {
     const install_tests = b.addInstallArtifact(tests, .{});
     b.step("test-bin", "Install the selected target's test executable without running it").dependOn(&install_tests.step);
 
+    const docs_obj = b.addObject(.{
+        .name = "born-docs",
+        .root_module = mod,
+    });
+    const install_docs = b.addInstallDirectory(.{
+        .source_dir = docs_obj.getEmittedDocs(),
+        .install_dir = .prefix,
+        .install_subdir = "docs",
+    });
+    b.step("docs", "Generate API documentation").dependOn(&install_docs.step);
+
     // On request only (never part of test, test-bin or check-targets): the
     // kqueue hot-path benchmark, installed as zig-out/bin/born-bench. Method
     // and driver: bench/README.md and bench/run.sh.
@@ -52,8 +63,8 @@ pub fn build(b: *std.Build) void {
     const bench_exe = b.addExecutable(.{ .name = "born-bench", .root_module = bench_mod });
     b.step("bench", "Build the born-bench benchmark (bench/README.md)").dependOn(&b.addInstallArtifact(bench_exe, .{}).step);
 
-    // Compile-only proof that every claimed platform still builds. Nothing is
-    // run; the binaries are discarded.
+    // Compile-only proof that every claimed platform still builds. No test
+    // binary is emitted or run.
     const check = b.step("check-targets", "Cross-compile every supported platform");
     for (supported_targets) |triple| {
         const q = std.Build.parseTargetQuery(.{ .arch_os_abi = triple }) catch @panic("bad triple");

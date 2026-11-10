@@ -1,40 +1,38 @@
-// BSD/macOS event port: kqueue backend.
-//
-// Global-rule discipline:
-//   - Staged changelist: monitor*/unmonitor* accumulate struct kevent into a
-//     local array; the next wait() submits changelist + eventlist in ONE
-//     kevent() call. No kevent() call exists solely to register fds.
-//   - A kernel-rejected change comes back at wait() as Event{ .err, .err_no }.
-//     An ALLOCATION failure never reaches the kernel, so it is stashed and
-//     returned as error.OutOfMemory from the next non-empty wait() instead
-//     (the IOCP backend's shape) — no failure is a silent drop.
-//   - EV_CLEAR (edge-triggered) on EVFILT_READ: read handlers must fully
-//     drain buffered data (plain: read to EAGAIN; TLS: SSL_read to
-//     WANT_READ, which implies the socket hit EAGAIN).
-//   - EV_ONESHOT on EVFILT_WRITE: connect completion and buffer-space
-//     events are single-shot; the connection re-arms on demand.
-//   - Cross-thread wakeup: EVFILT_USER on FreeBSD and macOS (EV_CLEAR, one
-//     knote registered by init with an immediate kevent(), which is one-time
-//     setup like the signal watch, so a wake() from another thread before
-//     the first wait() finds it). wake() is NOTE_TRIGGER through a kevent()
-//     with no eventlist: a cross-thread trigger, not a registration, so the
-//     staging rule does not apply. Triggers coalesce into one event. NetBSD
-//     and OpenBSD have no EVFILT_USER and keep the pipe trick (wake()
-//     writes 1 byte; wait() drains to one event). EVFILT_SIGNAL is not a
-//     wake channel.
-//   - Closing fds need no unmonitoring: close(2) removes all filters. The
-//     core defers close() until just after a wait() flush so staged entries
-//     never reference a closed (and possibly recycled) fd.
-//   - Timers (timer_kqueue.zig) register through stageRaw like any other
-//     change. The one exception: signal watch/unwatch (signal_kqueue.zig)
-//     are one-time setup calls that apply their change with an immediate
-//     kevent(), so no delivery is lost before the next wait(). wait()
-//     translates EVFILT_TIMER and EVFILT_SIGNAL into
-//     Event.timer/.signal/.fired after each module's observe() hook has
-//     seen the kevent.
-//   - Process exits (process_kqueue.zig, FreeBSD): EVFILT_PROCDESC knotes
-//     are staged like descriptor changes and translate into
-//     Event.exited/.exit. purgeFd drops their staged changes too.
+//! BSD and macOS event port backed by kqueue.
+//!
+//! Descriptor interest changes use a staged changelist. The next wait submits
+//! the accumulated `Kevent` values and the eventlist in one kevent call.
+//! A kernel-rejected change is returned as an error event. An allocation
+//! failure never reaches the kernel, so it is stashed and returned as
+//! error.OutOfMemory from the next non-empty wait instead of being silently
+//! dropped.
+//!
+//! Read interest uses EV_CLEAR and is edge-triggered. Read handlers must fully
+//! drain buffered data: plain reads continue to EAGAIN, and TLS reads continue
+//! to WANT_READ, which implies the socket reached EAGAIN. Write interest uses
+//! EV_ONESHOT for connect completion and buffer-space events; the connection
+//! re-arms it on demand.
+//!
+//! Cross-thread wakeup uses EVFILT_USER on FreeBSD and macOS. Initialization
+//! registers the wake knote immediately so a wake from another thread before
+//! the first wait is not lost. wake triggers it with NOTE_TRIGGER through a
+//! kevent call with no eventlist; triggers coalesce into one event. NetBSD and
+//! OpenBSD use a nonblocking pipe instead: wake writes one byte and wait drains
+//! the pipe to one event. EVFILT_SIGNAL is not a wake channel.
+//!
+//! Closing a descriptor removes its live filters. At the end-of-batch reap
+//! point, callers use purgeFd before close so staged entries cannot apply to
+//! a recycled descriptor number.
+//!
+//! Timers register through stageRaw like other staged changes. Signal watch
+//! and unwatch operations apply their changes immediately so no delivery is
+//! lost while the signal disposition changes. wait translates timer and signal
+//! kevents into Event.timer, Event.signal, and Event.fired after each owning
+//! module's observe hook has seen the kevent.
+//!
+//! FreeBSD process watches use EVFILT_PROCDESC, staged like descriptor changes
+//! and translated into Event.exited and Event.exit. purgeFd removes their
+//! staged changes too. Other kqueue targets report error.Unsupported.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -98,18 +96,21 @@ pub const InitError = error{ KqueueFailed, PipeFailed };
 pub const WaitError = error{ WaitFailed, OutOfMemory };
 pub const TimerError = types.TimerError;
 pub const SignalError = types.SignalError;
+/// Errors returned by process-watch operations.
 pub const ProcessError = types.ProcessError;
 /// Every error this backend can return.
 pub const Error = InitError || WaitError || TimerError || SignalError || ProcessError;
 
-/// Block `sigs` in the calling thread so a signal-watching port can receive
-/// them. Call it in `main` before spawning threads; see signal_kqueue.zig.
+/// No-op on kqueue: watched signals are recorded by EVFILT_SIGNAL without
+/// being blocked in the calling thread. Portable callers invoke this before
+/// spawning threads because epoll requires blocked signals.
 pub const blockSignals = signal_kqueue.blockSignals;
 
 /// Stable address used as the wake source's udata tag (module-level so a
 /// by-value EvPort return never leaves it dangling).
 var wake_sentinel: u8 = 0;
 
+/// A kqueue event port with staged descriptor, timer, and signal registrations.
 pub const EvPort = struct {
     kq: c_int = -1,
     alloc: std.mem.Allocator,
@@ -136,6 +137,7 @@ pub const EvPort = struct {
     /// Process-watch bookkeeping, owned by process_kqueue.zig.
     processes: process_kqueue.State = .{},
 
+    /// Create a kqueue and its wake source, using `alloc` for port bookkeeping.
     pub fn init(alloc: std.mem.Allocator) InitError!EvPort {
         const kq = std.posix.kqueue() catch return InitError.KqueueFailed;
         errdefer _ = std.c.close(kq);
@@ -178,6 +180,9 @@ pub const EvPort = struct {
         }
     }
 
+    /// Restore signal state and release port-owned descriptors and bookkeeping.
+    /// Caller-owned `Child.handle` values stay open, and child lifetime and
+    /// final reaping remain the caller's responsibility.
     pub fn deinit(self: *EvPort) void {
         // Signal dispositions are process-wide: restore them while the
         // port can still describe what it changed.
@@ -296,9 +301,11 @@ pub const EvPort = struct {
         signal_kqueue.unwatch(self, sig);
     }
 
-    /// Deliver the exit of the process behind `handle` (a process
-    /// descriptor) as Event.exited, staged into the next wait(). FreeBSD
-    /// only; see process_kqueue.zig.
+    /// Deliver one exit event for the child behind `handle`, a FreeBSD process
+    /// descriptor, staged into the next non-empty `wait()`. Invalid negative
+    /// handles and allocation failures are immediate call errors; ordinary
+    /// kernel refusals arrive as `Event.err` with native `err_no`, `exited=false`,
+    /// and `exit=null`. Exit delivery ends the watch but does not reap the child.
     pub fn watchProcess(self: *EvPort, handle: Handle, udata: ?*anyopaque) ProcessError!void {
         return process_kqueue.watch(self, handle, udata);
     }
@@ -322,10 +329,11 @@ pub const EvPort = struct {
         };
     }
 
-    /// Flush the staged changelist and harvest events in ONE kevent() call.
-    /// timeout_ms: null = block until an event; 0 = harvest without blocking.
-    /// A stashed allocation failure is reported here, once, ahead of the
-    /// syscall — an empty wait neither consumes nor reports it.
+    /// Flush the staged changelist and harvest events in one kevent call.
+    /// `timeout_ms` must be null or nonnegative. null blocks until an event,
+    /// zero harvests without blocking, and positive values wait that many
+    /// milliseconds. A stashed allocation failure is reported here once,
+    /// ahead of the syscall. An empty wait neither consumes nor reports it.
     pub fn wait(self: *EvPort, events: []Event, timeout_ms: ?i32) WaitError!usize {
         if (events.len == 0) return 0;
         if (self.pending_error) |err| {
@@ -343,7 +351,7 @@ pub const EvPort = struct {
             tsp = &ts;
         }
 
-        const n = if (@import("builtin").os.tag == .netbsd)
+        const n = if (builtin.os.tag == .netbsd)
             netbsd.__kevent50(self.kq, self.changes.items.ptr, self.changes.items.len, &kbuf, cap, tsp)
         else
             std.c.kevent(self.kq, self.changes.items.ptr, @intCast(self.changes.items.len), &kbuf, @intCast(cap), tsp);
@@ -445,7 +453,7 @@ pub const EvPort = struct {
 // --------------------------------------------------------------- tests ----
 
 test "kqueue: target-native layout and change encoding" {
-    const os = @import("builtin").os.tag;
+    const os = builtin.os.tag;
     try std.testing.expect(Kevent == std.posix.Kevent);
     const expected_size: usize = switch (os) {
         .freebsd => 64,
@@ -509,7 +517,7 @@ test "kqueue: registration error survives empty wait with errno payload" {
     try std.testing.expect(events[0].err);
     try std.testing.expectEqual(@as(usize, @intFromEnum(std.posix.E.BADF)), events[0].err_no);
     try std.testing.expect(events[0].udata == @as(?*anyopaque, &tag));
-    // A failed registration is not readiness (issue #4 addendum).
+    // A failed registration is not readiness.
     try std.testing.expect(!events[0].readable);
     try std.testing.expect(!events[0].writable);
 }
@@ -558,7 +566,7 @@ test "kqueue: socket read readiness + EV_CLEAR edge semantics" {
     try std.testing.expect(events[0].udata == @as(?*anyopaque, &tag));
 
     // The EV_CLEAR contract the core relies on: a handler that fully drains
-    // (read to EAGAIN) gets exactly-once delivery per edge — no re-fire
+    // (read to EAGAIN) gets exactly-once delivery per edge, with no re-fire
     // until new data arrives.
     var buf: [4]u8 = undefined;
     while (true) {
@@ -730,7 +738,7 @@ test "kqueue: timer and signal kevents translate to their event fields" {
     const unknown = EvPort.translate(EvPort.change(std.posix.SIG.WINCH, EVFILT_SIGNAL, EV_ADD, &tag));
     try std.testing.expect(unknown.err and unknown.signal == null);
 
-    // Descriptor events leave the new fields inert.
+    // Descriptor events leave the timer and signal fields inert.
     const read = EvPort.translate(EvPort.change(5, EVFILT_READ, EV_ADD, &tag));
     try std.testing.expect(read.readable and !read.timer and read.signal == null);
     try std.testing.expectEqual(@as(u32, 0), read.fired);

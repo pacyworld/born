@@ -93,7 +93,7 @@ test "reactor interest methods execute with native handles" {
     }
 }
 
-test "regular file registration behaves identically on every POSIX backend (issue #4)" {
+test "regular file registration behaves identically on every POSIX backend" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var port = try backend.EvPort.init(std.testing.allocator);
     defer port.deinit();

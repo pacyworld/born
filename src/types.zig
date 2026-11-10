@@ -1,15 +1,21 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+/// Platform-native descriptor: a Windows `HANDLE` or a POSIX file descriptor.
 pub const Handle = if (builtin.os.tag == .windows) std.os.windows.HANDLE else std.posix.fd_t;
 
 /// Signals a port can watch (`EvPort.watchSignal`). Windows maps console
 /// control events onto `interrupt` and `terminate` only.
 pub const Signal = enum {
+    /// Interactive interrupt, such as Ctrl+C or `SIGINT`.
     interrupt,
+    /// Termination request, such as `SIGTERM` or a Windows console close event.
     terminate,
+    /// Terminal hangup (`SIGHUP`) on POSIX.
     hangup,
+    /// Application-defined signal 1 (`SIGUSR1`) on POSIX.
     user1,
+    /// Application-defined signal 2 (`SIGUSR2`) on POSIX.
     user2,
 
     /// Native signal number. POSIX targets only.
@@ -34,8 +40,13 @@ pub const Signal = enum {
     }
 };
 
-/// `EvPort.addTimer` mode. `.repeat` re-fires every `after_ms`.
-pub const TimerMode = enum { once, repeat };
+/// `EvPort.addTimer` mode.
+pub const TimerMode = enum {
+    /// Fire once, then remove the timer.
+    once,
+    /// Fire repeatedly every `after_ms` until cancelled.
+    repeat,
+};
 
 /// `EvPort.addTimer`, the same on every backend.
 pub const TimerError = error{
@@ -45,6 +56,7 @@ pub const TimerError = error{
     InvalidArgument,
     /// The kernel refused a timer resource (timerfd, thread-pool timer).
     SystemResources,
+    /// Timer bookkeeping allocation failed.
     OutOfMemory,
 };
 
@@ -59,6 +71,7 @@ pub const SignalError = error{
     SignalNotBlocked,
     /// The kernel refused a signal resource (signalfd, console handler).
     SystemResources,
+    /// Signal bookkeeping allocation failed.
     OutOfMemory,
 };
 
@@ -66,13 +79,15 @@ pub const SignalError = error{
 pub const ProcessError = error{
     /// Process watches are not available on this backend or target.
     Unsupported,
-    /// The handle is not open, or not a process descriptor (pidfd): both
-    /// backends refuse a negative handle at watch time, and on epoll a
-    /// probe also refuses other pollable descriptors. On kqueue a surviving
-    /// kernel refusal is reported from wait() as Event.err.
+    /// The handle is not open or not a process descriptor. Supported FreeBSD
+    /// and epoll paths reject negative handles immediately; epoll also rejects
+    /// non-pidfds with a signal-0 probe. An ordinary FreeBSD kernel refusal is
+    /// deferred to `wait()` as `err=true`, native `err_no`, `exited=false`,
+    /// and `exit=null`, ending that watch.
     BadHandle,
     /// The kernel refused a watch resource (the epoll process set).
     SystemResources,
+    /// Process-watch bookkeeping allocation failed.
     OutOfMemory,
 };
 
@@ -93,32 +108,42 @@ pub const ProcessExit = union(enum) {
     }
 };
 
+/// Notification harvested by `EvPort.wait` on every backend.
 pub const Event = struct {
+    /// Caller token supplied at registration or post time, if any.
     udata: ?*anyopaque = null,
-    readable: bool = false, // unused on IOCP (the conn classifies)
-    writable: bool = false, // unused on IOCP
+    /// POSIX read readiness. Always false for raw IOCP completions.
+    readable: bool = false,
+    /// POSIX write readiness. Always false for raw IOCP completions.
+    writable: bool = false,
+    /// The native source reported end-of-stream or an equivalent hangup.
     eof: bool = false,
+    /// A native error or registration rejection was reported.
     err: bool = false,
-    /// EV_ERROR payload (errno) when err is set on kqueue.
-    err_no: usize = 0, // NTSTATUS from the completion's Internal field on IOCP
+    /// Optional native error payload: kqueue errno for a rejected change,
+    /// epoll `waitid` errno for a process-harvest failure, or IOCP NTSTATUS
+    /// from the completion's `Internal` field. Zero when no payload is
+    /// available, including epoll readiness errors.
+    err_no: usize = 0,
+    /// Cross-thread wakeup requested through `wake()` or an IOCP wake post.
     wake: bool = false,
-    /// Which operation completed (conn classifies by address). Null when
-    /// the completion carries no op (relay posts), or on POSIX.
+    /// Which operation completed (the companion classifies by address). Null
+    /// for relay posts without an operation and on POSIX.
     overlapped: ?*std.os.windows.OVERLAPPED = null,
+    /// Byte count supplied by an IOCP completion or post; zero on POSIX.
     bytes: usize = 0,
     /// A timer fired; `udata` is the timer's.
     timer: bool = false,
     /// A watched signal arrived; `udata` is the watch's.
     signal: ?Signal = null,
-    /// Timer expirations or signal deliveries coalesced into this event
-    /// (kqueue `data`, timerfd count, signalfd count; 1 on IOCP). Zero
-    /// for every other event.
+    /// Number of timer expirations or watched signal deliveries represented
+    /// by this event. Zero for every other event.
     fired: u32 = 0,
-    /// Readiness count the kernel attached to a readable event: bytes
-    /// buffered on a stream, connections queued on a listener (kqueue
-    /// `data` of EVFILT_READ). 0 means unknown, and is all that epoll and
-    /// IOCP ever report. Pass the event to `PlainNb.hintReadable` or
-    /// `Listener.hintReadable` to skip the trailing EAGAIN call.
+    /// Readiness count the kernel attached to a readable event: bytes buffered
+    /// on a stream or connections queued on a listener (kqueue `data` of
+    /// `EVFILT_READ`). Zero means unknown and is all epoll and IOCP report.
+    /// Pass the event to `PlainNb.hintReadable` or `Listener.hintReadable` to
+    /// avoid the trailing `EAGAIN` call after consuming the reported count.
     avail: usize = 0,
     /// A watched process exited; `udata` is the watch's. The watch ends
     /// with this event. With `err` clear, `exit` says how it ended; with
@@ -126,5 +151,7 @@ pub const Event = struct {
     /// and `err_no` holds the errno, or is zero when the status is owned by
     /// a tracer or a racing wait outside born.
     exited: bool = false,
+    /// Exit code or terminating signal when `exited` is set and `err` is
+    /// clear; null for other events and when the status cannot be collected.
     exit: ?ProcessExit = null,
 };

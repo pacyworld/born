@@ -1,27 +1,30 @@
-// Windows event port: IOCP backend (issue #7).
-//
-// Same contract as the kqueue/epoll backends, with the completion-model
-// differences handled here:
-//   - No readiness registration: monitorRead(fd, udata) ASSOCIATES the
-//     handle (socket) with the port; wantWrite/cancelWrite are no-ops
-//     (overlapped sends are posted by the stream layer and always
-//     complete). purgeFd is a no-op (closesocket/CancelIoEx teardown is
-//     the stream layer's job).
-//   - Events carry the completion key (udata) plus the raw OVERLAPPED
-//     pointer and byte count; the owning conn classifies which operation
-//     completed by comparing OVERLAPPED addresses (nb_win.zig).
-//   - wait() harvests a batch in ONE GetQueuedCompletionStatusEx call.
-//   - Cross-thread wakeup: PostQueuedCompletionStatus with the wake key.
-//   - stdio relay threads (libuv pattern for blocking pipes) post their
-//     chunks here via PQCS with the caller-chosen key. A FAILED post used
-//     to vanish silently (issue #5); it is now stashed atomically — relay
-//     threads share post() with the owning thread — and returned as
-//     error.PostFailed from the next non-empty wait(), like pending
-//     association failures.
-//   - Internal posts: timer_iocp.zig's thread-pool timer and
-//     signal_windows.zig's console handler only post() a completion keyed
-//     by internalKey(kind), with a payload in the byte count. wait() hands
-//     those to the kind's harvest() on the loop thread.
+//! Windows event port backed by I/O completion ports.
+//!
+//! IOCP reports completions rather than readiness. monitorRead associates a
+//! handle with the port. wantWrite and cancelWrite are no-ops because the
+//! stream layer posts overlapped sends and receives their completions.
+//! purgeFd is also a no-op; the stream layer owns closesocket and CancelIoEx
+//! teardown.
+//!
+//! Events carry the completion key, raw OVERLAPPED pointer, and byte count.
+//! The owning connection in socket_windows.zig identifies the completed
+//! operation by comparing OVERLAPPED addresses. wait harvests a batch in one
+//! GetQueuedCompletionStatusEx call.
+//!
+//! Cross-thread wakeup uses PostQueuedCompletionStatus with the wake key.
+//! Stdio relay threads for blocking pipes also post chunks with caller-chosen
+//! keys. post is shared by relay threads and the owning thread; a failed post
+//! is stashed atomically and returned as error.PostFailed from the next
+//! non-empty wait, like a pending association failure.
+//!
+//! timer_iocp.zig's thread-pool timer and signal_windows.zig's console handler
+//! only post completions keyed by internalKey, with a payload in the byte
+//! count. wait hands those completions to the owning module's harvest function
+//! on the event-loop thread.
+//!
+//! Process watches are unsupported. watchProcess returns error.Unsupported,
+//! unwatchProcess is a no-op, and native IOCP events leave Event.exited false
+//! and Event.exit null.
 
 const std = @import("std");
 const windows = std.os.windows;
@@ -45,6 +48,7 @@ pub const Signal = types.Signal;
 pub const TimerMode = types.TimerMode;
 
 pub const InitError = error{InitFailed};
+/// Failure to associate a handle with an I/O completion port.
 pub const AssociateError = error{AssociateFailed};
 /// AssociateFailed is a stashed monitorRead failure, PostFailed a stashed
 /// post()/wake() failure, OutOfMemory an internal harvest that could not
@@ -52,6 +56,7 @@ pub const AssociateError = error{AssociateFailed};
 pub const WaitError = error{ WaitFailed, AssociateFailed, PostFailed, OutOfMemory };
 pub const TimerError = types.TimerError;
 pub const SignalError = types.SignalError;
+/// Errors returned by process-watch operations.
 pub const ProcessError = types.ProcessError;
 /// Every error this backend can return.
 pub const Error = InitError || AssociateError || WaitError || TimerError || SignalError || ProcessError;
@@ -71,6 +76,11 @@ fn internalKind(key: usize) ?InternalKind {
     return @enumFromInt(key - base);
 }
 
+/// An I/O completion port and its timer and signal state.
+///
+/// The port must not move after its first `addTimer` call until `deinit`, or
+/// while it watches a signal, because timer and console callbacks retain its
+/// address.
 pub const EvPort = struct {
     iocp: windows.HANDLE = windows.INVALID_HANDLE_VALUE,
     /// Stashed association failure (owning thread via monitorRead only):
@@ -80,12 +90,13 @@ pub const EvPort = struct {
     timers: timer_iocp.State = .{},
     /// Signal-watch bookkeeping, owned by signal_windows.zig.
     signals: signal_windows.State = .{},
-    /// Set by post()/wake() from ANY thread on a failed
-    /// PostQueuedCompletionStatus; the next non-empty wait() reports it
-    /// once as error.PostFailed (issue #5). Atomic because post() may run
-    /// from relay threads while the owning thread is inside wait().
-    post_failed: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    /// Set by post or wake from any thread on a failed
+    /// PostQueuedCompletionStatus; the next non-empty wait reports it once
+    /// as error.PostFailed. Atomic because post may run from relay threads
+    /// while the owning thread is inside wait.
+    post_failed: std.atomic.Value(bool) = .init(false),
 
+    /// Create an I/O completion port and initialize its helper state with `alloc`.
     pub fn init(alloc: std.mem.Allocator) InitError!EvPort {
         const port = kernel32.CreateIoCompletionPort(windows.INVALID_HANDLE_VALUE, null, 0, 0) orelse
             return InitError.InitFailed;
@@ -96,9 +107,10 @@ pub const EvPort = struct {
         };
     }
 
+    /// Stop helper callbacks, release their state, and close the port handle.
     pub fn deinit(self: *EvPort) void {
         // Helpers post() from other threads: stop them before the port
-        // handle closes (the #5 lifetime rule).
+        // handle closes.
         self.signals.deinit(self);
         self.timers.deinit(self);
         if (self.iocp != windows.INVALID_HANDLE_VALUE) _ = windows.CloseHandle(self.iocp);
@@ -113,6 +125,7 @@ pub const EvPort = struct {
         };
     }
 
+    /// Associate `handle` with the port and use `udata` as its completion key.
     pub fn associate(self: *EvPort, handle: Handle, udata: ?*anyopaque) AssociateError!void {
         if (handle == windows.INVALID_HANDLE_VALUE or self.iocp == windows.INVALID_HANDLE_VALUE)
             return AssociateError.AssociateFailed;
@@ -129,39 +142,42 @@ pub const EvPort = struct {
         _ = udata;
     }
 
+    /// No-op: overlapped writes have no interest registration to cancel.
     pub fn cancelWrite(self: *EvPort, fd: Handle) void {
         _ = self;
         _ = fd;
     }
 
+    /// No-op: IOCP has no read-interest registration to remove.
     pub fn unmonitorRead(self: *EvPort, fd: Handle) void {
         _ = self;
         _ = fd;
     }
 
+    /// No-op: the stream layer owns closesocket and CancelIoEx teardown.
     pub fn purgeFd(self: *EvPort, fd: Handle) void {
         _ = self;
         _ = fd;
     }
 
-    /// Wake a wait() blocked anywhere (relay threads, future helpers).
+    /// Wake a wait blocked in another thread. Callable from any thread.
     pub fn wake(self: *EvPort) void {
         self.post(&wake_sentinel, null, 0);
     }
 
-    /// Post a completion with an arbitrary key (stdio relay threads use
-    /// their sentinel addresses; overlapped may be null). Callable from
-    /// any thread: a failed post is never silently dropped — the failure
-    /// is stashed atomically and returned as error.PostFailed (issue #5)
-    /// by the next non-empty wait(). NOTE: when the FAILED post is itself
-    /// a wake, nothing wakes the blocked wait, so the error reaches the
-    /// consumer at the next naturally-arriving completion.
+    /// Post a completion with an arbitrary key. Stdio relay threads use their
+    /// sentinel addresses, and `overlapped` may be null. Callable from any
+    /// thread. A failed post is stashed atomically and returned as
+    /// error.PostFailed by the next non-empty wait. When the failed post is
+    /// itself a wake, nothing wakes the blocked wait, so the error reaches the
+    /// consumer at the next naturally arriving completion.
     pub fn post(self: *EvPort, key: *anyopaque, overlapped: ?*windows.OVERLAPPED, bytes: usize) void {
         if (kernel32.PostQueuedCompletionStatus(self.iocp, @intCast(bytes), @intFromPtr(key), overlapped) == 0) {
             self.post_failed.store(true, .release);
         }
     }
 
+    /// Return the completion key used to identify wake events.
     pub fn wakeKey() *anyopaque {
         return &wake_sentinel;
     }
@@ -193,7 +209,9 @@ pub const EvPort = struct {
         signal_windows.unwatch(self, sig);
     }
 
-    /// Process watches are not implemented on IOCP.
+    /// Always returns `error.Unsupported` without associating `handle` or
+    /// changing bookkeeping. `handle` and `udata` are ignored, and native IOCP
+    /// events never acquire process exit fields through this method.
     pub fn watchProcess(self: *EvPort, handle: Handle, udata: ?*anyopaque) ProcessError!void {
         _ = self;
         _ = handle;
@@ -201,16 +219,18 @@ pub const EvPort = struct {
         return ProcessError.Unsupported;
     }
 
-    /// A no-op: nothing can be watched.
+    /// No-op because IOCP has no process watch to remove.
     pub fn unwatchProcess(self: *EvPort, handle: Handle) void {
         _ = self;
         _ = handle;
     }
 
-    /// Harvest one batch of completions in ONE GetQueuedCompletionStatusEx
-    /// call. timeout_ms: null = block until a completion; 0 = don't block.
-    /// Internal posts go to their kind's harvest, which may emit several
-    /// events or none (wait() can then return 0 before its timeout).
+    /// Harvest one batch of completions in one GetQueuedCompletionStatusEx
+    /// call. `timeout_ms` must be null or nonnegative. null blocks until a
+    /// completion, zero harvests without blocking, and positive values wait
+    /// that many milliseconds. Internal posts go to their kind's harvest,
+    /// which may emit several events or none, so wait can return zero before
+    /// its timeout.
     pub fn wait(self: *EvPort, events: []Event, timeout_ms: ?i32) WaitError!usize {
         if (events.len == 0) return 0;
         if (self.pending_error) |err| {
@@ -280,7 +300,7 @@ test "iocp: association failure is immediate or deferred without consuming compl
     try std.testing.expectEqual(@as(usize, 0), try port.wait(&events, 0));
 }
 
-test "iocp: failed post is stashed and returned by the next wait (issue #5)" {
+test "iocp: failed post is stashed and returned by the next wait" {
     var port = try EvPort.init(std.testing.allocator);
     defer port.deinit();
 
@@ -297,9 +317,9 @@ test "iocp: failed post is stashed and returned by the next wait (issue #5)" {
     port.iocp = windows.INVALID_HANDLE_VALUE;
     defer port.iocp = saved;
 
-    // A relay thread lost its chunk — the port must say so at its next
-    // wait instead of letting the loop wait on a completion that never
-    // arrives. An empty wait preserves the stashed error, as elsewhere.
+    // A relay thread lost its chunk. The port must say so at its next wait
+    // instead of letting the loop wait on a completion that never arrives.
+    // An empty wait preserves the stashed error, as elsewhere.
     port.post(&tag, null, 7);
     var empty: [0]Event = .{};
     try std.testing.expectEqual(@as(usize, 0), try port.wait(&empty, null));

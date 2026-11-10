@@ -1,6 +1,5 @@
-//! Signals on epoll: one signalfd per port. Owned by born#16: this file plus
-//! the EvPort.watchSignal/unwatchSignal bodies in evport_epoll.zig, and
-//! `blockSignals` (exported as `born.blockSignals`).
+//! Signals on epoll: one signalfd per port. `blockSignals` is exported as
+//! `born.blockSignals`.
 //!
 //! signalfd only sees signals blocked in every thread, so programs call
 //! `blockSignals` in `main` before spawning threads, and `watch` refuses a
@@ -33,7 +32,7 @@ const Siginfo = linux.signalfd_siginfo;
 var owners = [_]u64{0} ** signal_count;
 var owners_lock: std.Thread.Mutex = .{};
 /// Source of port ids; an id survives the port value being moved.
-var next_id = std.atomic.Value(u64).init(1);
+var next_id: std.atomic.Value(u64) = .init(1);
 
 /// Per-port watch bookkeeping, a field of EvPort (`signals`).
 pub const State = struct {
@@ -41,9 +40,10 @@ pub const State = struct {
     fd: i32 = -1,
     /// Ownership id, assigned on the first watch.
     id: u64 = 0,
-    watched: SignalSet = .{},
+    watched: SignalSet = .initEmpty(),
     udata: [signal_count]?*anyopaque = .{null} ** signal_count,
 
+    /// Returns state with no watched signals or signalfd.
     pub fn init(alloc: std.mem.Allocator) State {
         _ = alloc;
         return .{};
@@ -54,7 +54,7 @@ pub const State = struct {
     pub fn deinit(self: *State, port: *EvPort) void {
         var it = self.watched.iterator();
         while (it.next()) |sig| release(self.id, sig);
-        self.watched = .{};
+        self.watched = .initEmpty();
         self.udata = .{null} ** signal_count;
         self.closeFd(port);
     }
@@ -147,7 +147,7 @@ pub fn harvest(port: *EvPort, out: []Event) usize {
     var narrowed = false;
     while (true) {
         if (n == out.len and n < watched_count and !narrowed) {
-            var emitted: SignalSet = .{};
+            var emitted: SignalSet = .initEmpty();
             for (out[0..n]) |ev| emitted.insert(ev.signal.?);
             const mask = kernelMask(emitted);
             if (linux.E.init(linux.signalfd(st.fd, &mask, 0)) != .SUCCESS) {
@@ -350,7 +350,7 @@ test "signal_epoll: a full buffer leaves other signals for the next wait" {
     try raiseInThread(.hangup);
     try raiseInThread(.user2);
 
-    var seen = SignalSet{};
+    var seen: SignalSet = .initEmpty();
     var one: [1]Event = undefined;
     for (0..2) |_| {
         try std.testing.expectEqual(@as(usize, 1), try port.wait(&one, 1000));
