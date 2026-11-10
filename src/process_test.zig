@@ -304,9 +304,8 @@ test "process: watching a child that already exited fires at once" {
 
 test "process: rapid spawn of a short program never loses the exit status" {
     if (!process.supported) return error.SkipZigTest;
-    // Pins the spawn probe: it must never reap an already-exited child and
-    // discard its status (PR #49 review 330). The failure mode showed up
-    // as err set with err_no ECHILD under scheduling pressure.
+    // Smoke test: a short program may exit before spawn's feature probe
+    // runs; every exit must still arrive with the status, never err.
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
     var i: usize = 0;

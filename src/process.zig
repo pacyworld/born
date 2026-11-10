@@ -435,8 +435,8 @@ const linux_impl = struct {
             var probe: linux.siginfo_t = undefined;
             while (true) {
                 // A running child answers success with si_pid set to zero.
-                // WNOWAIT: the probe must never reap an already-exited
-                // child and discard its status (review 330).
+                // WNOWAIT: otherwise the probe reaps an already-exited
+                // child and discards its status.
                 const prc = linux.waitid(.PIDFD, pidfd, &probe, linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT);
                 switch (linux.E.init(prc)) {
                     .INTR => continue,
@@ -646,4 +646,25 @@ test "process: wait status decodes to exits" {
     try std.testing.expectEqual(types.ProcessExit{ .signal = 11 }, types.ProcessExit.fromWaitStatus(0x80 | 11).?);
     // Stopped: not an exit.
     try std.testing.expect(types.ProcessExit.fromWaitStatus((19 << 8) | 0x7f) == null);
+}
+
+test "process: the spawn probe leaves an exited child's status in place" {
+    if (comptime os != .linux) return error.SkipZigTest;
+    const linux = std.os.linux;
+    const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", "exit 5" };
+    const envp = [_:null]?[*:0]const u8{};
+    var child = spawn(&argv, &envp, .{}) catch |err| {
+        if (err == error.Unsupported) return error.SkipZigTest;
+        return err;
+    };
+    defer child.close();
+    var info: linux.siginfo_t = undefined;
+    // Wait for the exit without reaping, so the probe meets a child that
+    // has already exited.
+    while (linux.E.init(linux.waitid(.PIDFD, child.handle, &info, linux.W.EXITED | linux.W.NOWAIT)) == .INTR) {}
+    try std.testing.expect(linux_impl.pidfdUsable(child.handle, child.pid));
+    // The status survives the probe: a WNOHANG waitid still collects it.
+    info = std.mem.zeroes(linux.siginfo_t);
+    try std.testing.expectEqual(linux.E.SUCCESS, linux.E.init(linux.waitid(.PIDFD, child.handle, &info, linux.W.EXITED | linux.W.NOHANG)));
+    try std.testing.expectEqual(child.pid, info.fields.common.first.piduid.pid);
 }
