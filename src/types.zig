@@ -123,7 +123,8 @@ pub const Event = struct {
     /// A watched process exited; `udata` is the watch's. The watch ends
     /// with this event. With `err` clear, `exit` says how it ended; with
     /// `err` set (epoll: the status could not be collected), `exit` is null
-    /// and `err_no` holds the errno.
+    /// and `err_no` holds the errno, or is zero when the status is owned by
+    /// a tracer or a racing wait outside born.
     exited: bool = false,
     exit: ?ProcessExit = null,
 };

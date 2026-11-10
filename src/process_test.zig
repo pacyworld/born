@@ -302,6 +302,27 @@ test "process: watching a child that already exited fires at once" {
     port.purgeFd(child.handle);
 }
 
+test "process: rapid spawn of a short program never loses the exit status" {
+    if (!process.supported) return error.SkipZigTest;
+    // Pins the spawn probe: it must never reap an already-exited child and
+    // discard its status (PR #49 review 330). The failure mode showed up
+    // as err set with err_no ECHILD under scheduling pressure.
+    var port = try born.EvPort.init(alloc);
+    defer port.deinit();
+    var i: usize = 0;
+    while (i < 300) : (i += 1) {
+        var child = try spawnOrSkip(sh("exit 0"), .{});
+        var tag = i;
+        try port.watchProcess(child.handle, &tag);
+        const ev = try waitExit(&port, &tag, 5000);
+        try std.testing.expect(!ev.err);
+        try std.testing.expectEqual(born.ProcessExit{ .code = 0 }, ev.exit.?);
+        port.purgeFd(child.handle);
+        child.close();
+        try expectGone(child.pid);
+    }
+}
+
 test "process: exec and setup failures are spawn errors" {
     if (!process.supported) return error.SkipZigTest;
     const missing = [_:null]?[*:0]const u8{"/nonexistent/born-test-program"};

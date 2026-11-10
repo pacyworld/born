@@ -754,6 +754,8 @@ test "kqueue: process descriptor kevents translate to the exit fields" {
     kev.data = 7 << 8;
     const coded = EvPort.translate(kev);
     try std.testing.expect(coded.exited and !coded.err and !coded.readable and !coded.timer);
+    // An exit is not end-of-file on any backend, even with EV_EOF fed.
+    try std.testing.expect(!coded.eof);
     try std.testing.expectEqual(types.ProcessExit{ .code = 7 }, coded.exit.?);
     kev.data = std.posix.SIG.KILL;
     try std.testing.expectEqual(types.ProcessExit{ .signal = std.posix.SIG.KILL }, EvPort.translate(kev).exit.?);

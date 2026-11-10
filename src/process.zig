@@ -435,7 +435,9 @@ const linux_impl = struct {
             var probe: linux.siginfo_t = undefined;
             while (true) {
                 // A running child answers success with si_pid set to zero.
-                const prc = linux.waitid(.PIDFD, pidfd, &probe, linux.W.EXITED | linux.W.NOHANG);
+                // WNOWAIT: the probe must never reap an already-exited
+                // child and discard its status (review 330).
+                const prc = linux.waitid(.PIDFD, pidfd, &probe, linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT);
                 switch (linux.E.init(prc)) {
                     .INTR => continue,
                     .SUCCESS => return true,
@@ -491,21 +493,46 @@ const linux_impl = struct {
     /// A lazily spawned thread that reaps children whose pidfds a caller
     /// closed while they still ran: close never blocks a loop thread. The
     /// list is protected by the mutex; page_allocator is thread-safe.
+    /// Known limitation (#52): pidfds are reaped oldest-first with a
+    /// blocking waitid, so a child whose exit stalls (D-state, a large
+    /// exit_mmap) delays later entries until it finishes.
     const reaper = struct {
         var lock: std.Thread.Mutex = .{};
         var ready: std.Thread.Condition = .{};
         var pending: std.ArrayListUnmanaged(i32) = .empty;
         var started = false;
+        /// Pid of the process the running thread belongs to; a fork keeps
+        /// `started` but not the thread.
+        var owner: i32 = 0;
 
         /// Moves the pidfd to the reaper; false (and the caller keeps it)
         /// only when spawning the thread or queuing the fd fails.
         fn take(fd: i32) bool {
             lock.lock();
             defer lock.unlock();
+            const me = linux.getpid();
+            if (started and owner != me) {
+                // In a forked child the reaper thread does not exist; the
+                // inherited pidfds refer to children of the parent, which a
+                // restarted reaper could never wait on. Discard them.
+                for (pending.items) |pfd| _ = std.c.close(pfd);
+                pending.clearRetainingCapacity();
+                started = false;
+            }
             if (!started) {
-                const t = std.Thread.spawn(.{}, run, .{}) catch return false;
+                // The thread inherits this thread's signal mask, so block
+                // everything around the spawn: a reaper with the caller's
+                // mask could eat a process-directed signal destined for
+                // signalfd (which needs it blocked in every thread).
+                const all = linux.sigfillset();
+                var saved: linux.sigset_t = undefined;
+                _ = linux.sigprocmask(linux.SIG.SETMASK, &all, &saved);
+                const spawned = std.Thread.spawn(.{}, run, .{});
+                _ = linux.sigprocmask(linux.SIG.SETMASK, &saved, null);
+                const t = spawned catch return false;
                 t.setName("born-reaper") catch {};
                 t.detach();
+                owner = me;
                 started = true;
             }
             pending.append(std.heap.page_allocator, fd) catch return false;
