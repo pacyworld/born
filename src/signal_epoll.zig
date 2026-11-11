@@ -17,6 +17,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const compat = @import("compat");
 const ep = @import("evport_epoll.zig");
 const EvPort = ep.EvPort;
 const Event = ep.Event;
@@ -24,13 +25,13 @@ const SignalError = ep.SignalError;
 const Signal = ep.Signal;
 
 const SignalSet = std.EnumSet(Signal);
-const signal_count = std.meta.fields(Signal).len;
+const signal_count = compat.enumFields(Signal).len;
 const Siginfo = linux.signalfd_siginfo;
 
 /// Owning port id per signal, 0 when unwatched. Guarded by `owners_lock`
 /// because ports on different threads watch and unwatch concurrently.
-var owners = [_]u64{0} ** signal_count;
-var owners_lock: std.Thread.Mutex = .{};
+var owners: [signal_count]u64 = @splat(0);
+var owners_lock: compat.Mutex = .{};
 /// Source of port ids; an id survives the port value being moved.
 var next_id: std.atomic.Value(u64) = .init(1);
 
@@ -40,8 +41,8 @@ pub const State = struct {
     fd: i32 = -1,
     /// Ownership id, assigned on the first watch.
     id: u64 = 0,
-    watched: SignalSet = .initEmpty(),
-    udata: [signal_count]?*anyopaque = .{null} ** signal_count,
+    watched: SignalSet = compat.emptyEnumSet(Signal),
+    udata: [signal_count]?*anyopaque = @splat(null),
 
     /// Returns state with no watched signals or signalfd.
     pub fn init(alloc: std.mem.Allocator) State {
@@ -54,8 +55,8 @@ pub const State = struct {
     pub fn deinit(self: *State, port: *EvPort) void {
         var it = self.watched.iterator();
         while (it.next()) |sig| release(self.id, sig);
-        self.watched = .initEmpty();
-        self.udata = .{null} ** signal_count;
+        self.watched = compat.emptyEnumSet(Signal);
+        self.udata = @splat(null);
         self.closeFd(port);
     }
 
@@ -68,15 +69,15 @@ pub const State = struct {
         }
         const mask = kernelMask(set);
         if (self.fd != -1) {
-            if (linux.E.init(linux.signalfd(self.fd, &mask, 0)) != .SUCCESS)
+            if (ep.rawErrno(linux.signalfd(self.fd, &mask, 0)) != .SUCCESS)
                 return SignalError.SystemResources;
             return;
         }
         const rc = linux.signalfd(-1, &mask, linux.SFD.NONBLOCK | linux.SFD.CLOEXEC);
-        if (linux.E.init(rc) != .SUCCESS) return SignalError.SystemResources;
+        if (ep.rawErrno(rc) != .SUCCESS) return SignalError.SystemResources;
         const fd: i32 = @intCast(rc);
         port.addInternal(.signal, fd) catch |err| {
-            _ = std.c.close(fd);
+            compat.close(fd);
             return switch (err) {
                 // The signal slot belongs to this module and is empty
                 // whenever self.fd is -1.
@@ -90,7 +91,7 @@ pub const State = struct {
     fn closeFd(self: *State, port: *EvPort) void {
         if (self.fd == -1) return;
         port.removeInternal(.signal);
-        _ = std.c.close(self.fd);
+        compat.close(self.fd);
         self.fd = -1;
     }
 };
@@ -147,10 +148,10 @@ pub fn harvest(port: *EvPort, out: []Event) usize {
     var narrowed = false;
     while (true) {
         if (n == out.len and n < watched_count and !narrowed) {
-            var emitted: SignalSet = .initEmpty();
+            var emitted: SignalSet = compat.emptyEnumSet(Signal);
             for (out[0..n]) |ev| emitted.insert(ev.signal.?);
             const mask = kernelMask(emitted);
-            if (linux.E.init(linux.signalfd(st.fd, &mask, 0)) != .SUCCESS) {
+            if (ep.rawErrno(linux.signalfd(st.fd, &mask, 0)) != .SUCCESS) {
                 stashFailure(port);
                 break;
             }
@@ -161,7 +162,7 @@ pub fn harvest(port: *EvPort, out: []Event) usize {
         // record per read keeps a new signal from overrunning `out`.
         const batch: usize = if (narrowed or out.len - n >= watched_count - n) buf.len else 1;
         const rc = linux.read(st.fd, @ptrCast(&buf), batch * @sizeOf(Siginfo));
-        switch (linux.E.init(rc)) {
+        switch (ep.rawErrno(rc)) {
             .SUCCESS => {},
             .INTR => continue,
             .AGAIN => break,
@@ -196,7 +197,7 @@ pub fn harvest(port: *EvPort, out: []Event) usize {
     }
     if (narrowed) {
         const mask = kernelMask(st.watched);
-        if (linux.E.init(linux.signalfd(st.fd, &mask, 0)) != .SUCCESS) stashFailure(port);
+        if (ep.rawErrno(linux.signalfd(st.fd, &mask, 0)) != .SUCCESS) stashFailure(port);
     }
     return n;
 }
@@ -204,27 +205,27 @@ pub fn harvest(port: *EvPort, out: []Event) usize {
 /// `pthread_sigmask(SIG_BLOCK)` for `sigs` in the calling thread. Threads
 /// inherit the mask, so call it in `main` before spawning any.
 pub fn blockSignals(sigs: []const Signal) SignalError!void {
-    var set = std.posix.sigemptyset();
-    for (sigs) |sig| std.posix.sigaddset(&set, sig.toPosix());
-    var old: std.posix.sigset_t = undefined;
+    var set = compat.sigemptyset();
+    for (sigs) |sig| compat.sigaddset(&set, sig.toPosix());
+    var old: compat.sigset_t = undefined;
     // pthread_sigmask fails only with EINVAL for an invalid `how`.
-    if (std.c.pthread_sigmask(std.posix.SIG.BLOCK, &set, &old) != 0)
+    if (compat.pthreadSigmask(linux.SIG.BLOCK, &set, &old) != 0)
         return SignalError.SystemResources;
 }
 
 /// Whether `sig` is blocked in the calling thread.
 fn blockedInThread(sig: Signal) SignalError!bool {
-    const none = std.posix.sigemptyset();
-    var cur: std.posix.sigset_t = undefined;
-    if (std.c.pthread_sigmask(std.posix.SIG.BLOCK, &none, &cur) != 0)
+    const none = compat.sigemptyset();
+    var cur: compat.sigset_t = undefined;
+    if (compat.pthreadSigmask(linux.SIG.BLOCK, &none, &cur) != 0)
         return SignalError.SystemResources;
-    return std.posix.sigismember(&cur, sig.toPosix());
+    return compat.sigismember(&cur, sig.toPosix());
 }
 
 fn kernelMask(set: SignalSet) linux.sigset_t {
     var mask = linux.sigemptyset();
     var it = set.iterator();
-    while (it.next()) |sig| linux.sigaddset(&mask, sig.toPosix());
+    while (it.next()) |sig| linux.sigaddset(&mask, compat.nativeSignal(sig.toPosix()));
     return mask;
 }
 
@@ -253,28 +254,28 @@ fn stashFailure(port: *EvPort) void {
 /// Blocks or unblocks `sigs` in the calling thread; `restore` puts the
 /// previous mask back.
 const MaskGuard = struct {
-    saved: std.posix.sigset_t,
+    saved: compat.sigset_t,
 
     fn set(how: u32, sigs: []const Signal) MaskGuard {
         var g: MaskGuard = undefined;
-        var set_: std.posix.sigset_t = std.posix.sigemptyset();
-        for (sigs) |sig| std.posix.sigaddset(&set_, sig.toPosix());
-        std.debug.assert(std.c.pthread_sigmask(@intCast(how), &set_, &g.saved) == 0);
+        var set_: compat.sigset_t = compat.sigemptyset();
+        for (sigs) |sig| compat.sigaddset(&set_, sig.toPosix());
+        std.debug.assert(compat.pthreadSigmask(@intCast(how), &set_, &g.saved) == 0);
         return g;
     }
 
     fn restore(self: *const MaskGuard) void {
-        var ignored: std.posix.sigset_t = undefined;
-        std.debug.assert(std.c.pthread_sigmask(std.posix.SIG.SETMASK, &self.saved, &ignored) == 0);
+        var ignored: compat.sigset_t = undefined;
+        std.debug.assert(compat.pthreadSigmask(linux.SIG.SETMASK, &self.saved, &ignored) == 0);
     }
 };
 
 fn raiseInThread(sig: Signal) !void {
-    try std.posix.raise(sig.toPosix());
+    try compat.raise(sig.toPosix());
 }
 
 test "signal_epoll: watching an unblocked signal fails with SignalNotBlocked" {
-    const guard = MaskGuard.set(std.posix.SIG.UNBLOCK, &.{.hangup});
+    const guard = MaskGuard.set(linux.SIG.UNBLOCK, &.{.hangup});
     defer guard.restore();
     var port = try EvPort.init(std.testing.allocator);
     defer port.deinit();
@@ -291,7 +292,7 @@ test "signal_epoll: watching an unblocked signal fails with SignalNotBlocked" {
 }
 
 test "signal_epoll: the signalfd lives exactly as long as some watch" {
-    const guard = MaskGuard.set(std.posix.SIG.BLOCK, &.{ .hangup, .user2 });
+    const guard = MaskGuard.set(linux.SIG.BLOCK, &.{ .hangup, .user2 });
     defer guard.restore();
     var port = try EvPort.init(std.testing.allocator);
     defer port.deinit();
@@ -308,7 +309,7 @@ test "signal_epoll: the signalfd lives exactly as long as some watch" {
 }
 
 test "signal_epoll: deinit releases ownership" {
-    const guard = MaskGuard.set(std.posix.SIG.BLOCK, &.{.hangup});
+    const guard = MaskGuard.set(linux.SIG.BLOCK, &.{.hangup});
     defer guard.restore();
     var tag: u8 = 0;
     {
@@ -322,7 +323,7 @@ test "signal_epoll: deinit releases ownership" {
 }
 
 test "signal_epoll: re-watching replaces the udata" {
-    const guard = MaskGuard.set(std.posix.SIG.BLOCK, &.{.hangup});
+    const guard = MaskGuard.set(linux.SIG.BLOCK, &.{.hangup});
     defer guard.restore();
     var port = try EvPort.init(std.testing.allocator);
     defer port.deinit();
@@ -339,7 +340,7 @@ test "signal_epoll: re-watching replaces the udata" {
 }
 
 test "signal_epoll: a full buffer leaves other signals for the next wait" {
-    const guard = MaskGuard.set(std.posix.SIG.BLOCK, &.{ .hangup, .user2 });
+    const guard = MaskGuard.set(linux.SIG.BLOCK, &.{ .hangup, .user2 });
     defer guard.restore();
     var port = try EvPort.init(std.testing.allocator);
     defer port.deinit();
@@ -350,7 +351,7 @@ test "signal_epoll: a full buffer leaves other signals for the next wait" {
     try raiseInThread(.hangup);
     try raiseInThread(.user2);
 
-    var seen: SignalSet = .initEmpty();
+    var seen: SignalSet = compat.emptyEnumSet(Signal);
     var one: [1]Event = undefined;
     for (0..2) |_| {
         try std.testing.expectEqual(@as(usize, 1), try port.wait(&one, 1000));
@@ -371,13 +372,13 @@ test "signal_epoll: a full buffer leaves other signals for the next wait" {
 }
 
 test "signal_epoll: ports on other threads contend for one owner" {
-    const guard = MaskGuard.set(std.posix.SIG.BLOCK, &.{.hangup});
+    const guard = MaskGuard.set(linux.SIG.BLOCK, &.{.hangup});
     defer guard.restore();
     const Racer = struct {
         won: std.atomic.Value(u32) = .init(0),
         refused: std.atomic.Value(u32) = .init(0),
 
-        fn run(self: *@This(), done: *std.Thread.ResetEvent, release_: *std.Thread.ResetEvent) void {
+        fn run(self: *@This(), done: *compat.ResetEvent, release_: *compat.ResetEvent) void {
             var port = EvPort.init(std.heap.page_allocator) catch {
                 done.set();
                 return;
@@ -395,8 +396,10 @@ test "signal_epoll: ports on other threads contend for one owner" {
         }
     };
     var racer: Racer = .{};
-    var done: [4]std.Thread.ResetEvent = .{ .{}, .{}, .{}, .{} };
-    var release_: std.Thread.ResetEvent = .{};
+    var done: [4]compat.ResetEvent = .{ .{}, .{}, .{}, .{} };
+    defer for (&done) |*d| d.deinit();
+    var release_: compat.ResetEvent = .{};
+    defer release_.deinit();
     var threads: [4]std.Thread = undefined;
     for (&threads, &done) |*t, *d| t.* = try std.Thread.spawn(.{}, Racer.run, .{ &racer, d, &release_ });
     for (&done) |*d| d.wait();

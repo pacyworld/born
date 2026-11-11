@@ -26,36 +26,40 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
-const posix = std.posix;
+const compat = @import("compat");
 const kq = @import("evport_kqueue.zig");
 const EvPort = kq.EvPort;
 const Kevent = kq.Kevent;
 const SignalError = kq.SignalError;
 const Signal = kq.Signal;
 
-const EV = posix.system.EV;
+const EV = std.c.EV;
 // Zig 0.15 omits ERROR on NetBSD (sys/event.h).
 const EV_ERROR = if (@hasDecl(EV, "ERROR")) EV.ERROR else 0x4000;
 
-fn ignore() posix.Sigaction {
-    return .{ .handler = .{ .handler = posix.SIG.IGN }, .mask = posix.sigemptyset(), .flags = 0 };
+fn ignore() compat.Sigaction {
+    return .{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = compat.sigemptyset(),
+        .flags = 0,
+    };
 }
 
 /// A process-wide watch: the owning port's kqueue and the disposition
 /// `watch` replaced.
-const Owner = struct { kq: c_int, prior: posix.Sigaction };
+const Owner = struct { kq: c_int, prior: compat.Sigaction };
 
 var owners: std.EnumArray(Signal, ?Owner) = .initFill(null);
-var owners_lock: std.Thread.Mutex = .{};
+var owners_lock: compat.Mutex = .{};
 
 /// Per-port watch bookkeeping, a field of EvPort (`signals`).
 pub const State = struct {
     /// Signals this port watches.
-    watched: std.EnumSet(Signal) = .initEmpty(),
+    watched: std.EnumSet(Signal) = compat.emptyEnumSet(Signal),
     /// Unwatched signals whose immediate delete failed, so their filter may
     /// still deliver. `observe` drops those deliveries; a staged delete
     /// retries the removal.
-    stale: std.EnumSet(Signal) = .initEmpty(),
+    stale: std.EnumSet(Signal) = compat.emptyEnumSet(Signal),
 
     /// Returns state with no watched or stale signals.
     pub fn init(alloc: std.mem.Allocator) State {
@@ -88,8 +92,8 @@ pub fn watch(port: *EvPort, sig: Signal, udata: ?*anyopaque) SignalError!void {
     purgeStaged(port, sig);
     if (owner.* == null) {
         const ign = ignore();
-        var prior: posix.Sigaction = undefined;
-        posix.sigaction(sig.toPosix(), &ign, &prior);
+        var prior: compat.Sigaction = undefined;
+        compat.sigaction(sig.toPosix(), &ign, &prior);
         owner.* = .{ .kq = port.kq, .prior = prior };
     }
     port.signals.watched.insert(sig);
@@ -123,7 +127,7 @@ pub fn observe(port: *EvPort, kev: Kevent) bool {
     if (port.signals.watched.contains(sig)) return true;
     if (kev.flags & EV_ERROR != 0) {
         // A retried delete for a filter that is already gone is expected.
-        return kev.data != @intFromEnum(posix.E.NOENT);
+        return kev.data != @intFromEnum(compat.E.NOENT);
     }
     // A late delivery from a filter whose delete is still pending.
     return !port.signals.stale.contains(sig);
@@ -143,7 +147,7 @@ fn release(port: *EvPort, sig: Signal) void {
     const owner = owners.getPtr(sig);
     const o = owner.* orelse return;
     if (o.kq != port.kq) return;
-    posix.sigaction(sig.toPosix(), &o.prior, null);
+    compat.sigaction(sig.toPosix(), &o.prior, null);
     owner.* = null;
 }
 
@@ -162,16 +166,16 @@ const netbsd = struct {
 
 /// Applies one change now: kevent() with no eventlist and a zero timeout,
 /// so it neither waits nor harvests. Returns the change's errno.
-fn apply(port: *EvPort, kev: Kevent) posix.E {
+fn apply(port: *EvPort, kev: Kevent) compat.E {
     const one = [1]Kevent{kev};
-    const zero: std.c.timespec = .{ .sec = 0, .nsec = 0 };
+    const zero: compat.timespec = .{ .sec = 0, .nsec = 0 };
     while (true) {
         const rc = if (builtin.os.tag == .netbsd)
             netbsd.__kevent50(port.kq, &one, 1, null, 0, &zero)
         else
             std.c.kevent(port.kq, &one, 1, undefined, 0, &zero);
         if (rc >= 0) return .SUCCESS;
-        const e = posix.errno(@as(isize, rc));
+        const e = std.posix.errno(@as(isize, rc));
         if (e != .INTR) return e;
     }
 }
@@ -201,15 +205,15 @@ fn change(sig: Signal, flags: @FieldType(Kevent, "flags"), udata: ?*anyopaque) K
 
 // --------------------------------------------------------------- tests ----
 
-fn disposition(sig: Signal) posix.Sigaction {
-    var now: posix.Sigaction = undefined;
-    posix.sigaction(sig.toPosix(), null, &now);
+fn disposition(sig: Signal) compat.Sigaction {
+    var now: compat.Sigaction = undefined;
+    compat.sigaction(sig.toPosix(), null, &now);
     return now;
 }
 
 /// Process-directed: macOS EVFILT_SIGNAL does not see a thread-directed raise(3).
 fn send(sig: Signal) !void {
-    try posix.kill(std.c.getpid(), sig.toPosix());
+    try compat.kill(std.c.getpid(), sig.toPosix());
 }
 
 test "signal_kqueue: watch and unwatch stage nothing" {
@@ -257,7 +261,7 @@ test "signal_kqueue: deinit restores every disposition and frees ownership" {
     var port = try EvPort.init(std.testing.allocator);
     var tag: u8 = 1;
     try watch(&port, .hangup, &tag);
-    try std.testing.expect(disposition(.hangup).handler.handler == posix.SIG.IGN);
+    try std.testing.expect(disposition(.hangup).handler.handler == std.posix.SIG.IGN);
     port.deinit();
     try std.testing.expect(disposition(.hangup).handler.handler == before.handler.handler);
     var other = try EvPort.init(std.testing.allocator);

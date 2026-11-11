@@ -17,7 +17,8 @@
 //! and currently return `error.Unsupported` rather than emulating Unix sockets.
 
 const std = @import("std");
-const windows = std.os.windows;
+const compat = @import("compat");
+const windows = compat.windows;
 const ws2 = windows.ws2_32;
 const kernel32 = windows.kernel32;
 const evport = @import("root.zig");
@@ -121,7 +122,7 @@ pub const PlainNb = struct {
         try ensureWsa();
         self.wsa_started = true;
         errdefer self.deinit();
-        const addr_list = std.net.getAddressList(alloc, host, port) catch |err| return switch (err) {
+        const addr_list = compat.getAddressList(alloc, host, port) catch |err| return switch (err) {
             error.OutOfMemory => error.OutOfMemory,
             else => error.ConnectFailed,
         };
@@ -144,7 +145,7 @@ pub const PlainNb = struct {
     /// Constructs an overlapped connect to an already resolved `addr` in
     /// `self`, with no resolver or allocation. It has the same stable-storage
     /// and completion contract as `startConnectInto`.
-    pub fn startConnectAddrInto(self: *PlainNb, addr: std.net.Address, evp: *evport.EvPort, key: ?*anyopaque) io.ConnectAddrError!void {
+    pub fn startConnectAddrInto(self: *PlainNb, addr: compat.Address, evp: *evport.EvPort, key: ?*anyopaque) io.ConnectAddrError!void {
         std.debug.assert(self.sock == ws2.INVALID_SOCKET and self.pendingOps() == 0 and !self.wsa_started);
         self.* = .{};
         try ensureWsa();
@@ -159,16 +160,15 @@ pub const PlainNb = struct {
     /// One address: socket, wildcard bind, port association, ConnectEx.
     /// On success the connect is pending. On failure the socket is closed,
     /// except after `Associate`, which leaves it for the caller's deinit.
-    fn connectOne(self: *PlainNb, addr: std.net.Address, evp: *evport.EvPort, key: ?*anyopaque) error{ Unusable, Associate, NoConnectEx, Refused }!void {
-        const s = ws2.WSASocketW(addr.any.family, ws2.SOCK.STREAM, 0, null, 0, ws2.WSA_FLAG_OVERLAPPED | ws2.WSA_FLAG_NO_HANDLE_INHERIT);
+    fn connectOne(self: *PlainNb, addr: compat.Address, evp: *evport.EvPort, key: ?*anyopaque) error{ Unusable, Associate, NoConnectEx, Refused }!void {
+        const s = ws2.WSASocketW(@intCast(addr.any.family), ws2.SOCK.STREAM, 0, null, 0, ws2.WSA_FLAG_OVERLAPPED | ws2.WSA_FLAG_NO_HANDLE_INHERIT);
         if (s == ws2.INVALID_SOCKET) return error.Unusable;
 
         // ConnectEx requires the socket bound first (wildcard, target's
-        // address family); use a std.net.Address so the layout is
-        // target-correct.
+        // address family); use the owned native Address layout.
         const any_addr = switch (addr.any.family) {
-            ws2.AF.INET => std.net.Address.parseIp4("0.0.0.0", 0) catch unreachable,
-            else => std.net.Address.parseIp6("::", 0) catch unreachable,
+            ws2.AF.INET => compat.Address.parseIp4("0.0.0.0", 0) catch unreachable,
+            else => compat.Address.parseIp6("::", 0) catch unreachable,
         };
         if (ws2.bind(s, &any_addr.any, @intCast(any_addr.getOsSockLen())) != 0) {
             _ = ws2.closesocket(s);
@@ -292,7 +292,7 @@ pub const PlainNb = struct {
         // Post the next overlapped read. Sockets ALWAYS queue a completion
         // (even on inline success), so all data arrives via absorbCompletion.
         self.recv_ov = std.mem.zeroes(windows.OVERLAPPED);
-        var buf = ws2.WSABUF{ .len = self.recv_buf.len, .buf = &self.recv_buf };
+        var buf = ws2.WSABUF{ .len = @intCast(self.recv_buf.len), .buf = &self.recv_buf };
         var flags: u32 = 0;
         const rc = ws2.WSARecv(self.sock, @ptrCast(&buf), 1, null, &flags, &self.recv_ov, null);
         if (rc == 0 or ws2.WSAGetLastError() == .WSA_IO_PENDING) {

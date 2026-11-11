@@ -24,6 +24,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const compat = @import("compat");
 const ep = @import("evport_epoll.zig");
 const types = @import("types.zig");
 const EvPort = ep.EvPort;
@@ -46,7 +47,7 @@ pub const State = struct {
     pub fn deinit(self: *State, port: *EvPort) void {
         if (self.fd != -1) {
             port.removeInternal(.process);
-            _ = std.c.close(self.fd);
+            compat.close(self.fd);
         }
         self.watches.deinit(port.alloc);
         self.* = .{};
@@ -55,10 +56,10 @@ pub const State = struct {
     fn ensureFd(self: *State, port: *EvPort) ProcessError!void {
         if (self.fd != -1) return;
         const rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
-        if (linux.E.init(rc) != .SUCCESS) return ProcessError.SystemResources;
+        if (ep.rawErrno(rc) != .SUCCESS) return ProcessError.SystemResources;
         const fd: i32 = @intCast(rc);
         port.addInternal(.process, fd) catch |err| {
-            _ = std.c.close(fd);
+            compat.close(fd);
             return switch (err) {
                 // The process slot belongs to this module and is empty
                 // whenever self.fd is -1.
@@ -79,7 +80,7 @@ pub fn watch(port: *EvPort, fd: i32, udata: ?*anyopaque) ProcessError!void {
     if (fd < 0) return ProcessError.BadHandle;
     // ESRCH (an exited child is still watchable) and EPERM both confirm a
     // real pidfd; EINVAL marks any other pollable descriptor.
-    switch (linux.E.init(linux.pidfd_send_signal(fd, 0, null, 0))) {
+    switch (ep.rawErrno(linux.pidfd_send_signal(fd, compat.nativeSignal(0), null, 0))) {
         .SUCCESS, .SRCH, .PERM => {},
         .NOSYS => return ProcessError.Unsupported,
         .BADF, .INVAL => return ProcessError.BadHandle,
@@ -90,7 +91,7 @@ pub fn watch(port: *EvPort, fd: i32, udata: ?*anyopaque) ProcessError!void {
     const gop = st.watches.getOrPut(port.alloc, fd) catch return ProcessError.OutOfMemory;
     errdefer if (!gop.found_existing) st.watches.removeByPtr(gop.key_ptr);
     var ev: linux.epoll_event = .{ .events = linux.EPOLL.IN, .data = .{ .fd = fd } };
-    switch (linux.E.init(linux.epoll_ctl(st.fd, linux.EPOLL.CTL_ADD, fd, &ev))) {
+    switch (ep.rawErrno(linux.epoll_ctl(st.fd, linux.EPOLL.CTL_ADD, fd, &ev))) {
         .SUCCESS => {},
         // Already in the set: a re-watch, or a stale entry for a reused
         // descriptor number.
@@ -106,7 +107,7 @@ pub fn watch(port: *EvPort, fd: i32, udata: ?*anyopaque) ProcessError!void {
 pub fn unwatch(port: *EvPort, fd: i32) void {
     const st = &port.processes;
     if (!st.watches.remove(fd)) return;
-    switch (linux.E.init(linux.epoll_ctl(st.fd, linux.EPOLL.CTL_DEL, fd, null))) {
+    switch (ep.rawErrno(linux.epoll_ctl(st.fd, linux.EPOLL.CTL_DEL, fd, null))) {
         .SUCCESS => {},
         else => if (port.pending_error == null) {
             port.pending_error = error.RegisterFailed;
@@ -132,7 +133,7 @@ pub fn harvest(port: *EvPort, out: []Event) usize {
     var buf: [64]linux.epoll_event = undefined;
     const cap = @min(out.len, buf.len);
     const rc = linux.epoll_wait(st.fd, &buf, @intCast(cap), 0);
-    switch (linux.E.init(rc)) {
+    switch (ep.rawErrno(rc)) {
         .SUCCESS => {},
         .INTR => return 0,
         else => {
@@ -151,10 +152,10 @@ pub fn harvest(port: *EvPort, out: []Event) usize {
         var ev: Event = .{ .udata = udata, .exited = true };
         var info: linux.siginfo_t = std.mem.zeroes(linux.siginfo_t);
         const wrc = while (true) {
-            const r = linux.waitid(.PIDFD, fd, &info, linux.W.EXITED | linux.W.NOHANG);
-            if (linux.E.init(r) != .INTR) break r;
+            const r = compat.waitid(.PIDFD, fd, &info, linux.W.EXITED | linux.W.NOHANG);
+            if (ep.rawErrno(r) != .INTR) break r;
         };
-        switch (linux.E.init(wrc)) {
+        switch (ep.rawErrno(wrc)) {
             .SUCCESS => {
                 // WNOHANG with nothing to collect leaves si_pid zero: the
                 // status belongs to someone else (a tracer, or a racing
@@ -185,7 +186,7 @@ pub fn harvest(port: *EvPort, out: []Event) usize {
 /// Removes `fd` from the inner set. A failure would leave a reaped pidfd
 /// ready forever, so it is stashed as error.SourceFailed.
 fn drop(port: *EvPort, fd: i32) void {
-    switch (linux.E.init(linux.epoll_ctl(port.processes.fd, linux.EPOLL.CTL_DEL, fd, null))) {
+    switch (ep.rawErrno(linux.epoll_ctl(port.processes.fd, linux.EPOLL.CTL_DEL, fd, null))) {
         .SUCCESS => {},
         else => if (port.pending_error == null) {
             port.pending_error = error.SourceFailed;
@@ -209,13 +210,11 @@ const testing = std.testing;
 test "process_epoll: a descriptor epoll cannot poll is BadHandle" {
     var port = try EvPort.init(testing.allocator);
     defer port.deinit();
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try tmp.dir.createFile("not-a-pidfd", .{});
-    defer file.close();
+    const file = try compat.open("/dev/null", .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+    defer compat.close(file);
     var tag: u8 = 1;
-    try testing.expectError(ProcessError.BadHandle, watch(&port, file.handle, &tag));
-    try testing.expect(!port.processes.watches.contains(file.handle));
+    try testing.expectError(ProcessError.BadHandle, watch(&port, file, &tag));
+    try testing.expect(!port.processes.watches.contains(file));
     try testing.expectError(ProcessError.BadHandle, watch(&port, -1, &tag));
 }
 
@@ -225,9 +224,9 @@ test "process_epoll: unwatch and purge forget the pidfd" {
     // Own-pid pidfd: real pidfd (5.3, below the floor is fine here), and
     // this process never exits, so nothing becomes readable.
     const prc = linux.pidfd_open(linux.getpid(), 0);
-    try testing.expectEqual(linux.E.SUCCESS, linux.E.init(prc));
+    try testing.expectEqual(linux.E.SUCCESS, ep.rawErrno(prc));
     const fd: i32 = @intCast(prc);
-    defer _ = std.c.close(fd);
+    defer compat.close(fd);
     var tag: u8 = 1;
     try watch(&port, fd, &tag);
     try watch(&port, fd, &tag);
@@ -243,9 +242,9 @@ test "process_epoll: unwatch and purge forget the pidfd" {
 test "process_epoll: a pollable non-pidfd (pipe) is BadHandle" {
     var port = try EvPort.init(testing.allocator);
     defer port.deinit();
-    const fds = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
-    defer std.posix.close(fds[0]);
-    defer std.posix.close(fds[1]);
+    const fds = try compat.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    defer compat.close(fds[0]);
+    defer compat.close(fds[1]);
     var tag: u8 = 1;
     // Epoll would take the pipe; the probe refuses it like kqueue does.
     try testing.expectError(ProcessError.BadHandle, watch(&port, fds[0], &tag));
@@ -258,8 +257,8 @@ test "process_epoll: siginfo decodes to an exit" {
     info.fields.common.second.sigchld.status = 7;
     try testing.expectEqual(types.ProcessExit{ .code = 7 }, exitOf(info).?);
     info.code = CLD_KILLED;
-    info.fields.common.second.sigchld.status = linux.SIG.TERM;
-    try testing.expectEqual(types.ProcessExit{ .signal = linux.SIG.TERM }, exitOf(info).?);
+    info.fields.common.second.sigchld.status = compat.signalNumber(linux.SIG.TERM);
+    try testing.expectEqual(types.ProcessExit{ .signal = compat.signalNumber(linux.SIG.TERM) }, exitOf(info).?);
     info.code = CLD_DUMPED;
     try testing.expect(exitOf(info) != null);
     info.code = 5; // CLD_STOPPED

@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const born = @import("root.zig");
+const compat = @import("compat");
 const Event = born.Event;
 const alloc = std.testing.allocator;
 
@@ -20,10 +21,10 @@ const Seen = struct { udata: ?*anyopaque, fired: u32, batch: usize };
 fn collect(port: *born.EvPort, seen: *std.ArrayList(Seen), window_ms: u64, stop: usize, buf_len: usize) !void {
     var buf: [16]Event = undefined;
     const events = buf[0..buf_len];
-    var timer = try std.time.Timer.start();
+    const start = try compat.monotonicNs();
     var batch: usize = 0;
     while (seen.items.len < stop) {
-        const elapsed = timer.read() / std.time.ns_per_ms;
+        const elapsed = (try compat.monotonicNs() - start) / std.time.ns_per_ms;
         if (elapsed >= window_ms) break;
         const n = try port.wait(events, @intCast(window_ms - elapsed));
         for (events[0..n]) |ev| {
@@ -148,7 +149,7 @@ test "timer: deadlines are delivered in order across waits" {
     try std.testing.expectEqual(@as(usize, count), seen.items.len);
     // Within one batch order is free; across batches every deadline in a
     // later batch is no earlier than every deadline in an earlier one.
-    var delivered = [_]bool{false} ** count;
+    var delivered: [count]bool = @splat(false);
     var earlier_max: usize = 0;
     var batch_max: usize = 0;
     var batch: usize = 0;
@@ -173,12 +174,12 @@ test "timer: expirations beyond the event buffer wait for the next wait()" {
     var tags: [count]u8 = undefined;
     for (&tags, 0..) |*tag, i| try addOrSkip(&port, @intCast(200 + i), tag, 5, .once);
     // Let every timer fall due before the first harvest.
-    std.Thread.sleep(40 * std.time.ns_per_ms);
+    compat.sleepNs(40 * std.time.ns_per_ms);
     var seen: std.ArrayList(Seen) = .empty;
     defer seen.deinit(alloc);
     try collect(&port, &seen, 2000, count, 3);
     try std.testing.expectEqual(@as(usize, count), seen.items.len);
-    var delivered = [_]bool{false} ** count;
+    var delivered: [count]bool = @splat(false);
     for (seen.items) |s| {
         const idx = @intFromPtr(s.udata.?) - @intFromPtr(&tags[0]);
         try std.testing.expect(idx < count and !delivered[idx]);

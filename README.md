@@ -59,7 +59,9 @@ The raw event port has a uniform **type surface**, not identical I/O semantics.
 Use `born.socket.PlainNb` for the portable plain-TCP companion. TLS, certificate
 validation, HTTP and application logging are outside born. Backend-specific
 design rationale is in [docs/](docs/README.md); `zig build docs` generates
-declaration-level API documentation.
+declaration-level API documentation. The P3 analysis covers the
+[std.Io.VTable gap map](https://git.morante.net/daniel/engineering-docs/src/branch/master/born/born-vtable-gap.md)
+and [std.Io design lessons](https://git.morante.net/daniel/engineering-docs/src/branch/master/born/learned-from-ioloop.md).
 
 ### kqueue and epoll: readiness
 
@@ -294,8 +296,8 @@ child.close();
 | IOCP; kqueue on macOS, NetBSD, OpenBSD | none | spawn and watch return `error.Unsupported` | n/a |
 
 - **Born's successful spawn and setup path takes no allocator and performs no
-  user-space heap allocation:** argv and envp are the caller's NUL-terminated arrays, and the
-  fixed descriptor plan is ready before the fork. There is no PATH search
+  user-space heap allocation:** argv and envp are the caller's NUL-terminated
+  arrays, and the fixed descriptor plan is ready before the fork. There is no PATH search
   (`opts.path` or argv[0] is the program). Between fork and execve the child
   makes only async-signal-safe calls. FreeBSD libthr also runs the
   application's `pthread_atfork` handlers around `pdfork`; born registers
@@ -329,8 +331,8 @@ child.close();
   status is already available. A still-exiting child's pidfd goes to a lazily
   spawned detached reaper thread. If that thread cannot be spawned or its
   queue cannot allocate space, `close` itself falls back to a blocking reap;
-  it is therefore not unconditionally nonblocking, and the fallback is not
-  allocation-only. The reaper drains oldest-first, so one stalled exit delays
+  it is therefore not unconditionally nonblocking. The reaper drains
+  oldest-first, so one stalled exit delays
   later entries (#52). Loop code should `child.kill(sig)`, wait for the exit
   event, then `purgeFd` and `close`, which keeps reaping on the spot.
 - **kill** signals through the descriptor, so it never reaches a recycled
@@ -466,11 +468,15 @@ zig build test-bin -Dtarget=x86_64-windows-gnu --prefix zig-out/windows
 zig build test-bin -Dtarget=x86_64-linux-gnu --prefix zig-out/linux
 ```
 
-Requires Zig 0.15.2. The module propagates its libc or Winsock/kernel32 linkage.
-Forgejo CI checks the exact toolchain version, runs FreeBSD Debug/ReleaseSafe
-tests, compiles the seven-target test matrix, generates API documentation,
-links the Linux/Windows test executables and runs them on an Ubuntu 24.04 and
-a Windows Server 2022 runner.
+Born supports Zig 0.15.2, 0.16.0, and 0.17.1. `src/compat.zig` owns native ABI
+and toolchain-version differences; core code does not depend on `std.Io`.
+TCP companions accept `born.socket.Address`, Born's native sockaddr union, on
+all three toolchains. Callers using `std.net.Address` must migrate to this type.
+
+The module propagates its libc or Winsock/kernel32 linkage. Forgejo CI currently
+uses Zig 0.15.2, runs FreeBSD Debug/ReleaseSafe tests, compiles the seven-target
+test matrix, generates API documentation, links the Linux/Windows test
+executables and runs them on an Ubuntu 24.04 and a Windows Server 2022 runner.
 `check-targets` is deliberately compile-only, not evidence that target
 libraries link or that tests ran on those operating systems. Outside CI, run
 the `test-bin` output on its matching platform (hosts in `AGENTS.md`).

@@ -50,6 +50,8 @@ pub const WriteError = io.WriteError;
 pub const IoError = io.IoError;
 /// Overlapped stream operation classification.
 pub const CompletionKind = io.CompletionKind;
+/// Native socket address accepted by TCP companions.
+pub const Address = @import("compat").Address;
 /// Portable plaintext stream socket.
 pub const PlainNb = impl.PlainNb;
 

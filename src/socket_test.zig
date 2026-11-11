@@ -1,20 +1,29 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const compat = @import("compat");
 const born = @import("root.zig");
 const socket = @import("socket.zig");
 const PlainNb = socket.PlainNb;
-const windows = std.os.windows;
+const windows = compat.windows;
 const is_windows = builtin.os.tag == .windows;
 const alloc = std.testing.allocator;
+
+fn closeRaw(sock: compat.socket_t) void {
+    if (comptime is_windows) {
+        _ = windows.ws2_32.closesocket(sock);
+    } else {
+        compat.close(sock);
+    }
+}
 
 const Pair = struct {
     port: born.EvPort,
     client: PlainNb = .{},
     peer: PlainNb = .{},
     wsa_started: bool = false,
-    server: ?std.net.Server = null,
+    server: ?compat.Server = null,
     accept_ov: windows.OVERLAPPED = std.mem.zeroes(windows.OVERLAPPED),
-    accept_buf: [2 * (@sizeOf(std.net.Address) + 16)]u8 = undefined,
+    accept_buf: [2 * (@sizeOf(compat.Address) + 16)]u8 = undefined,
     accept_pending: bool = false,
     connected: bool = false,
     /// Set by the refusal test. epoll reports a refused connect as
@@ -34,7 +43,7 @@ const Pair = struct {
         switch (how) {
             .host => try self.client.startConnectInto(alloc, "127.0.0.1", port, &self.port, &self.client),
             .addr => {
-                const address = try std.net.Address.parseIp4("127.0.0.1", port);
+                const address = try compat.Address.parseIp4("127.0.0.1", port);
                 try self.client.startConnectAddrInto(address, &self.port, &self.client);
             },
         }
@@ -48,7 +57,7 @@ const Pair = struct {
             try std.testing.expectEqual(@as(c_int, 0), windows.ws2_32.WSAStartup(0x0202, &wsa));
             self.wsa_started = true;
         }
-        const address = try std.net.Address.parseIp4("127.0.0.1", 0);
+        const address = try compat.Address.parseIp4("127.0.0.1", 0);
         self.server = try address.listen(.{ .force_nonblocking = true });
         if (is_windows) {
             try self.postAccept();
@@ -71,7 +80,7 @@ const Pair = struct {
             try self.port.associate(self.peer.handle(), &self.peer);
         } else {
             if (comptime builtin.os.tag.isDarwin()) {
-                try std.posix.setsockopt(self.peer.sock, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, std.mem.asBytes(&@as(c_int, 1)));
+                try compat.setsockopt(self.peer.sock, compat.SOL.SOCKET, compat.SO.NOSIGPIPE, std.mem.asBytes(&@as(c_int, 1)));
             }
             self.port.monitorRead(self.client.handle(), &self.client);
             self.port.monitorRead(self.peer.handle(), &self.peer);
@@ -87,7 +96,7 @@ const Pair = struct {
         var bytes: u32 = 0;
         const listener = self.server.?.stream.handle;
         try std.testing.expectEqual(@as(c_int, 0), ws2.WSAIoctl(listener, ws2.SIO_GET_EXTENSION_FUNCTION_POINTER, &guid, @sizeOf(windows.GUID), @ptrCast(&accept_ex), @sizeOf(?AcceptEx), &bytes, null, null));
-        self.peer.sock = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, std.posix.IPPROTO.TCP);
+        self.peer.sock = try compat.socket(compat.AF.INET, compat.SOCK.STREAM | compat.SOCK.CLOEXEC, compat.IPPROTO.TCP);
         try self.port.associate(@ptrCast(listener), self);
         const rc = accept_ex.?(listener, self.peer.sock, &self.accept_buf, 0, self.accept_buf.len / 2, self.accept_buf.len / 2, &bytes, &self.accept_ov);
         try std.testing.expect(rc != 0 or ws2.WSAGetLastError() == .WSA_IO_PENDING);
@@ -119,7 +128,7 @@ const Pair = struct {
                     if (self.server != null) try std.testing.expect(!event.err);
                 } else {
                     try std.testing.expect(!event.err);
-                    self.peer.sock = std.posix.accept(self.server.?.stream.handle, null, null, std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK) catch |err| switch (err) {
+                    self.peer.sock = compat.accept(self.server.?.stream.handle, null, null, compat.SOCK.CLOEXEC | compat.SOCK.NONBLOCK) catch |err| switch (err) {
                         error.WouldBlock => continue,
                         else => return err,
                     };
@@ -206,7 +215,7 @@ const Pair = struct {
 
 test "plain socket has the same companion API on every target" {
     try std.testing.expect(@TypeOf(PlainNb.startConnectInto) == fn (*PlainNb, std.mem.Allocator, []const u8, u16, *born.EvPort, ?*anyopaque) socket.ConnectError!void);
-    try std.testing.expect(@TypeOf(PlainNb.startConnectAddrInto) == fn (*PlainNb, std.net.Address, *born.EvPort, ?*anyopaque) socket.ConnectAddrError!void);
+    try std.testing.expect(@TypeOf(PlainNb.startConnectAddrInto) == fn (*PlainNb, compat.Address, *born.EvPort, ?*anyopaque) socket.ConnectAddrError!void);
     try std.testing.expect(socket.ConnectAddrError == error{ ConnectFailed, SocketError });
     try std.testing.expect(@TypeOf(PlainNb.connectDone) == fn (*PlainNb) socket.ConnectDoneError!void);
     try std.testing.expect(@TypeOf(PlainNb.readNb) == fn (*PlainNb, []u8) socket.ReadError!socket.NbRead);
@@ -253,7 +262,7 @@ test "plain socket loopback round trip, partial drains, and EOF" {
     try std.testing.expectEqual(socket.CompletionKind.unknown, pair.client.absorbCompletion(null, 0, null));
     var unrelated = std.mem.zeroes(windows.OVERLAPPED);
     try std.testing.expectEqual(socket.CompletionKind.unknown, pair.client.absorbCompletion(&unrelated, 0, null));
-    var scratch = [_]u8{0xa5} ** 7;
+    var scratch: [7]u8 = @splat(0xa5);
     try std.testing.expectEqual(socket.NbRead.want_read, try pair.client.readNb(&scratch));
     try std.testing.expectEqual(socket.NbRead.want_read, try pair.client.readNb(&scratch));
     try std.testing.expectEqual(@as(usize, if (is_windows) 1 else 0), pair.client.pendingOps());
@@ -263,7 +272,7 @@ test "plain socket loopback round trip, partial drains, and EOF" {
     var received: [payload.len]u8 = undefined;
     try pair.transfer(&pair.client, &pair.peer, &payload, &received);
     try pair.transfer(&pair.peer, &pair.client, &received, &payload);
-    try std.testing.expectEqualSlices(u8, &([_]u8{0xa5} ** 7), &scratch);
+    try std.testing.expectEqualSlices(u8, &@as([7]u8, @splat(0xa5)), &scratch);
     try std.testing.expectEqual(socket.NbRead.want_read, try pair.client.readNb(&scratch));
     pair.peer.closeNotify();
     pair.close(&pair.peer);
@@ -329,13 +338,13 @@ fn connectRefused(how: Pair.Connect) !void {
     var pair: Pair = undefined;
     try pair.init();
     defer pair.deinit();
-    var address = try std.net.Address.parseIp4("127.0.0.1", 0);
-    const refused_socket = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
+    var address = try compat.Address.parseIp4("127.0.0.1", 0);
+    const refused_socket = try compat.socket(compat.AF.INET, compat.SOCK.STREAM | compat.SOCK.CLOEXEC, 0);
     var reserved = true;
-    defer if (reserved) std.posix.close(refused_socket);
-    try std.posix.bind(refused_socket, &address.any, address.getOsSockLen());
+    defer if (reserved) closeRaw(refused_socket);
+    try compat.bind(refused_socket, &address.any, address.getOsSockLen());
     var address_len = address.getOsSockLen();
-    try std.posix.getsockname(refused_socket, &address.any, &address_len);
+    try compat.getsockname(refused_socket, &address.any, &address_len);
     const refused_port = address.getPort();
     pair.close(&pair.client);
     try pair.drain();
@@ -347,7 +356,7 @@ fn connectRefused(how: Pair.Connect) !void {
     // keep the reservation: Windows refusal timing needs it, and it keeps the
     // port from being reused.
     if (builtin.os.tag.isDarwin()) {
-        std.posix.close(refused_socket);
+        compat.close(refused_socket);
         reserved = false;
     }
     pair.startClient(how, refused_port) catch |err| {
@@ -369,7 +378,7 @@ test "plain socket cancellation before connect completion is absorbed" {
     defer pair.deinit();
     pair.close(&pair.client);
     pair.client.deinit();
-    const address = try std.net.Address.parseIp4("127.0.0.1", 0);
+    const address = try compat.Address.parseIp4("127.0.0.1", 0);
     var server = try address.listen(.{ .force_nonblocking = true });
     defer server.deinit();
     try pair.client.startConnectInto(alloc, "127.0.0.1", server.listen_address.getPort(), &pair.port, &pair.client);
@@ -392,7 +401,7 @@ test "plain socket allocation failure releases startup state" {
         try std.testing.expect(!client.wsa_started);
         try std.testing.expect(client.sock == windows.ws2_32.INVALID_SOCKET);
     } else {
-        try std.testing.expectEqual(@as(std.posix.fd_t, -1), client.sock);
+        try std.testing.expectEqual(@as(compat.fd_t, -1), client.sock);
     }
 }
 
@@ -411,7 +420,7 @@ test "plain socket write after send shutdown reports an error without SIGPIPE" {
     var pair: Pair = undefined;
     try pair.init();
     defer pair.deinit();
-    try std.posix.shutdown(pair.client.sock, .send);
+    try compat.shutdown(pair.client.sock, .send);
     try std.testing.expectError(error.SocketError, pair.client.writeNb("closed"));
     try std.testing.expectEqual(@as(usize, 0), pair.client.pendingOps());
 }
@@ -421,7 +430,7 @@ test "plain socket overlapped send owns its submitted buffer" {
     var pair: Pair = undefined;
     try pair.init();
     defer pair.deinit();
-    var source = [_]u8{0x37} ** 8192;
+    var source: [8192]u8 = @splat(0x37);
     const expected = source;
     try std.testing.expectEqual(socket.NbWrite.want_write, try pair.client.writeNb(&source));
     @memset(&source, 0xa5);

@@ -40,18 +40,19 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const compat = @import("compat");
 const kq = @import("evport_kqueue.zig");
 const EvPort = kq.EvPort;
 const Kevent = kq.Kevent;
 const TimerError = kq.TimerError;
 const TimerMode = kq.TimerMode;
 
-const EV_ADD = std.posix.system.EV.ADD;
-const EV_DELETE = std.posix.system.EV.DELETE;
-const EV_ONESHOT = std.posix.system.EV.ONESHOT;
+const EV_ADD = std.c.EV.ADD;
+const EV_DELETE = std.c.EV.DELETE;
+const EV_ONESHOT = std.c.EV.ONESHOT;
 // Zig 0.15 omits ERROR on NetBSD (sys/event.h); same value as evport_kqueue.zig.
-const EV_ERROR = if (@hasDecl(std.posix.system.EV, "ERROR")) std.posix.system.EV.ERROR else 0x4000;
-const ENOENT = @intFromEnum(std.posix.E.NOENT);
+const EV_ERROR = if (@hasDecl(std.c.EV, "ERROR")) std.c.EV.ERROR else 0x4000;
+const ENOENT = @intFromEnum(compat.E.NOENT);
 
 /// EVFILT_TIMER fflags selecting milliseconds; see the unit table above.
 const NOTE_MSECONDS: @FieldType(Kevent, "fflags") = switch (builtin.os.tag) {
@@ -133,9 +134,10 @@ const Event = kq.Event;
 
 /// Waits up to `window_ms` for one event.
 fn waitOne(port: *EvPort, events: []Event, window_ms: i32) !usize {
-    var timer = try std.time.Timer.start();
+    const started_ns = try compat.monotonicNs();
     while (true) {
-        const elapsed: i32 = @intCast(timer.read() / std.time.ns_per_ms);
+        const elapsed_ns = (try compat.monotonicNs()) - started_ns;
+        const elapsed: i32 = @intCast(elapsed_ns / std.time.ns_per_ms);
         if (elapsed >= window_ms) return 0;
         const n = try port.wait(events, window_ms - elapsed);
         if (n != 0) return n;
@@ -178,7 +180,7 @@ test "timer_kqueue: cancel discards a fired but unharvested one-shot" {
     var tag: u8 = 1;
     try add(&port, 2, &tag, 5, .once);
     try testing.expectEqual(@as(usize, 0), try port.wait(&events, 0));
-    std.Thread.sleep(30 * std.time.ns_per_ms);
+    compat.sleepNs(30 * std.time.ns_per_ms);
     // Fired in the kernel, not yet harvested: still live, so the delete
     // finds the knote and takes the queued firing with it.
     try testing.expect(port.timers.live.contains(2));
@@ -204,7 +206,7 @@ test "timer_kqueue: other change errors still surface" {
     var tag: u8 = 1;
     var kev = change(4, EV_ADD, &tag, 0);
     kev.flags = EV_ERROR;
-    kev.data = @intFromEnum(std.posix.E.INVAL);
+    kev.data = @intFromEnum(compat.E.INVAL);
     try testing.expect(observe(&port, kev));
     kev.data = ENOENT;
     try testing.expect(!observe(&port, kev));

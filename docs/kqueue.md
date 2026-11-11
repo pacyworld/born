@@ -30,11 +30,12 @@ leaves subsequent changes unprocessed. Earlier changes and copied error
 records are not rolled back. `EV_RECEIPT` records consume the same slots.
 
 Born submits the entire staged changelist with at most 64 event slots and
-clears it even after `-1`. Until overflow handling is fixed, more rejections
-than available slots can therefore surface only `error.WaitFailed`, discard
-the copied error events, and drop the unprocessed suffix. An allocation
-failure before submission is instead stashed and returned as
-`error.OutOfMemory` from the next non-empty `wait()`.
+clears it even after `-1`. More rejections than available slots can therefore
+surface only `error.WaitFailed`, discard the copied error events, and drop the
+unprocessed suffix, as tracked in
+[#66](https://pacyworld.dev/pacyworld/born/issues/66). An allocation failure
+before submission is instead stashed and returned as `error.OutOfMemory` from
+the next non-empty `wait()`.
 
 Regular files are native kqueue readiness sources and remain perpetually
 ready. Consumers stop monitoring them at EOF to avoid a busy wait.

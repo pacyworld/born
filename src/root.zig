@@ -108,4 +108,5 @@ test {
     _ = @import("hint_test.zig");
     _ = @import("process.zig");
     _ = @import("process_test.zig");
+    _ = @import("compat_test.zig");
 }

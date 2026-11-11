@@ -29,7 +29,8 @@
 //! `error.Unsupported`.
 
 const std = @import("std");
-const windows = std.os.windows;
+const compat = @import("compat");
+const windows = compat.windows;
 const ws2 = windows.ws2_32;
 const kernel32 = windows.kernel32;
 const evport = @import("root.zig");
@@ -109,9 +110,9 @@ pub const Listener = struct {
     /// TCP listener on `addr` (port 0 picks one; see `localAddress`) with
     /// SO_EXCLUSIVEADDRUSE. A backlog of 200 or more is requested exactly
     /// (SOMAXCONN_HINT); smaller values are passed as given.
-    pub fn openTcp(alloc: std.mem.Allocator, addr: std.net.Address, opts: io.ListenOptions) io.ListenError!Listener {
+    pub fn openTcp(alloc: std.mem.Allocator, addr: compat.Address, opts: io.ListenOptions) io.ListenError!Listener {
         if (opts.reuse_port == .balanced) return io.ListenError.Unsupported;
-        const family: i32 = addr.any.family;
+        const family: i32 = @intCast(addr.any.family);
         if (family != ws2.AF.INET and family != ws2.AF.INET6) return io.ListenError.SocketError;
 
         var wsa: ws2.WSADATA = undefined;
@@ -263,15 +264,15 @@ pub const Listener = struct {
 
     /// The bound address (the chosen port after binding to port 0, or the
     /// path of a Unix listener).
-    pub fn localAddress(self: *const Listener) io.LocalAddressError!std.net.Address {
+    pub fn localAddress(self: *const Listener) io.LocalAddressError!compat.Address {
         if (self.sock == ws2.INVALID_SOCKET) return io.LocalAddressError.SocketError;
         var ss: ws2.sockaddr.storage = undefined;
         var len: i32 = @sizeOf(ws2.sockaddr.storage);
         if (ws2.getsockname(self.sock, @ptrCast(&ss), &len) != 0) return io.LocalAddressError.SocketError;
         switch (ss.family) {
-            ws2.AF.INET, ws2.AF.INET6 => return std.net.Address.initPosix(@ptrCast(&ss)),
+            ws2.AF.INET, ws2.AF.INET6 => return compat.Address.initPosix(@ptrCast(&ss)),
             ws2.AF.UNIX => {
-                if (comptime std.net.has_unix_sockets) {
+                if (comptime compat.has_unix_sockets) {
                     // getsockname may omit the path's NUL; zero-fill so it stays terminated.
                     var un = std.mem.zeroes(ws2.sockaddr.un);
                     const n = @min(@as(usize, @intCast(len)), @sizeOf(ws2.sockaddr.un));
@@ -345,7 +346,7 @@ pub const Listener = struct {
     }
 };
 
-fn bindAndListen(s: ws2.SOCKET, addr: std.net.Address, opts: io.ListenOptions) io.ListenError!void {
+fn bindAndListen(s: ws2.SOCKET, addr: compat.Address, opts: io.ListenOptions) io.ListenError!void {
     try setInt(s, ws2.SOL.SOCKET, SO_EXCLUSIVEADDRUSE, 1);
     if (addr.any.family == ws2.AF.INET6) try setInt(s, IPPROTO_IPV6, ws2.IPV6_V6ONLY, @intFromBool(opts.v6_only));
     if (ws2.bind(s, &addr.any, @intCast(addr.getOsSockLen())) != 0) return switch (ws2.WSAGetLastError()) {
@@ -409,9 +410,9 @@ fn completionError(status: usize) io.AcceptError {
 /// The next completion for `l`. One per wait, so none is dropped.
 fn waitFor(port: *evport.EvPort, l: *Listener) !evport.Event {
     var events: [1]evport.Event = undefined;
-    var timer = try std.time.Timer.start();
+    const start_ns = try compat.monotonicNs();
     while (true) {
-        const elapsed = timer.read() / std.time.ns_per_ms;
+        const elapsed = (try compat.monotonicNs() - start_ns) / std.time.ns_per_ms;
         if (elapsed >= 5000) return error.ListenerEventTimeout;
         const n = try port.wait(&events, @intCast(5000 - elapsed));
         for (events[0..n]) |ev| {
@@ -435,7 +436,7 @@ fn expectCompletionOutcome(status: windows.NTSTATUS, want: ?io.AcceptError) !voi
     defer _ = ws2.WSACleanup();
     var port = try evport.EvPort.init(testing.allocator);
     defer port.deinit();
-    var l = try Listener.openTcp(testing.allocator, try std.net.Address.parseIp4("127.0.0.1", 0), .{ .accept_depth = 1 });
+    var l = try Listener.openTcp(testing.allocator, try compat.Address.parseIp4("127.0.0.1", 0), .{ .accept_depth = 1 });
     try l.register(&port, &l);
     const slot = &l.slots[0];
     try testing.expect(kernel32.CancelIoEx(l.handle(), &slot.ov) != 0);
@@ -454,7 +455,7 @@ fn expectCompletionOutcome(status: windows.NTSTATUS, want: ?io.AcceptError) !voi
     // connection is accepted.
     try testing.expectEqual(io.AcceptResult.want_accept, try l.acceptNb(&out, &out));
     try testing.expectEqual(@as(usize, 1), l.pendingOps());
-    var client = try std.net.tcpConnectToAddress(try l.localAddress());
+    var client = try compat.tcpConnectToAddress(try l.localAddress());
     defer client.close();
     const ev = try waitFor(&port, &l);
     try testing.expectEqual(io.ListenerCompletion.accept, l.absorbCompletion(ev.overlapped, ev.bytes, if (ev.err) ev.err_no else null));
@@ -484,7 +485,7 @@ test "listener_windows: register on the same port re-posts idle slots" {
     var other = try evport.EvPort.init(testing.allocator);
     defer other.deinit();
     const depth = 2;
-    var l = try Listener.openTcp(testing.allocator, try std.net.Address.parseIp4("127.0.0.1", 0), .{ .accept_depth = depth });
+    var l = try Listener.openTcp(testing.allocator, try compat.Address.parseIp4("127.0.0.1", 0), .{ .accept_depth = depth });
     try l.register(&port, &l);
 
     // Resuming with nothing idle posts nothing more.
@@ -514,10 +515,10 @@ test "listener_windows: register on the same port re-posts idle slots" {
     try testing.expectEqual(io.AcceptResult.want_accept, try l.acceptNb(&out, &out));
 
     // Every slot accepts again.
-    var clients: [depth]std.net.Stream = undefined;
-    for (&clients) |*c| c.* = try std.net.tcpConnectToAddress(try l.localAddress());
+    var clients: [depth]compat.Stream = undefined;
+    for (&clients) |*c| c.* = try compat.tcpConnectToAddress(try l.localAddress());
     defer for (&clients) |*c| c.close();
-    var streams = [_]PlainNb{.{}} ** depth;
+    var streams: [depth]PlainNb = @splat(.{});
     var accepted: usize = 0;
     while (accepted < depth) {
         const ev = try waitFor(&port, &l);

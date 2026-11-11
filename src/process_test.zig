@@ -4,11 +4,12 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const compat = @import("compat");
 const born = @import("root.zig");
 const process = born.process;
 const Event = born.Event;
 const alloc = std.testing.allocator;
-const posix = std.posix;
+const posix = compat;
 
 const no_env = [_:null]?[*:0]const u8{};
 
@@ -33,9 +34,9 @@ const sleep_long = [_:null]?[*:0]const u8{ "/bin/sleep", "30" };
 /// or signal fields set.
 fn waitExit(port: *born.EvPort, udata: *anyopaque, window_ms: u64) !Event {
     var events: [8]Event = undefined;
-    var timer = try std.time.Timer.start();
+    const start = try compat.monotonicNs();
     while (true) {
-        const elapsed = timer.read() / std.time.ns_per_ms;
+        const elapsed = (try compat.monotonicNs() - start) / std.time.ns_per_ms;
         if (elapsed >= window_ms) return error.TestExpectedExit;
         const n = try port.wait(&events, @intCast(window_ms - elapsed));
         for (events[0..n]) |ev| {
@@ -52,10 +53,10 @@ fn waitExit(port: *born.EvPort, udata: *anyopaque, window_ms: u64) !Event {
 /// two seconds: a running FreeBSD child whose descriptor was closed is
 /// reaped by init.
 fn expectGone(pid: i32) !void {
-    var timer = try std.time.Timer.start();
-    while (timer.read() < 2 * std.time.ns_per_s) {
+    const start = try compat.monotonicNs();
+    while (try compat.monotonicNs() - start < 2 * std.time.ns_per_s) {
         if (try gone(pid)) return;
-        std.Thread.sleep(10 * std.time.ns_per_ms);
+        compat.sleepNs(10 * std.time.ns_per_ms);
     }
     return error.TestProcessNotReaped;
 }
@@ -66,15 +67,15 @@ fn gone(pid: i32) !bool {
             const linux = std.os.linux;
             var info: linux.siginfo_t = undefined;
             // ECHILD: no child with this pid is left to wait for.
-            const rc = linux.waitid(.PID, pid, &info, linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT);
-            return linux.E.init(rc) == .CHILD;
+            const rc = compat.waitid(.PID, pid, &info, linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT);
+            return compat.linuxErrno(rc) == .CHILD;
         },
         .freebsd => {
             // kern.proc.pid lists zombies too.
             const mib = [4]c_int{ 1, 14, 1, pid }; // CTL_KERN, KERN_PROC, KERN_PROC_PID
             var len: usize = 0;
             if (std.c.sysctl(&mib, mib.len, null, &len, null, 0) != 0) {
-                return switch (posix.errno(@as(c_int, -1))) {
+                return switch (std.posix.errno(@as(c_int, -1))) {
                     .SRCH => true,
                     else => error.Unexpected,
                 };
@@ -113,30 +114,31 @@ test "process: a signal-killed child reports the signal" {
     defer port.deinit();
     // Block and ignore SIGTERM here: the child must still start with an
     // empty mask and default dispositions, so the signal ends it.
+    const signo = compat.signalNumber(std.posix.SIG.TERM);
     var term = posix.sigemptyset();
-    posix.sigaddset(&term, posix.SIG.TERM);
+    posix.sigaddset(&term, signo);
     var mask: posix.sigset_t = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.pthread_sigmask(posix.SIG.BLOCK, &term, &mask));
-    defer _ = std.c.pthread_sigmask(posix.SIG.SETMASK, &mask, &term);
-    const ignore: posix.Sigaction = .{ .handler = .{ .handler = posix.SIG.IGN }, .mask = posix.sigemptyset(), .flags = 0 };
+    try std.testing.expectEqual(@as(c_int, 0), compat.pthreadSigmask(std.posix.SIG.BLOCK, &term, &mask));
+    defer _ = compat.pthreadSigmask(std.posix.SIG.SETMASK, &mask, &term);
+    const ignore: posix.Sigaction = .{ .handler = .{ .handler = std.posix.SIG.IGN }, .mask = posix.sigemptyset(), .flags = 0 };
     var prior: posix.Sigaction = undefined;
-    posix.sigaction(posix.SIG.TERM, &ignore, &prior);
-    defer posix.sigaction(posix.SIG.TERM, &prior, null);
+    posix.sigaction(signo, &ignore, &prior);
+    defer posix.sigaction(signo, &prior, null);
 
     var child = try spawnOrSkip(&sleep_long, .{});
     defer child.close();
     var tag: u8 = 0;
     try port.watchProcess(child.handle, &tag);
-    try child.kill(posix.SIG.TERM);
+    try child.kill(signo);
     const ev = try waitExit(&port, &tag, 5000);
     try std.testing.expect(!ev.err);
-    try std.testing.expectEqual(born.ProcessExit{ .signal = posix.SIG.TERM }, ev.exit.?);
+    try std.testing.expectEqual(born.ProcessExit{ .signal = signo }, ev.exit.?);
     // Linux reaped the child in wait(); FreeBSD keeps the zombie, which
     // still accepts (and ignores) signals until close.
     if (builtin.os.tag == .linux) {
-        try std.testing.expectError(error.Exited, child.kill(posix.SIG.TERM));
+        try std.testing.expectError(error.Exited, child.kill(signo));
     } else {
-        try child.kill(posix.SIG.TERM);
+        try child.kill(signo);
     }
     port.purgeFd(child.handle);
 }
@@ -205,9 +207,9 @@ test "process: unwatch then close kills a running child" {
     var pipe_tag: u8 = 0;
     port.monitorRead(life[0], &pipe_tag);
     child.close();
-    var timer = try std.time.Timer.start();
+    const start = try compat.monotonicNs();
     var eof = false;
-    while (!eof and timer.read() < 5 * std.time.ns_per_s) {
+    while (!eof and try compat.monotonicNs() - start < 5 * std.time.ns_per_s) {
         const n = try port.wait(&events, 1000);
         for (events[0..n]) |ev| {
             try std.testing.expect(ev.udata == @as(?*anyopaque, &pipe_tag));
@@ -242,8 +244,8 @@ test "process: an exit is delivered among timer and descriptor events" {
     var saw_timer = false;
     var saw_sock = false;
     var events: [8]Event = undefined;
-    var clock = try std.time.Timer.start();
-    while (!(saw_exit and saw_timer and saw_sock) and clock.read() < 5 * std.time.ns_per_s) {
+    const start = try compat.monotonicNs();
+    while (!(saw_exit and saw_timer and saw_sock) and try compat.monotonicNs() - start < 5 * std.time.ns_per_s) {
         const n = try port.wait(&events, 1000);
         for (events[0..n]) |ev| {
             try std.testing.expect(!ev.err);
@@ -279,15 +281,15 @@ test "process: watching a child that already exited fires at once" {
         .linux => {
             const linux = std.os.linux;
             var info: linux.siginfo_t = undefined;
-            while (linux.E.init(linux.waitid(.PIDFD, child.handle, &info, linux.W.EXITED | linux.W.NOWAIT)) == .INTR) {}
+            while (compat.linuxErrno(compat.waitid(.PIDFD, child.handle, &info, linux.W.EXITED | linux.W.NOWAIT)) == .INTR) {}
         },
         .freebsd => {
             var first = try born.EvPort.init(alloc);
             try first.watchProcess(child.handle, null);
             var events: [4]Event = undefined;
             var saw = false;
-            var clock = try std.time.Timer.start();
-            while (!saw and clock.read() < 5 * std.time.ns_per_s) {
+            const start = try compat.monotonicNs();
+            while (!saw and try compat.monotonicNs() - start < 5 * std.time.ns_per_s) {
                 const n = try first.wait(&events, 1000);
                 for (events[0..n]) |ev| saw = saw or ev.exited;
             }
@@ -338,7 +340,7 @@ test "process: unsupported targets refuse spawn and watch" {
     try std.testing.expectError(error.Unsupported, process.spawn(&sleep_long, &no_env, .{}));
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
-    const handle: born.Handle = if (builtin.os.tag == .windows) std.os.windows.INVALID_HANDLE_VALUE else 0;
+    const handle: born.Handle = if (builtin.os.tag == .windows) compat.windows.INVALID_HANDLE_VALUE else 0;
     try std.testing.expectError(error.Unsupported, port.watchProcess(handle, null));
     port.unwatchProcess(handle);
 }

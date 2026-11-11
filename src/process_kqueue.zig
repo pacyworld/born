@@ -23,6 +23,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const compat = @import("compat");
 const kq = @import("evport_kqueue.zig");
 const types = @import("types.zig");
 const EvPort = kq.EvPort;
@@ -36,10 +37,10 @@ pub const EVFILT_PROCDESC = if (have_procdesc) std.c.EVFILT.PROCDESC else 0;
 /// sys/event.h NOTE_EXIT.
 const NOTE_EXIT: u32 = 0x80000000;
 
-const EV_ADD = std.posix.system.EV.ADD;
-const EV_DELETE = std.posix.system.EV.DELETE;
-const EV_ERROR = if (@hasDecl(std.posix.system.EV, "ERROR")) std.posix.system.EV.ERROR else 0x4000;
-const ENOENT = @intFromEnum(std.posix.E.NOENT);
+const EV_ADD = std.c.EV.ADD;
+const EV_DELETE = std.c.EV.DELETE;
+const EV_ERROR = if (@hasDecl(std.c.EV, "ERROR")) std.c.EV.ERROR else 0x4000;
+const ENOENT = @intFromEnum(compat.E.NOENT);
 
 /// Per-port watch bookkeeping, a field of EvPort (`processes`).
 pub const State = struct {
@@ -166,9 +167,9 @@ test "process_kqueue: a refused add is an error event and ends the watch" {
     if (!have_procdesc) return error.SkipZigTest;
     var port = try EvPort.init(testing.allocator);
     defer port.deinit();
-    const fds = try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
-    defer std.posix.close(fds[0]);
-    defer std.posix.close(fds[1]);
+    const fds = try compat.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    defer compat.close(fds[0]);
+    defer compat.close(fds[1]);
     var tag: u8 = 1;
     // A pipe is not a process descriptor.
     try watch(&port, fds[0], &tag);

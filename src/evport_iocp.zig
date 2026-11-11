@@ -27,20 +27,14 @@
 //! and Event.exit null.
 
 const std = @import("std");
-const windows = std.os.windows;
+const compat = @import("compat");
+const windows = compat.windows;
 const kernel32 = windows.kernel32;
 const types = @import("types.zig");
 const timer_iocp = @import("timer_iocp.zig");
 const signal_windows = @import("signal_windows.zig");
 
-// Zig 0.15's OVERLAPPED_ENTRY declares lpOverlapped non-null, but posted
-// completions may carry null. Keep the native layout with a nullable field.
-const CompletionEntry = extern struct {
-    lpCompletionKey: usize,
-    lpOverlapped: ?*windows.OVERLAPPED,
-    Internal: usize,
-    dwNumberOfBytesTransferred: u32,
-};
+const CompletionEntry = windows.OVERLAPPED_ENTRY;
 
 pub const Handle = types.Handle;
 pub const Event = types.Event;
@@ -68,7 +62,7 @@ pub const blockSignals = signal_windows.blockSignals;
 pub const InternalKind = enum { timer, signal };
 
 /// Stable addresses used as internal completion keys, one per kind.
-var internal_keys = [_]u8{0} ** std.meta.fields(InternalKind).len;
+var internal_keys: [compat.enumFields(InternalKind).len]u8 = @splat(0);
 
 fn internalKind(key: usize) ?InternalKind {
     const base = @intFromPtr(&internal_keys);
@@ -113,7 +107,7 @@ pub const EvPort = struct {
         // handle closes.
         self.signals.deinit(self);
         self.timers.deinit(self);
-        if (self.iocp != windows.INVALID_HANDLE_VALUE) _ = windows.CloseHandle(self.iocp);
+        if (self.iocp != windows.INVALID_HANDLE_VALUE) _ = kernel32.CloseHandle(self.iocp);
         self.iocp = windows.INVALID_HANDLE_VALUE;
     }
 
@@ -241,10 +235,10 @@ pub const EvPort = struct {
         var entries: [64]CompletionEntry = undefined;
         const cap = @min(events.len, entries.len);
         var removed: u32 = 0;
-        const ms: u32 = if (timeout_ms) |t| @intCast(@max(t, 0)) else 0xFFFFFFFF; // INFINITE
+        const ms: u32 = if (timeout_ms) |t| @intCast(@max(t, 0)) else windows.INFINITE;
         const ok = kernel32.GetQueuedCompletionStatusEx(self.iocp, @ptrCast(&entries), @intCast(cap), &removed, ms, 0);
         if (ok == 0) {
-            const err = windows.GetLastError();
+            const err = kernel32.GetLastError();
             if (err == .WAIT_TIMEOUT) return 0;
             return WaitError.WaitFailed;
         }
@@ -352,12 +346,14 @@ test "iocp: empty wait preserves raw posted completions" {
     try std.testing.expectEqual(@as(usize, 0), try port.wait(&events, 0));
 }
 
-test "iocp: nullable completion entry matches native ABI" {
-    try std.testing.expectEqual(@sizeOf(windows.OVERLAPPED_ENTRY), @sizeOf(CompletionEntry));
-    try std.testing.expectEqual(@alignOf(windows.OVERLAPPED_ENTRY), @alignOf(CompletionEntry));
-    inline for (.{ "lpCompletionKey", "lpOverlapped", "Internal", "dwNumberOfBytesTransferred" }) |name| {
-        try std.testing.expectEqual(@offsetOf(windows.OVERLAPPED_ENTRY, name), @offsetOf(CompletionEntry, name));
-    }
+test "iocp: native completion entries allow null overlapped pointers" {
+    const entry: CompletionEntry = .{
+        .lpCompletionKey = 0,
+        .lpOverlapped = null,
+        .Internal = 0,
+        .dwNumberOfBytesTransferred = 0,
+    };
+    try std.testing.expect(entry.lpOverlapped == null);
 }
 
 test "iocp: completion status is raw while relay and wake sentinels have no error" {
@@ -403,7 +399,7 @@ test "iocp: internal completion keys are distinct from wake and caller keys" {
     try std.testing.expect(internalKind(@intFromPtr(&tag)) == null);
     try std.testing.expect(internalKind(@intFromPtr(EvPort.wakeKey())) == null);
     try std.testing.expect(internalKind(0) == null);
-    inline for (std.meta.fields(InternalKind)) |field| {
+    inline for (comptime compat.enumFields(InternalKind)) |field| {
         const kind: InternalKind = @enumFromInt(field.value);
         try std.testing.expectEqual(@as(?InternalKind, kind), internalKind(@intFromPtr(EvPort.internalKey(kind))));
         try std.testing.expect(EvPort.internalKey(kind) != EvPort.wakeKey());
