@@ -90,11 +90,10 @@ errno in `.err_no` (and
 before the change ever reaches the kernel is stashed and returned as
 `error.OutOfMemory` the same way epoll stashes its rejections.
 
-On kqueue, a rejected change that finds no eventlist slot makes `kevent()`
-return `-1` and leaves subsequent changes unprocessed. Born currently clears
-the submitted changelist in this case, so `error.WaitFailed` can hide copied
-error events and the unprocessed suffix. See [kqueue backend
-rationale](docs/kqueue.md) for the complete contract.
+On kqueue, each submission is bounded to the available event slots. Every
+rejected change has room for its `EV_ERROR` record, results are returned in
+order, and remaining changes stay staged for the next wait. See
+[kqueue backend rationale](docs/kqueue.md) for the complete contract.
 
 **Regular files work identically on every POSIX backend.** I/O on a regular
 file never blocks, so "always ready" is the correct answer. kqueue accepts

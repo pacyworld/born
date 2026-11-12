@@ -330,7 +330,8 @@ pub const EvPort = struct {
         };
     }
 
-    /// Flush the staged changelist and harvest events in one kevent call.
+    /// Flush a bounded prefix of the staged changelist and harvest events in
+    /// one kevent call. Remaining changes stay staged for the next wait.
     /// `timeout_ms` must be null or nonnegative. null blocks until an event,
     /// zero harvests without blocking, and positive values wait that many
     /// milliseconds. A stashed allocation failure is reported here once,
@@ -352,12 +353,18 @@ pub const EvPort = struct {
             tsp = &ts;
         }
 
+        // Every change may produce an EV_ERROR record. Limiting the prefix to
+        // the eventlist capacity guarantees each rejection has a record slot;
+        // later waits submit the remaining changes in order.
+        const submitted = @min(self.changes.items.len, cap);
         const n = if (builtin.os.tag == .netbsd)
-            netbsd.__kevent50(self.kq, self.changes.items.ptr, self.changes.items.len, &kbuf, cap, tsp)
+            netbsd.__kevent50(self.kq, self.changes.items.ptr, submitted, &kbuf, cap, tsp)
         else
-            std.c.kevent(self.kq, self.changes.items.ptr, @intCast(self.changes.items.len), &kbuf, @intCast(cap), tsp);
-        self.changes.clearRetainingCapacity();
-        process_kqueue.flushed(self);
+            std.c.kevent(self.kq, self.changes.items.ptr, @intCast(submitted), &kbuf, @intCast(cap), tsp);
+        process_kqueue.flushed(self, submitted);
+        const remaining = self.changes.items.len - submitted;
+        for (self.changes.items[0..remaining], 0..) |*kev, i| kev.* = self.changes.items[i + submitted];
+        self.changes.items.len = remaining;
         if (n < 0) {
             const e = std.posix.errno(@as(isize, n));
             if (e == .INTR) return 0;
@@ -521,6 +528,59 @@ test "kqueue: registration error survives empty wait with errno payload" {
     // A failed registration is not readiness.
     try std.testing.expect(!events[0].readable);
     try std.testing.expect(!events[0].writable);
+}
+
+test "kqueue: eventlist capacity preserves rejected changes and the suffix" {
+    var port = try EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const closed = try compat.pipe2(PIPE2_FLAGS);
+    compat.close(closed[0]);
+    compat.close(closed[1]);
+    var tags: [2]u8 = .{ 1, 2 };
+    port.monitorRead(closed[0], &tags[0]);
+    port.monitorRead(closed[1], &tags[1]);
+    var timer_tag: u8 = 3;
+    try port.addTimer(99, &timer_tag, 1, .once);
+
+    var event: [1]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try port.wait(&event, 0));
+    try std.testing.expect(event[0].err and event[0].udata == @as(?*anyopaque, &tags[0]));
+    try std.testing.expectEqual(@as(usize, @intFromEnum(compat.E.BADF)), event[0].err_no);
+    try std.testing.expectEqual(@as(usize, 2), port.changes.items.len);
+
+    try std.testing.expectEqual(@as(usize, 1), try port.wait(&event, 0));
+    try std.testing.expect(event[0].err and event[0].udata == @as(?*anyopaque, &tags[1]));
+    try std.testing.expectEqual(@as(usize, @intFromEnum(compat.E.BADF)), event[0].err_no);
+    try std.testing.expectEqual(@as(usize, 1), port.changes.items.len);
+
+    try std.testing.expectEqual(@as(usize, 1), try port.wait(&event, 1000));
+    try std.testing.expect(event[0].timer and event[0].udata == @as(?*anyopaque, &timer_tag));
+    try std.testing.expectEqual(@as(usize, 0), port.changes.items.len);
+}
+
+test "kqueue: 65 rejections cross the 64-slot boundary without loss" {
+    var port = try EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    var closed: [65]Handle = undefined;
+    for (&closed) |*fd| fd.* = try compat.open("/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    for (closed) |fd| compat.close(fd);
+    var tags: [65]u8 = @splat(0);
+    for (&tags, 0..) |*tag, i| port.monitorRead(closed[i], tag);
+    var timer_tag: u8 = 1;
+    try port.addTimer(100, &timer_tag, 1, .once);
+
+    var events: [64]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 64), try port.wait(&events, 0));
+    for (events) |event| try std.testing.expect(event.err);
+    try std.testing.expectEqual(@as(usize, 2), port.changes.items.len);
+
+    try std.testing.expectEqual(@as(usize, 1), try port.wait(&events, 0));
+    try std.testing.expect(events[0].err);
+    try std.testing.expectEqual(@as(usize, 0), port.changes.items.len);
+
+    try std.testing.expectEqual(@as(usize, 1), try port.wait(&events, 1000));
+    try std.testing.expect(events[0].timer and events[0].udata == @as(?*anyopaque, &timer_tag));
+    try std.testing.expectEqual(@as(usize, 0), port.changes.items.len);
 }
 
 test "kqueue: allocation failure is reported by the next wait, once" {
