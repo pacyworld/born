@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("compat");
+const born = @import("root.zig");
 const backend = switch (builtin.os.tag) {
     .freebsd, .macos, .netbsd, .openbsd => @import("evport_kqueue.zig"),
     .linux => @import("evport_epoll.zig"),
@@ -17,7 +18,7 @@ test "reactor has exact non-generic handle and event API" {
     try std.testing.expect(backend.Event == @import("types.zig").Event);
     if (builtin.os.tag == .windows) {
         try std.testing.expect(@TypeOf(Port.associate) == fn (*Port, Handle, ?*anyopaque) backend.AssociateError!void);
-        try std.testing.expect(@TypeOf(Port.post) == fn (*Port, *anyopaque, ?*compat.windows.OVERLAPPED, usize) void);
+        try std.testing.expect(@TypeOf(Port.post) == fn (*Port, *anyopaque, ?*born.windows.OVERLAPPED, usize) void);
         try std.testing.expect(@TypeOf(Port.wakeKey) == fn () *anyopaque);
     }
     try std.testing.expect(@TypeOf(Port.init) == fn (std.mem.Allocator) backend.InitError!Port);
@@ -50,7 +51,7 @@ test "reactor has exact non-generic handle and event API" {
     const event = backend.Event{};
     try std.testing.expect(@TypeOf(event.udata) == ?*anyopaque);
     try std.testing.expect(@TypeOf(event.err_no) == usize);
-    try std.testing.expect(@TypeOf(event.overlapped) == ?*compat.windows.OVERLAPPED);
+    try std.testing.expect(@TypeOf(event.overlapped) == ?*born.windows.OVERLAPPED);
     try std.testing.expect(@TypeOf(event.bytes) == usize);
     inline for (.{ "readable", "writable", "eof", "err", "wake", "timer", "exited" }) |name| {
         try std.testing.expect(@TypeOf(@field(event, name)) == bool);
@@ -66,6 +67,26 @@ test "reactor has exact non-generic handle and event API" {
     try std.testing.expect(event.overlapped == null);
     try std.testing.expectEqual(@as(usize, 0), event.err_no);
     try std.testing.expectEqual(@as(usize, 0), event.bytes);
+}
+
+test "public overlapped type executes post and absorbCompletion" {
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    var overlapped: born.windows.OVERLAPPED = std.mem.zeroes(born.windows.OVERLAPPED);
+    var stream: born.socket.PlainNb = .{};
+    try std.testing.expectEqual(
+        born.socket.CompletionKind.unknown,
+        stream.absorbCompletion(&overlapped, 0, null),
+    );
+    if (builtin.os.tag != .windows) return;
+
+    var tag: u8 = 1;
+    port.post(&tag, &overlapped, 7);
+    var events: [4]born.Event = undefined;
+    const n = try port.wait(&events, 1000);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expect(events[0].overlapped == &overlapped);
+    try std.testing.expectEqual(@as(usize, 7), events[0].bytes);
 }
 
 test "reactor interest methods execute with native handles" {

@@ -2726,10 +2726,9 @@ pub const Mutex = if (is_windows) struct {
     }
 };
 
-const PthreadCondattr = if (@hasDecl(std.c, "pthread_condattr_t"))
-    std.c.pthread_condattr_t
-else
-    extern struct { bytes: [64]u8 align(16) };
+// A pointer on FreeBSD/OpenBSD, 4 bytes on glibc, and 16 on NetBSD. Darwin
+// returns before using this storage; 64 bytes covers every non-Darwin layout.
+const PthreadCondattr = extern struct { bytes: [64]u8 align(16) };
 
 extern "c" fn pthread_condattr_init(attr: *PthreadCondattr) c_int;
 extern "c" fn pthread_condattr_setclock(attr: *PthreadCondattr, clock: clockid_t) c_int;
