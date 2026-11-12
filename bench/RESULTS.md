@@ -141,10 +141,12 @@ delta 0 over 3 s.
 truss and DTrace report different totals for the multi-connection scenarios
 (echo16 2.076 here vs 2.626 in (a); storm16 5.143 vs 7.305), so the gate's
 thresholds are calibrated to these truss medians, not the DTrace baseline.
-Syscalls/req is deterministic (spread < 0.01); its bound sits roughly 0.5-0.9
-above the median, so a regression of about one syscall per request trips it,
-such as losing the readiness counts (echo1 3.009 -> ~4) or the EVFILT_USER wake
-(wake 4.232 -> ~8 back on the pipe).
+Syscalls/req is deterministic on this host (spread < 0.01); its bound sits
+roughly 0.5-0.9 above the median, so a regression of about one syscall per
+request trips it, such as losing the readiness counts (echo1 3.009 -> ~4). The
+wake bound is wider (5.6 rather than ~5.0) because wake is not deterministic on
+runner01's 6 CPUs (see the re-verification below); it still catches the
+EVFILT_USER loss that puts wake back at ~8 on the pipe (wake 4.232 here).
 Latency carries the shared host's noise (echo1 p50 46.1 here vs ~30 in the
 quieter (a)/(c) runs); its bound is roughly 2x the median, a coarse guard
 against gross regressions rather than noise. `bench/regress.sh` reports all
@@ -155,7 +157,13 @@ Re-verified on the CI host via workflow dispatch (born run #156, commit
 `25f5b35`): runner01 is FreeBSD 15.1-RELEASE-p5 with **6 CPUs**, so the bench
 takes the `ncpu < 12` pinning branch (server CPU 0, clients CPUs 0-5). The
 quiet guard passed (load1 2.68 <= 0.5*6 = 3.00, ip netisr Len 0, QDrops delta
-0) and all fifteen metrics stayed within these same thresholds, so no
-recalibration was needed. runner01's faster hardware lowers latency (echo1 p50
-17.8 us, wake p50 4.7 us); syscalls/req matches the calibration (echo1 3.005,
-echo16 2.068, storm16 5.132, bulk4 5.621, wake 4.845).
+0) and `regress.sh` reported all fifteen metrics within bounds. runner01's
+faster hardware lowers latency (echo1 p50 17.8 us, wake p50 4.7 us). echo1,
+echo16, storm16 and bulk4 syscalls/req are deterministic and match the
+calibration (3.005, 2.068, 5.132, 5.621). **wake does not match and is not
+deterministic here**: 4.845 against the calibration's 4.232, with five reps
+spanning 4.554-5.044 (spread 0.49). The 6-CPU pinning puts server and clients on
+the same CPUs (0-5), so wake coalescing varies run to run. The median stayed
+under the old 5.0 bound but with only 0.155 headroom, so a busier host could
+push the median over it with no code change; the wake bound is therefore raised
+to 5.6 (review 424). Losing EVFILT_USER still regresses wake to ~8 and trips it.

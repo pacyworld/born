@@ -55,7 +55,7 @@ tarball, verified against a pinned SHA-256 and cached under
 
 | Job | Runner (`runs-on`) | What it does |
 |---|---|---|
-| `fmt` | runner01, FreeBSD 15 (`FreeBSD`) | The single Zig 0.15.2 `zig fmt --check .` gate plus README/AGENTS consistency (versions, `zig016`/`zig0171`, seven target rows). No fmt matrix |
+| `fmt` | runner01, FreeBSD 15 (`FreeBSD`) | The single Zig 0.15.2 `zig fmt --check .` gate plus README/AGENTS version-and-target presence (versions, `zig016`/`zig0171`, seven target names); `build.zig` carries the real target-table row guard. No fmt matrix |
 | `build` | runner01, FreeBSD 15 (`FreeBSD`) | Matrix `zig: [0.15.2, 0.16.0, 0.17.1]`, `max-parallel: 1`; native Debug and ReleaseSafe tests (kqueue); `check-targets`; API docs; cross-builds both `born-tests` executables in Debug and ReleaseSafe and uploads each with its sha256 |
 | `linux-runtime` | runner03, Ubuntu 24.04 (`ubuntu-24.04`) | Matrix `zig × optimize`; runs the Linux executable in a `node:24-bookworm` container on the runner's kernel (epoll) |
 | `windows-runtime` | runner02, Windows Server 2022 (`windows-2022`) | Matrix `zig × optimize`; runs `born-tests.exe` on the host (IOCP) |
@@ -97,11 +97,13 @@ These run weekly and on `workflow_dispatch`, never on push/PR, so they do not
 gate a commit. Both pin Zig 0.15.2 on runner01.
 
 - **Stress (#45 repro shape):** `bench/stress.sh BIN RUNS [HOGS]` runs the suite
-  RUNS times (default 500) with HOGS CPU busy-loops (default 4) beside it, on
-  FreeBSD (runner01) and Linux (runner03). Any failure is a release blocker.
-  The workload is bounded and scheduled off-peak; raise HOGS via dispatch to
-  approach #45's original load 30-35. It targets the listener exhaustion-resume
-  race and `timer_test` under load.
+  RUNS times (default 500) with HOGS CPU busy-loops beside it, on FreeBSD
+  (runner01) and Linux (runner03). HOGS defaults to `ncpu + ncpu/2` (~1.5x the
+  core count, #45's original load ratio) derived per host; pass HOGS via
+  dispatch to override. It records `vm.loadavg` (`/proc/loadavg` on Linux) at
+  the start, each 50-run progress line, and the end. Any failure is a release
+  blocker. It targets the listener exhaustion-resume race and `timer_test`
+  under load.
 - **Benchmark regression (#31):** `bench.yml` runs `bench/suite.sh` with
   `SYSCALLS=truss` on a quiet runner01, then `bench/regress.sh` compares the
   median syscalls/req and p50/p99 latency against `bench/thresholds.txt`.
@@ -109,6 +111,14 @@ gate a commit. Both pin Zig 0.15.2 on runner01.
   Len 0 and no QDrops advance over 3 s. A busy host fails the guard rather than
   yielding an accepted measurement. Results upload as an artifact; recording
   them in `bench/RESULTS.md` is a per-release step.
+
+runner01 is shared between the per-commit matrix and these gates. A stress run
+loads it with ~1.5x ncpu busy-loops for roughly 100 minutes (500 FreeBSD runs),
+so CI results on runner01 during a stress window are under load: treat
+latency-sensitive numbers from that window as noisy, and re-run on a quiet host
+before accepting them. The Sunday 04:00 stress schedule (bench at 06:00, after
+the expected end) keeps the overlap rare, but a manual dispatch can still
+coincide with a push.
 
 ### Manual hosts
 
