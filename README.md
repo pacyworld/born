@@ -471,13 +471,26 @@ and toolchain-version differences; core code does not depend on `std.Io`.
 TCP companions accept `born.socket.Address`, Born's native sockaddr union, on
 all three toolchains. Callers using `std.net.Address` must migrate to this type.
 
-The module propagates its libc or Winsock/kernel32 linkage. Forgejo CI currently
-uses Zig 0.15.2, runs FreeBSD Debug/ReleaseSafe tests, compiles the seven-target
-test matrix, generates API documentation, links the Linux/Windows test
-executables and runs them on an Ubuntu 24.04 and a Windows Server 2022 runner.
-`check-targets` is deliberately compile-only, not evidence that target
+The module propagates its libc or Winsock/kernel32 linkage. Forgejo CI
+(`.forgejo/workflows/ci.yml`) runs a toolchain matrix over Zig 0.15.2, 0.16.0,
+and 0.17.1: each toolchain runs the FreeBSD Debug and ReleaseSafe suites
+(kqueue), compiles the seven-target test matrix, generates API documentation,
+and cross-builds the Linux and Windows test executables in both optimize modes.
+The Linux (epoll, Ubuntu 24.04) and Windows (IOCP, Windows Server 2022) runtime
+jobs run those executables per toolchain and optimize mode, verifying each
+executable's SHA-256 against the build. A single Zig 0.15.2 `zig fmt --check`
+gate carries formatting and README/AGENTS consistency; there is deliberately no
+fmt matrix, because the 0.17.1 formatter rewrites enum builtins unavailable in
+0.15.2. `check-targets` is deliberately compile-only, not evidence that target
 libraries link or that tests ran on those operating systems. Outside CI, run
 the `test-bin` output on its matching platform (hosts in `AGENTS.md`).
+
+Two scheduled gates run weekly and on dispatch, separate from the per-commit
+CI. `stress.yml` runs the suite 500 times under bounded CPU load on FreeBSD and
+Linux (the #45 repro shape; a failure is a release blocker). `bench.yml` runs
+the kqueue benchmark on a quiet runner01 and fails on a syscall or latency
+regression against `bench/thresholds.txt` (#31). macOS Apple Silicon stays a
+manual harness (`AGENTS.md`).
 
 ## Provenance
 

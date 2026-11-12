@@ -48,11 +48,17 @@ and pull request; the manual hosts below are the fallback.
 
 ### CI (`.forgejo/workflows/ci.yml`)
 
+Per-commit CI runs a toolchain matrix over Zig 0.15.2, 0.16.0, and 0.17.1.
+runner01 provisions each toolchain from the official ziglang.org FreeBSD
+tarball, verified against a pinned SHA-256 and cached under
+`~/.cache/born-zig/<version>`; runner02/runner03 need no Zig.
+
 | Job | Runner (`runs-on`) | What it does |
 |---|---|---|
-| `build` | runner01, FreeBSD 15 (`FreeBSD`) | Rejects any Zig but 0.15.2; native Debug and ReleaseSafe tests (kqueue); `check-targets`; API documentation build; cross-builds both `born-tests` executables and uploads them with their sha256 |
-| `linux-runtime` | runner03, Ubuntu 24.04 (`ubuntu-24.04`) | Runs the Linux executable in a `node:24-bookworm` container on the runner's kernel (epoll) |
-| `windows-runtime` | runner02, Windows Server 2022 (`windows-2022`) | Runs `born-tests.exe` on the host (IOCP) |
+| `fmt` | runner01, FreeBSD 15 (`FreeBSD`) | The single Zig 0.15.2 `zig fmt --check .` gate plus README/AGENTS consistency (versions, `zig016`/`zig0171`, seven target rows). No fmt matrix |
+| `build` | runner01, FreeBSD 15 (`FreeBSD`) | Matrix `zig: [0.15.2, 0.16.0, 0.17.1]`, `max-parallel: 1`; native Debug and ReleaseSafe tests (kqueue); `check-targets`; API docs; cross-builds both `born-tests` executables in Debug and ReleaseSafe and uploads each with its sha256 |
+| `linux-runtime` | runner03, Ubuntu 24.04 (`ubuntu-24.04`) | Matrix `zig × optimize`; runs the Linux executable in a `node:24-bookworm` container on the runner's kernel (epoll) |
+| `windows-runtime` | runner02, Windows Server 2022 (`windows-2022`) | Matrix `zig × optimize`; runs `born-tests.exe` on the host (IOCP) |
 
 - The runtime jobs need no Zig. Each checks the executable's sha256
   against the build, prints the host kernel or OS version and the commit,
@@ -61,6 +67,11 @@ and pull request; the manual hosts below are the fallback.
   output has no passing summary line (`N passed; M skipped; 0 failed.` or
   `All N tests passed.`). Skips are listed per test in the log; a contract
   test that still skips is not evidence for its primitive.
+- The native FreeBSD legs decide pass/fail by `zig build test`'s exit code and
+  quote the `Build Summary:` line as evidence (its format differs across
+  toolchains). The standalone executables on Linux/Windows print
+  `N passed; M skipped; 0 failed.`, which the runtime jobs grep for. Both
+  formats were verified under all three toolchains.
 - An offline runner leaves its job waiting, so the run and the pull
   request stay pending, never green. Report that instead of merging.
 - Artifacts use `https://code.forgejo.org/forgejo/upload-artifact@v4` and
@@ -79,6 +90,25 @@ and pull request; the manual hosts below are the fallback.
 
 To cite CI evidence, link the job: `https://pacyworld.dev/pacyworld/born/actions/runs/<run number>`
 (the number shown in the web UI, not the API id), with its summary line.
+
+### Scheduled gates (`.forgejo/workflows/stress.yml`, `bench.yml`)
+
+These run weekly and on `workflow_dispatch`, never on push/PR, so they do not
+gate a commit. Both pin Zig 0.15.2 on runner01.
+
+- **Stress (#45 repro shape):** `bench/stress.sh BIN RUNS [HOGS]` runs the suite
+  RUNS times (default 500) with HOGS CPU busy-loops (default 4) beside it, on
+  FreeBSD (runner01) and Linux (runner03). Any failure is a release blocker.
+  The workload is bounded and scheduled off-peak; raise HOGS via dispatch to
+  approach #45's original load 30-35. It targets the listener exhaustion-resume
+  race and `timer_test` under load.
+- **Benchmark regression (#31):** `bench.yml` runs `bench/suite.sh` with
+  `SYSCALLS=truss` on a quiet runner01, then `bench/regress.sh` compares the
+  median syscalls/req and p50/p99 latency against `bench/thresholds.txt`.
+  `bench/quiet.sh` guards acceptance: 1-min loadavg ≤ 0.5·ncpu, ip netisr queue
+  Len 0 and no QDrops advance over 3 s. A busy host fails the guard rather than
+  yielding an accepted measurement. Results upload as an artifact; recording
+  them in `bench/RESULTS.md` is a per-release step.
 
 ### Manual hosts
 

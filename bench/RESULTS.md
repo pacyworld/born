@@ -118,3 +118,34 @@ quiet host: `SERVER_ARGS=--read-after-accept` against the patch's
 `--accept-filter`. Expected effect to confirm: with the filter a lone
 connection needs one `kevent` wake instead of two. `kbuf` stays 64 (it matters
 only when more than 64 events are ready per wait).
+
+## P4 gate calibration (master 36677d7, truss)
+
+The P4 benchmark regression gate (`bench/regress.sh`, `bench/thresholds.txt`,
+`.forgejo/workflows/bench.yml`) counts syscalls with `truss -c` instead of
+DTrace, so it needs no root on runner01. This run calibrates the thresholds to
+that method. Host: FreeBSD 15.1-RELEASE-p2 amd64, 20 CPUs, `kern.hz=100`, Zig
+0.15.2 ReleaseSafe, server CPU 2 / clients CPUs 4-11, `SYSCALLS=truss`, 5 reps,
+2026-11-12. The quiet-host guard (`bench/quiet.sh`) passed before and after the
+run: load1 4.91 then 7.04 (both <= 0.5*20 = 10), ip netisr queue Len 0, QDrops
+delta 0 over 3 s.
+
+| Scenario | req/s | p50 us | p99 us | p99.9 us | syscalls/req (truss) |
+|---|---|---|---|---|---|
+| echo1 | 17530 (15570-18740) | 46.1 (40.8-51.2) | 173.7 (162.4-188.2) | 515.1 (454.9-635.2) | 3.009 (3.009-3.011) |
+| echo16 | 86490 (78200-97430) | 138.3 (119.2-163.2) | 327.2 (309.8-359.6) | 2274 (2064-3353) | 2.076 (2.075-2.078) |
+| storm16 | 17140 (16280-20790) | 578.9 (525.2-643.2) | 1243 (1099-2598) | 66410 (60210-94500) | 5.143 (5.141-5.152) |
+| bulk4 | 522 (495-532) | 7576 (6501-7738) | 12190 (9905-12330) | 24450 (18410-327500) | 5.744 (5.692-5.954) |
+| wake | 58420 (56570-61360) | 11.7 (11.6-12.1) | 46.5 (45.4-48.1) | 113.9 (110.5-121) | 4.232 (4.206-4.235) |
+
+truss and DTrace report different totals for the multi-connection scenarios
+(echo16 2.076 here vs 2.626 in (a); storm16 5.143 vs 7.305), so the gate's
+thresholds are calibrated to these truss medians, not the DTrace baseline.
+Syscalls/req is deterministic (spread < 0.01); its bound sits about 0.5 above
+the median to catch any increase, such as losing the readiness counts (echo1
+3.009 -> ~4) or the EVFILT_USER wake (wake 4.232 -> ~8 back on the pipe).
+Latency carries the shared host's noise (echo1 p50 46.1 here vs ~30 in the
+quieter (a)/(c) runs); its bound is roughly 2x the median, a coarse guard
+against gross regressions rather than noise. `bench/regress.sh` reports all
+fifteen metrics within bounds on this run. The wake round trip stays near 4
+syscalls, confirming (c) is in this tree.
