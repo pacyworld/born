@@ -55,11 +55,11 @@ env:
 jobs:
   # Exactly one formatting gate, pinned to Zig 0.15.2. The 0.17.1 formatter
   # rewrites @intFromEnum/@enumFromInt to builtins unavailable in 0.15.2, so
-  # there is deliberately no fmt matrix (AGENTS.md). This job also carries the
-  # README/AGENTS consistency check; build.zig's embedded README target-table
-  # guard runs in every build leg below.
+  # there is deliberately no fmt matrix (AGENTS.md). This job also carries a
+  # README/AGENTS string-presence check; build.zig's embedded README
+  # target-table guard (the real row-count check) runs in every build leg below.
   fmt:
-    name: Formatting + consistency (runner01, 0.15.2)
+    name: Formatting + presence (runner01, 0.15.2)
     runs-on: FreeBSD
     timeout-minutes: 10
     steps:
@@ -75,7 +75,7 @@ jobs:
       - name: Format check (0.15.2 only)
         run: zig fmt --check .
 
-      - name: README/AGENTS consistency
+      - name: README/AGENTS version and target presence
         run: |
           set -eu
           for v in 0.15.2 0.16.0 0.17.1; do
@@ -87,7 +87,7 @@ jobs:
           for t in x86_64-freebsd x86_64-linux-gnu aarch64-macos x86_64-macos x86_64-windows-gnu x86_64-netbsd x86_64-openbsd; do
             grep -q "$t" README.md
           done
-          echo "README/AGENTS consistency: OK"
+          echo "README/AGENTS presence: OK"
 
   # runner01 (FreeBSD): one leg per toolchain. Each leg runs the native kqueue
   # suite (Debug and ReleaseSafe), the seven-target compile gate, the API doc
@@ -135,23 +135,26 @@ jobs:
           echo "host: $(uname -srm), commit $GITHUB_SHA, zig $ver"
           "$cache/zig" version
 
-      # zig build test decides pass/fail by its exit code (set -e aborts on a
-      # nonzero run). The native --summary all output is a "Build Summary:"
-      # line, not the standalone runner's "All N tests passed." line, so the
-      # evidence line quotes the build summary verbatim.
+      # Capture the exit code so the test log prints on both success and
+      # failure: a failing leg must still name the failing tests. The native
+      # --summary all output is a "Build Summary:" line, not the standalone
+      # runner's "All N tests passed." line, so the evidence line quotes the
+      # build summary verbatim.
       - name: Unit tests (native Debug)
         run: |
           set -eu
-          "$ZIG" build test -Doptimize=Debug --summary all > freebsd-debug.log 2>&1
+          if "$ZIG" build test -Doptimize=Debug --summary all > freebsd-debug.log 2>&1; then rc=0; else rc=$?; fi
           cat freebsd-debug.log
+          [ "$rc" -eq 0 ] || exit "$rc"
           summary=$(grep -E 'Build Summary:.*tests passed' freebsd-debug.log) || { echo "born-tests printed no passing build summary"; exit 1; }
           echo "runtime evidence (x86_64-freebsd, kqueue, zig ${{ matrix.zig }}, Debug): $summary"
 
       - name: Unit tests (native ReleaseSafe)
         run: |
           set -eu
-          "$ZIG" build test -Doptimize=ReleaseSafe --summary all > freebsd-releasesafe.log 2>&1
+          if "$ZIG" build test -Doptimize=ReleaseSafe --summary all > freebsd-releasesafe.log 2>&1; then rc=0; else rc=$?; fi
           cat freebsd-releasesafe.log
+          [ "$rc" -eq 0 ] || exit "$rc"
           summary=$(grep -E 'Build Summary:.*tests passed' freebsd-releasesafe.log) || { echo "born-tests printed no passing build summary"; exit 1; }
           echo "runtime evidence (x86_64-freebsd, kqueue, zig ${{ matrix.zig }}, ReleaseSafe): $summary"
 

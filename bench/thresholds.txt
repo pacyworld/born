@@ -10,9 +10,10 @@
 # baseline numbers.
 #
 # Syscalls/req is deterministic (run-to-run spread < 0.01), so its bound sits
-# about 0.5 above the measured median: any increase trips it. This catches
-# losing an adopted optimization (echo1 3.009 -> ~4 without readiness counts;
-# wake 4.232 -> ~8 back on the pipe). Latency is noisy on the shared host, so
+# roughly 0.5-0.9 above the measured median: a regression of about one syscall
+# per request trips it. This catches losing an adopted optimization (echo1
+# 3.009 -> ~4 without readiness counts; wake 4.232 -> ~8 back on the pipe).
+# Latency is noisy on the shared host, so
 # its bound is roughly 2x the measured median: a coarse guard against gross
 # regressions, not run-to-run noise. Accept results only from a quiet host
 # (bench/quiet.sh).

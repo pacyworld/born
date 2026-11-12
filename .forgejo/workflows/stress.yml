@@ -14,13 +14,13 @@ on:
         required: false
         default: '500'
       hogs:
-        description: 'CPU busy-loops beside the suite'
+        description: 'CPU busy-loops beside the suite (default: ncpu + ncpu/2)'
         required: false
-        default: '4'
+        default: ''
 
 env:
   RUNS: ${{ github.event.inputs.runs || '500' }}
-  HOGS: ${{ github.event.inputs.hogs || '4' }}
+  HOGS: ${{ github.event.inputs.hogs || '' }}
   # Pacy World Root CA, the root of the pacyworld.dev chain. The artifact
   # actions run under Node, which neither reads the runner02 Windows store
   # nor finds this root in the runner03 container, so the runtime jobs hand
@@ -149,9 +149,8 @@ jobs:
           cd born-stress
           sha256sum -c born-tests.sha256
           chmod +x born-tests
-          echo "host: $(uname -srm), commit $GITHUB_SHA, runs=$RUNS hogs=$HOGS"
-          sh stress.sh ./born-tests "$RUNS" "$HOGS"
-          echo "stress evidence (x86_64-freebsd, kqueue, zig 0.15.2, ReleaseSafe): runs=$RUNS hogs=$HOGS failed=0"
+          echo "host: $(uname -srm), commit $GITHUB_SHA, runs=$RUNS hogs=${HOGS:-auto}"
+          STRESS_LABEL="x86_64-freebsd, kqueue, zig 0.15.2, ReleaseSafe" sh stress.sh ./born-tests "$RUNS" "$HOGS"
 
   # runner03 (Ubuntu 24.04, epoll): the same cases on Linux. The container has
   # no Zig and no checkout; the bundle carries stress.sh. Node needs the root.
@@ -181,6 +180,5 @@ jobs:
           cd born-stress
           sha256sum -c born-tests.sha256
           chmod +x born-tests
-          echo "host: $(uname -srm), $(. /etc/os-release && echo "$PRETTY_NAME") container, commit $GITHUB_SHA, runs=$RUNS hogs=$HOGS"
-          sh stress.sh ./born-tests "$RUNS" "$HOGS"
-          echo "stress evidence (x86_64-linux-gnu, epoll, zig 0.15.2, ReleaseSafe): runs=$RUNS hogs=$HOGS failed=0"
+          echo "host: $(uname -srm), $(. /etc/os-release && echo "$PRETTY_NAME") container, commit $GITHUB_SHA, runs=$RUNS hogs=${HOGS:-auto}"
+          STRESS_LABEL="x86_64-linux-gnu, epoll, zig 0.15.2, ReleaseSafe" sh stress.sh ./born-tests "$RUNS" "$HOGS"

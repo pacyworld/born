@@ -6,14 +6,31 @@
 #
 #   bench/stress.sh BIN RUNS [HOGS]
 #
-# BIN is a built test executable (zig build test-bin). RUNS defaults to 500,
-# HOGS to 4. #45's original repro used load 30-35 on a 20-core host; raise
-# HOGS through the workflow dispatch input to approach that pressure.
+# BIN is a built test executable (zig build test-bin). RUNS defaults to 500.
+# HOGS defaults to ncpu + ncpu/2 (about 1.5x the core count): #45's original
+# repro used load 30-35 on a 20-core host. Pass HOGS to override. The start,
+# each 50-run progress line, and the end record vm.loadavg so the run shows
+# the load it actually applied.
 set -eu
 
 bin=$1
 runs=${2:-500}
-hogs=${3:-4}
+hogs=${3:-}
+
+ncpu() {
+    nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1
+}
+loadavg() {
+    if [ -r /proc/loadavg ]; then
+        cut -d' ' -f1-3 /proc/loadavg
+    else
+        sysctl -n vm.loadavg 2>/dev/null | tr -d '{}'
+    fi
+}
+if [ -z "$hogs" ]; then
+    n=$(ncpu)
+    hogs=$((n + n / 2))
+fi
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/born-stress.XXXXXX")
 pids=""
@@ -29,7 +46,7 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-echo "stress: starting runs=$runs hogs=$hogs bin=$bin"
+echo "stress: starting runs=$runs hogs=$hogs loadavg=[$(loadavg)] bin=$bin"
 fail=0
 run=1
 while [ "$run" -le "$runs" ]; do
@@ -42,9 +59,9 @@ while [ "$run" -le "$runs" ]; do
         tail -25 "$tmp/run.log"
     fi
     if [ $((run % 50)) -eq 0 ]; then
-        echo "stress: progress $run/$runs runs, $fail failed"
+        echo "stress: progress $run/$runs runs, $fail failed, loadavg=[$(loadavg)]"
     fi
     run=$((run + 1))
 done
-echo "stress: runs=$runs hogs=$hogs failed=$fail"
+echo "stress evidence (${STRESS_LABEL:-$(uname -srm)}): runs=$runs hogs=$hogs failed=$fail loadavg=[$(loadavg)]"
 [ "$fail" -eq 0 ]

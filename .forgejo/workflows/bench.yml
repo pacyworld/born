@@ -59,6 +59,7 @@ jobs:
         run: |
           set -eu
           ncpu=$(sysctl -n hw.ncpu)
+          echo "runner01 ncpu=$ncpu"
           if [ "$ncpu" -ge 12 ]; then
             echo "SRV_CPUS=2" >> "$GITHUB_ENV"
             echo "CLI_CPUS=4-11" >> "$GITHUB_ENV"
