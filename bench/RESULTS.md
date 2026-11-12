@@ -141,11 +141,21 @@ delta 0 over 3 s.
 truss and DTrace report different totals for the multi-connection scenarios
 (echo16 2.076 here vs 2.626 in (a); storm16 5.143 vs 7.305), so the gate's
 thresholds are calibrated to these truss medians, not the DTrace baseline.
-Syscalls/req is deterministic (spread < 0.01); its bound sits about 0.5 above
-the median to catch any increase, such as losing the readiness counts (echo1
-3.009 -> ~4) or the EVFILT_USER wake (wake 4.232 -> ~8 back on the pipe).
+Syscalls/req is deterministic (spread < 0.01); its bound sits roughly 0.5-0.9
+above the median, so a regression of about one syscall per request trips it,
+such as losing the readiness counts (echo1 3.009 -> ~4) or the EVFILT_USER wake
+(wake 4.232 -> ~8 back on the pipe).
 Latency carries the shared host's noise (echo1 p50 46.1 here vs ~30 in the
 quieter (a)/(c) runs); its bound is roughly 2x the median, a coarse guard
 against gross regressions rather than noise. `bench/regress.sh` reports all
 fifteen metrics within bounds on this run. The wake round trip stays near 4
 syscalls, confirming (c) is in this tree.
+
+Re-verified on the CI host via workflow dispatch (born run #156, commit
+`25f5b35`): runner01 is FreeBSD 15.1-RELEASE-p5 with **6 CPUs**, so the bench
+takes the `ncpu < 12` pinning branch (server CPU 0, clients CPUs 0-5). The
+quiet guard passed (load1 2.68 <= 0.5*6 = 3.00, ip netisr Len 0, QDrops delta
+0) and all fifteen metrics stayed within these same thresholds, so no
+recalibration was needed. runner01's faster hardware lowers latency (echo1 p50
+17.8 us, wake p50 4.7 us); syscalls/req matches the calibration (echo1 3.005,
+echo16 2.068, storm16 5.132, bulk4 5.621, wake 4.845).
