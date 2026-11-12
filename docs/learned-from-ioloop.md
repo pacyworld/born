@@ -10,8 +10,8 @@ This is a source critique of Zig 0.16.0, Zig 0.17.1, and the Born reactor at the
 
 Two source facts should guide the adapter design and shim terminology:
 
-1. `Io.Select` and `Io.Batch` exist in both releases, not only 0.17. See `U16/Io.zig:474-504,1360-1425` and `U17/Io.zig:573-640,1489-1555`.
-2. The planned "136-slot mandatory interface" is not the field count in these release files. Counting top-level declarations in `Io.VTable` gives 109 fields in 0.16.0 and 106 in 0.17.1 (`U16/Io.zig:51-255`, `U17/Io.zig:51-244`). The design problem is the monolithic, mandatory interface regardless of the number. The shim must assert the count and field names for each exact upstream tag, not hard-code 136.
+1. `Io.Select` and `Io.Batch` exist in both releases. See `U16/Io.zig:474-504,1360-1425` and `U17/Io.zig:573-640,1489-1555`.
+2. Counting top-level declarations in `Io.VTable` gives 109 fields in 0.16.0 and 106 in 0.17.1 (`U16/Io.zig:51-255`, `U17/Io.zig:51-244`). The design problem is the monolithic, mandatory interface regardless of the number. The shim must assert the count and field names for each exact upstream tag.
 
 ## What to adopt
 

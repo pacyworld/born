@@ -5,13 +5,12 @@ is not a claim that the shim exists.
 
 ## Source count and mechanical scope
 
-**The authoritative Zig 0.17.1 source contains 106 `Io.VTable` fields, not
-136.** The 0.16.0 source contains 109. A mechanical scan of every declaration
-between `pub const VTable = struct` and its closing `};` produces the 106 names
-below, in declaration order, with no omissions or duplicates. Producing 136
-rows would invent 30 slots that are not in the ABI. A shim compatibility gate
-should assert 106 for 0.17.1 and 109 for 0.16.0, and should also compare field
-names and function types so that same-count drift cannot pass.
+**The Zig 0.17.1 source contains 106 `Io.VTable` fields. The 0.16.0 source
+contains 109.** A mechanical scan of every declaration between
+`pub const VTable = struct` and its closing `};` produces the 106 names below,
+in declaration order, with no omissions or duplicates. A shim compatibility
+gate should assert 106 for 0.17.1 and 109 for 0.16.0, and should also compare
+field names and function types so that same-count drift cannot pass.
 
 The field declarations are at `I:51-244` and `I16:51-255`. `Io.Operation` is a
 separate seven-tag union (`I:246-255`), not seven extra vtable fields.
@@ -431,7 +430,7 @@ queue cancellation (`I:1621-1665`). Consequently:
 
 ## 0.16.0 to 0.17.1 drift
 
-The VTable shrank by three fields, **109 to 106**, rather than growing to 136.
+The VTable shrank by three fields, **109 to 106**.
 The declarations are `I16:51-255` and `I:51-244`.
 
 - Removed process slots: `processReplacePath` and `processSpawnPath`
@@ -544,4 +543,3 @@ names, and function signatures. A count-only assertion would miss the
     body-reference standard to shim tests rather than relying on declarations
     alone. Use a real `std.Io` consumer. Cross-compilation and a populated
     vtable alone prove neither cancellation nor runtime behavior.
-
