@@ -4,12 +4,16 @@
 
 - Support Zig **0.15.2**, **0.16.0**, and **0.17.1**. On
   freebsd-dev1.morante.com (FreeBSD 15.1 amd64), use `zig`, `zig016`, and
-  `/home/admin/Documents/Workspaces/zig-0171-src/zig-x86_64-freebsd-0.17.1/zig`.
+  `zig0171`. The side-by-side installations live under `/opt/zig-*`.
 - Keep unavoidable toolchain dispatch and native ABI replacements in
   `src/compat.zig`. Core code must not import `std.Io`; use the named `compat`
   module supplied by `build.zig`.
 - Run shell/build commands asynchronously; this workstation is FreeBSD,
   not Linux. Check the current branch and working tree before editing.
+- Run `zig fmt` and `zig fmt --check` only with Zig 0.15.2. The 0.17.1
+  formatter rewrites `@intFromEnum` and `@enumFromInt` to builtins unavailable
+  in 0.15.2. P4 keeps one 0.15.2 formatting gate, not an fmt matrix. If a later
+  compiler removes the older builtins, move those calls behind `compat.zig`.
 - Native runtime gates for each of the three toolchains:
   - `<toolchain> build test -Doptimize=Debug --summary all`
   - `<toolchain> build test -Doptimize=ReleaseSafe --summary all`

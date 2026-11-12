@@ -59,7 +59,7 @@ pub const State = struct {
     fn ensureFd(self: *State, port: *EvPort) TimerError!void {
         if (self.fd != -1) return;
         const rc = linux.timerfd_create(.MONOTONIC, .{ .NONBLOCK = true, .CLOEXEC = true });
-        if (ep.rawErrno(rc) != .SUCCESS) return TimerError.SystemResources;
+        if (compat.linuxErrno(rc) != .SUCCESS) return TimerError.SystemResources;
         const fd: i32 = @intCast(rc);
         port.addInternal(.timer, fd) catch |err| {
             compat.close(fd);
@@ -86,7 +86,7 @@ pub const State = struct {
             .it_interval = .{ .sec = 0, .nsec = 0 },
             .it_value = if (want) |ns| timespecOf(@max(ns, 1)) else .{ .sec = 0, .nsec = 0 },
         };
-        if (ep.rawErrno(linux.timerfd_settime(self.fd, .{ .ABSTIME = true }, &spec, null)) != .SUCCESS) {
+        if (compat.linuxErrno(linux.timerfd_settime(self.fd, .{ .ABSTIME = true }, &spec, null)) != .SUCCESS) {
             self.armed = null;
             stashFailure(port);
             return;
@@ -126,7 +126,7 @@ pub fn harvest(port: *EvPort, out: []Event) usize {
     var ticks: u64 = 0;
     while (true) {
         const rc = linux.read(st.fd, std.mem.asBytes(&ticks), @sizeOf(u64));
-        switch (ep.rawErrno(rc)) {
+        switch (compat.linuxErrno(rc)) {
             // The armed expiration is consumed: the timerfd is disarmed.
             .SUCCESS => {
                 if (rc != @sizeOf(u64)) stashFailure(port);
@@ -181,7 +181,7 @@ const testing = std.testing;
 /// The timerfd's absolute expiry in ns, or null while disarmed.
 fn armedAt(fd: i32) !?u64 {
     var cur: linux.itimerspec = undefined;
-    try testing.expectEqual(linux.E.SUCCESS, ep.rawErrno(linux.timerfd_gettime(fd, &cur)));
+    try testing.expectEqual(linux.E.SUCCESS, compat.linuxErrno(linux.timerfd_gettime(fd, &cur)));
     if (cur.it_value.sec == 0 and cur.it_value.nsec == 0) return null;
     // timerfd_gettime reports the time remaining, not the absolute value.
     const now = try timer_heap.nowNs();
@@ -271,5 +271,5 @@ test "timer_epoll: deinit closes the timerfd" {
     try port.addTimer(1, &a, 1000, .repeat);
     const fd = port.timers.fd;
     port.deinit();
-    try testing.expectEqual(linux.E.BADF, ep.rawErrno(linux.fcntl(fd, linux.F.GETFD, 0)));
+    try testing.expectEqual(linux.E.BADF, compat.linuxErrno(linux.fcntl(fd, linux.F.GETFD, 0)));
 }

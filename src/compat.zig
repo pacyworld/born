@@ -2726,10 +2726,15 @@ pub const Mutex = if (is_windows) struct {
     }
 };
 
-extern "c" fn pthread_condattr_init(attr: *anyopaque) c_int;
-extern "c" fn pthread_condattr_setclock(attr: *anyopaque, clock: clockid_t) c_int;
-extern "c" fn pthread_condattr_destroy(attr: *anyopaque) c_int;
-extern "c" fn pthread_cond_init(cond: *std.c.pthread_cond_t, attr: *const anyopaque) c_int;
+const PthreadCondattr = if (@hasDecl(std.c, "pthread_condattr_t"))
+    std.c.pthread_condattr_t
+else
+    extern struct { bytes: [64]u8 align(16) };
+
+extern "c" fn pthread_condattr_init(attr: *PthreadCondattr) c_int;
+extern "c" fn pthread_condattr_setclock(attr: *PthreadCondattr, clock: clockid_t) c_int;
+extern "c" fn pthread_condattr_destroy(attr: *PthreadCondattr) c_int;
+extern "c" fn pthread_cond_init(cond: *std.c.pthread_cond_t, attr: *const PthreadCondattr) c_int;
 extern "c" fn pthread_cond_timedwait_relative_np(
     cond: *std.c.pthread_cond_t,
     mutex: *std.c.pthread_mutex_t,
@@ -2795,7 +2800,7 @@ pub const Condition = if (is_windows) struct {
         if (comptime is_darwin) return;
         if (self.init_state.load(.acquire) == 2) return;
         if (self.init_state.cmpxchgStrong(0, 1, .acquire, .acquire) == null) {
-            var attr: [64]u8 align(16) = @splat(0);
+            var attr: PthreadCondattr = std.mem.zeroes(PthreadCondattr);
             std.debug.assert(pthread_condattr_init(&attr) == 0);
             defer std.debug.assert(pthread_condattr_destroy(&attr) == 0);
             std.debug.assert(pthread_condattr_setclock(&attr, .MONOTONIC) == 0);
@@ -2888,19 +2893,11 @@ pub const ResetEvent = struct {
         self.mutex.lock();
         defer self.mutex.unlock();
         while (!self.isSet()) {
-            if (comptime is_windows) {
-                const now = monotonicNs() catch unreachable;
-                if (now >= deadline) return error.Timeout;
-                self.condition.timedWait(&self.mutex, deadline - now) catch |err| switch (err) {
-                    error.Timeout => if (!self.isSet()) return error.Timeout,
-                };
-            } else {
-                const now = monotonicNs() catch unreachable;
-                if (now >= deadline) return error.Timeout;
-                self.condition.timedWait(&self.mutex, deadline - now) catch |err| switch (err) {
-                    error.Timeout => if (!self.isSet()) return error.Timeout,
-                };
-            }
+            const now = monotonicNs() catch unreachable;
+            if (now >= deadline) return error.Timeout;
+            self.condition.timedWait(&self.mutex, deadline - now) catch |err| switch (err) {
+                error.Timeout => if (!self.isSet()) return error.Timeout,
+            };
         }
     }
 

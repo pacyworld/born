@@ -97,13 +97,6 @@ var wake_sentinel: u8 = 0;
 const READ_MASK: u32 = linux.EPOLL.IN | linux.EPOLL.ET | linux.EPOLL.RDHUP;
 const WRITE_MASK: u32 = linux.EPOLL.OUT;
 
-/// Decodes a raw Linux syscall result without reading libc's thread-local errno.
-pub fn rawErrno(rc: usize) linux.E {
-    const signed: isize = @bitCast(rc);
-    const number = if (signed > -4096 and signed < 0) -signed else 0;
-    return @enumFromInt(number);
-}
-
 const FdState = struct {
     udata: ?*anyopaque = null,
     read: bool = false,
@@ -143,12 +136,12 @@ pub const EvPort = struct {
         // itself. std.posix.errno() would read libc's thread-local errno in
         // this libc-linked binary and report SUCCESS for failed syscalls.
         const ep_rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
-        if (rawErrno(ep_rc) != .SUCCESS) return InitError.InitFailed;
+        if (compat.linuxErrno(ep_rc) != .SUCCESS) return InitError.InitFailed;
         const ep: i32 = @intCast(ep_rc);
         errdefer compat.close(ep);
 
         const wfd_rc = linux.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
-        if (rawErrno(wfd_rc) != .SUCCESS) return InitError.InitFailed;
+        if (compat.linuxErrno(wfd_rc) != .SUCCESS) return InitError.InitFailed;
         const wfd: i32 = @intCast(wfd_rc);
         errdefer compat.close(wfd);
 
@@ -274,7 +267,7 @@ pub const EvPort = struct {
             .events = linux.EPOLL.IN,
             .data = .{ .ptr = @intFromPtr(&internal_tags[@intFromEnum(kind)]) },
         };
-        if (rawErrno(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_ADD, fd, &ev)) != .SUCCESS)
+        if (compat.linuxErrno(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_ADD, fd, &ev)) != .SUCCESS)
             return error.SystemResources;
         slot.* = fd;
     }
@@ -331,7 +324,7 @@ pub const EvPort = struct {
         if (!gop.found_existing) {
             gop.value_ptr.* = st;
             var ev = makeEvent(st);
-            switch (rawErrno(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_ADD, fd, &ev))) {
+            switch (compat.linuxErrno(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_ADD, fd, &ev))) {
                 .SUCCESS => {},
                 // "I cannot poll this": the pseudo registration above.
                 .PERM => {
@@ -349,7 +342,7 @@ pub const EvPort = struct {
         }
         if (!gop.value_ptr.pseudo) {
             var ev = makeEvent(st);
-            if (rawErrno(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_MOD, fd, &ev)) != .SUCCESS) {
+            if (compat.linuxErrno(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_MOD, fd, &ev)) != .SUCCESS) {
                 _ = self.fds.remove(fd);
                 self.pending_error = WaitError.RegisterFailed;
                 return;
@@ -395,7 +388,7 @@ pub const EvPort = struct {
         const timeout: i32 = if (self.pseudo_count == 0) timeout_ms orelse -1 else 0;
 
         const n_rc = linux.epoll_wait(self.ep, &ebuf, @intCast(cap), timeout);
-        const n_err = rawErrno(n_rc);
+        const n_err = compat.linuxErrno(n_rc);
         if (n_err != .SUCCESS) {
             if (n_err == .INTR) return 0;
             return WaitError.WaitFailed;
@@ -741,7 +734,7 @@ test "epoll: internal source table is one fd per kind" {
     var evp = try EvPort.init(std.testing.allocator);
     defer evp.deinit();
     const rc = linux.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
-    try std.testing.expectEqual(linux.E.SUCCESS, rawErrno(rc));
+    try std.testing.expectEqual(linux.E.SUCCESS, compat.linuxErrno(rc));
     const fd: i32 = @intCast(rc);
     defer compat.close(fd);
 

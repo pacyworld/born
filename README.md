@@ -59,9 +59,7 @@ The raw event port has a uniform **type surface**, not identical I/O semantics.
 Use `born.socket.PlainNb` for the portable plain-TCP companion. TLS, certificate
 validation, HTTP and application logging are outside born. Backend-specific
 design rationale is in [docs/](docs/README.md); `zig build docs` generates
-declaration-level API documentation. The P3 analysis covers the
-[std.Io.VTable gap map](https://git.morante.net/daniel/engineering-docs/src/branch/master/born/born-vtable-gap.md)
-and [std.Io design lessons](https://git.morante.net/daniel/engineering-docs/src/branch/master/born/learned-from-ioloop.md).
+declaration-level API documentation.
 
 ### kqueue and epoll: readiness
 
@@ -297,8 +295,8 @@ child.close();
 
 - **Born's successful spawn and setup path takes no allocator and performs no
   user-space heap allocation:** argv and envp are the caller's NUL-terminated
-  arrays, and the fixed descriptor plan is ready before the fork. There is no PATH search
-  (`opts.path` or argv[0] is the program). Between fork and execve the child
+  arrays, and the fixed descriptor plan is ready before the fork. There is no
+  PATH search (`opts.path` or argv[0] is the program). Between fork and execve the child
   makes only async-signal-safe calls. FreeBSD libthr also runs the
   application's `pthread_atfork` handlers around `pdfork`; born registers
   none, and application handlers must obey the same child-side rule for a
@@ -332,9 +330,9 @@ child.close();
   spawned detached reaper thread. If that thread cannot be spawned or its
   queue cannot allocate space, `close` itself falls back to a blocking reap;
   it is therefore not unconditionally nonblocking. The reaper drains
-  oldest-first, so one stalled exit delays
-  later entries (#52). Loop code should `child.kill(sig)`, wait for the exit
-  event, then `purgeFd` and `close`, which keeps reaping on the spot.
+  oldest-first, so one stalled exit delays later entries (#52). Loop code
+  should `child.kill(sig)`, wait for the exit event, then `purgeFd` and `close`,
+  which keeps reaping on the spot.
 - **kill** signals through the descriptor, so it never reaches a recycled
   pid. After born reaps a reported exit, or after an external wait reaps the
   child, Linux answers `error.Exited`; a FreeBSD zombie accepts and ignores

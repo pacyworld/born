@@ -69,12 +69,12 @@ pub const State = struct {
         }
         const mask = kernelMask(set);
         if (self.fd != -1) {
-            if (ep.rawErrno(linux.signalfd(self.fd, &mask, 0)) != .SUCCESS)
+            if (compat.linuxErrno(linux.signalfd(self.fd, &mask, 0)) != .SUCCESS)
                 return SignalError.SystemResources;
             return;
         }
         const rc = linux.signalfd(-1, &mask, linux.SFD.NONBLOCK | linux.SFD.CLOEXEC);
-        if (ep.rawErrno(rc) != .SUCCESS) return SignalError.SystemResources;
+        if (compat.linuxErrno(rc) != .SUCCESS) return SignalError.SystemResources;
         const fd: i32 = @intCast(rc);
         port.addInternal(.signal, fd) catch |err| {
             compat.close(fd);
@@ -151,7 +151,7 @@ pub fn harvest(port: *EvPort, out: []Event) usize {
             var emitted: SignalSet = compat.emptyEnumSet(Signal);
             for (out[0..n]) |ev| emitted.insert(ev.signal.?);
             const mask = kernelMask(emitted);
-            if (ep.rawErrno(linux.signalfd(st.fd, &mask, 0)) != .SUCCESS) {
+            if (compat.linuxErrno(linux.signalfd(st.fd, &mask, 0)) != .SUCCESS) {
                 stashFailure(port);
                 break;
             }
@@ -162,7 +162,7 @@ pub fn harvest(port: *EvPort, out: []Event) usize {
         // record per read keeps a new signal from overrunning `out`.
         const batch: usize = if (narrowed or out.len - n >= watched_count - n) buf.len else 1;
         const rc = linux.read(st.fd, @ptrCast(&buf), batch * @sizeOf(Siginfo));
-        switch (ep.rawErrno(rc)) {
+        switch (compat.linuxErrno(rc)) {
             .SUCCESS => {},
             .INTR => continue,
             .AGAIN => break,
@@ -197,7 +197,7 @@ pub fn harvest(port: *EvPort, out: []Event) usize {
     }
     if (narrowed) {
         const mask = kernelMask(st.watched);
-        if (ep.rawErrno(linux.signalfd(st.fd, &mask, 0)) != .SUCCESS) stashFailure(port);
+        if (compat.linuxErrno(linux.signalfd(st.fd, &mask, 0)) != .SUCCESS) stashFailure(port);
     }
     return n;
 }

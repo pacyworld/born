@@ -56,7 +56,7 @@ pub const State = struct {
     fn ensureFd(self: *State, port: *EvPort) ProcessError!void {
         if (self.fd != -1) return;
         const rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
-        if (ep.rawErrno(rc) != .SUCCESS) return ProcessError.SystemResources;
+        if (compat.linuxErrno(rc) != .SUCCESS) return ProcessError.SystemResources;
         const fd: i32 = @intCast(rc);
         port.addInternal(.process, fd) catch |err| {
             compat.close(fd);
@@ -80,7 +80,7 @@ pub fn watch(port: *EvPort, fd: i32, udata: ?*anyopaque) ProcessError!void {
     if (fd < 0) return ProcessError.BadHandle;
     // ESRCH (an exited child is still watchable) and EPERM both confirm a
     // real pidfd; EINVAL marks any other pollable descriptor.
-    switch (ep.rawErrno(linux.pidfd_send_signal(fd, compat.nativeSignal(0), null, 0))) {
+    switch (compat.linuxErrno(linux.pidfd_send_signal(fd, compat.nativeSignal(0), null, 0))) {
         .SUCCESS, .SRCH, .PERM => {},
         .NOSYS => return ProcessError.Unsupported,
         .BADF, .INVAL => return ProcessError.BadHandle,
@@ -91,7 +91,7 @@ pub fn watch(port: *EvPort, fd: i32, udata: ?*anyopaque) ProcessError!void {
     const gop = st.watches.getOrPut(port.alloc, fd) catch return ProcessError.OutOfMemory;
     errdefer if (!gop.found_existing) st.watches.removeByPtr(gop.key_ptr);
     var ev: linux.epoll_event = .{ .events = linux.EPOLL.IN, .data = .{ .fd = fd } };
-    switch (ep.rawErrno(linux.epoll_ctl(st.fd, linux.EPOLL.CTL_ADD, fd, &ev))) {
+    switch (compat.linuxErrno(linux.epoll_ctl(st.fd, linux.EPOLL.CTL_ADD, fd, &ev))) {
         .SUCCESS => {},
         // Already in the set: a re-watch, or a stale entry for a reused
         // descriptor number.
@@ -107,7 +107,7 @@ pub fn watch(port: *EvPort, fd: i32, udata: ?*anyopaque) ProcessError!void {
 pub fn unwatch(port: *EvPort, fd: i32) void {
     const st = &port.processes;
     if (!st.watches.remove(fd)) return;
-    switch (ep.rawErrno(linux.epoll_ctl(st.fd, linux.EPOLL.CTL_DEL, fd, null))) {
+    switch (compat.linuxErrno(linux.epoll_ctl(st.fd, linux.EPOLL.CTL_DEL, fd, null))) {
         .SUCCESS => {},
         else => if (port.pending_error == null) {
             port.pending_error = error.RegisterFailed;
@@ -133,7 +133,7 @@ pub fn harvest(port: *EvPort, out: []Event) usize {
     var buf: [64]linux.epoll_event = undefined;
     const cap = @min(out.len, buf.len);
     const rc = linux.epoll_wait(st.fd, &buf, @intCast(cap), 0);
-    switch (ep.rawErrno(rc)) {
+    switch (compat.linuxErrno(rc)) {
         .SUCCESS => {},
         .INTR => return 0,
         else => {
@@ -153,9 +153,9 @@ pub fn harvest(port: *EvPort, out: []Event) usize {
         var info: linux.siginfo_t = std.mem.zeroes(linux.siginfo_t);
         const wrc = while (true) {
             const r = compat.waitid(.PIDFD, fd, &info, linux.W.EXITED | linux.W.NOHANG);
-            if (ep.rawErrno(r) != .INTR) break r;
+            if (compat.linuxErrno(r) != .INTR) break r;
         };
-        switch (ep.rawErrno(wrc)) {
+        switch (compat.linuxErrno(wrc)) {
             .SUCCESS => {
                 // WNOHANG with nothing to collect leaves si_pid zero: the
                 // status belongs to someone else (a tracer, or a racing
@@ -186,7 +186,7 @@ pub fn harvest(port: *EvPort, out: []Event) usize {
 /// Removes `fd` from the inner set. A failure would leave a reaped pidfd
 /// ready forever, so it is stashed as error.SourceFailed.
 fn drop(port: *EvPort, fd: i32) void {
-    switch (ep.rawErrno(linux.epoll_ctl(port.processes.fd, linux.EPOLL.CTL_DEL, fd, null))) {
+    switch (compat.linuxErrno(linux.epoll_ctl(port.processes.fd, linux.EPOLL.CTL_DEL, fd, null))) {
         .SUCCESS => {},
         else => if (port.pending_error == null) {
             port.pending_error = error.SourceFailed;
@@ -224,7 +224,7 @@ test "process_epoll: unwatch and purge forget the pidfd" {
     // Own-pid pidfd: real pidfd (5.3, below the floor is fine here), and
     // this process never exits, so nothing becomes readable.
     const prc = linux.pidfd_open(linux.getpid(), 0);
-    try testing.expectEqual(linux.E.SUCCESS, ep.rawErrno(prc));
+    try testing.expectEqual(linux.E.SUCCESS, compat.linuxErrno(prc));
     const fd: i32 = @intCast(prc);
     defer compat.close(fd);
     var tag: u8 = 1;
