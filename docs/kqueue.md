@@ -30,10 +30,12 @@ leaves subsequent changes unprocessed. Earlier changes and copied error
 records are not rolled back. `EV_RECEIPT` records consume the same slots.
 
 Born submits at most one change per available event slot, up to 64. Every
-rejected change therefore has room for its `EV_ERROR` record. Results are
-returned in order, and any remaining changes stay staged for the next wait.
-An allocation failure before submission is instead stashed and returned as
-`error.OutOfMemory` from the next non-empty `wait()`.
+rejected change therefore has room for its `EV_ERROR` record. `wait()` submits
+every staged change before it blocks: intermediate chunks use a zero timeout,
+and only the chunk that empties the changelist receives the caller's timeout.
+Earlier records are returned first, and the next wait continues with any
+remaining changes. An allocation failure before submission is instead stashed
+and returned as `error.OutOfMemory` from the next non-empty `wait()`.
 
 Regular files are native kqueue readiness sources and remain perpetually
 ready. Consumers stop monitoring them at EOF to avoid a busy wait.

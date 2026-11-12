@@ -91,8 +91,9 @@ before the change ever reaches the kernel is stashed and returned as
 `error.OutOfMemory` the same way epoll stashes its rejections.
 
 On kqueue, each submission is bounded to the available event slots. Every
-rejected change has room for its `EV_ERROR` record, results are returned in
-order, and remaining changes stay staged for the next wait. See
+rejected change has room for its `EV_ERROR` record. `wait()` submits every
+staged change before it blocks. Earlier records are returned first, and the
+next wait continues with any remaining changes. See
 [kqueue backend rationale](docs/kqueue.md) for the complete contract.
 
 **Regular files work identically on every POSIX backend.** I/O on a regular

@@ -99,8 +99,8 @@ pub fn purge(port: *EvPort, fd: c_int) void {
 /// wait() hook after every kevent attempt, including a failed one. Marks only
 /// process adds actually included in the submitted prefix. Other change kinds
 /// and adds left for a later wait do not affect process bookkeeping.
-pub fn flushed(port: *EvPort, submitted: usize) void {
-    for (port.changes.items[0..submitted]) |kev| {
+pub fn flushed(port: *EvPort, submitted: []const Kevent) void {
+    for (submitted) |kev| {
         if (kev.filter != EVFILT_PROCDESC or (kev.flags & EV_ADD) == 0) continue;
         const fd = std.math.cast(c_int, kev.ident) orelse continue;
         if (port.processes.live.getPtr(fd)) |in_kernel| {
@@ -212,10 +212,12 @@ test "process_kqueue: mixed changes do not count as process adds" {
     port.monitorRead(fds[1], null);
     try watch(&port, fds[0], &tag);
 
-    var event: [1]kq.Event = undefined;
-    try testing.expectEqual(@as(usize, 0), try port.wait(&event, 0));
+    flushed(&port, port.changes.items[0..1]);
+    _ = port.changes.orderedRemove(0);
     try testing.expectEqual(@as(usize, 1), port.processes.unflushed.items.len);
     try testing.expect(!port.processes.live.get(fds[0]).?);
+
+    var event: [1]kq.Event = undefined;
 
     try testing.expectEqual(@as(usize, 1), try port.wait(&event, 0));
     try testing.expect(event[0].err and event[0].udata == @as(?*anyopaque, &tag));
@@ -274,6 +276,7 @@ test "process_kqueue: bounded submissions mark only attempted adds" {
     try testing.expect(event[0].err and event[0].udata == @as(?*anyopaque, &tags[1]));
     try testing.expectEqual(@as(usize, 1), port.processes.unflushed.items.len);
 
+    // The short-lived child may exit before or after its add is submitted.
     if (try port.wait(&event, 1000) == 1) {
         try testing.expect(event[0].exited and event[0].udata == @as(?*anyopaque, &tags[2]));
     } else {
