@@ -118,3 +118,52 @@ quiet host: `SERVER_ARGS=--read-after-accept` against the patch's
 `--accept-filter`. Expected effect to confirm: with the filter a lone
 connection needs one `kevent` wake instead of two. `kbuf` stays 64 (it matters
 only when more than 64 events are ready per wait).
+
+## P4 gate calibration (master 36677d7, truss)
+
+The P4 benchmark regression gate (`bench/regress.sh`, `bench/thresholds.txt`,
+`.forgejo/workflows/bench.yml`) counts syscalls with `truss -c` instead of
+DTrace, so it needs no root on runner01. This run calibrates the thresholds to
+that method. Host: FreeBSD 15.1-RELEASE-p2 amd64, 20 CPUs, `kern.hz=100`, Zig
+0.15.2 ReleaseSafe, server CPU 2 / clients CPUs 4-11, `SYSCALLS=truss`, 5 reps,
+2026-11-12. The quiet-host guard (`bench/quiet.sh`) passed before and after the
+run: load1 4.91 then 7.04 (both <= 0.5*20 = 10), ip netisr queue Len 0, QDrops
+delta 0 over 3 s.
+
+| Scenario | req/s | p50 us | p99 us | p99.9 us | syscalls/req (truss) |
+|---|---|---|---|---|---|
+| echo1 | 17530 (15570-18740) | 46.1 (40.8-51.2) | 173.7 (162.4-188.2) | 515.1 (454.9-635.2) | 3.009 (3.009-3.011) |
+| echo16 | 86490 (78200-97430) | 138.3 (119.2-163.2) | 327.2 (309.8-359.6) | 2274 (2064-3353) | 2.076 (2.075-2.078) |
+| storm16 | 17140 (16280-20790) | 578.9 (525.2-643.2) | 1243 (1099-2598) | 66410 (60210-94500) | 5.143 (5.141-5.152) |
+| bulk4 | 522 (495-532) | 7576 (6501-7738) | 12190 (9905-12330) | 24450 (18410-327500) | 5.744 (5.692-5.954) |
+| wake | 58420 (56570-61360) | 11.7 (11.6-12.1) | 46.5 (45.4-48.1) | 113.9 (110.5-121) | 4.232 (4.206-4.235) |
+
+truss and DTrace report different totals for the multi-connection scenarios
+(echo16 2.076 here vs 2.626 in (a); storm16 5.143 vs 7.305), so the gate's
+thresholds are calibrated to these truss medians, not the DTrace baseline.
+Syscalls/req is deterministic on this host (spread < 0.01); its bound sits
+roughly 0.5-0.9 above the median, so a regression of about one syscall per
+request trips it, such as losing the readiness counts (echo1 3.009 -> ~4). The
+wake bound is wider (5.6 rather than ~5.0) because wake is not deterministic on
+runner01's 6 CPUs (see the re-verification below); it still catches the
+EVFILT_USER loss that puts wake back at ~8 on the pipe (wake 4.232 here).
+Latency carries the shared host's noise (echo1 p50 46.1 here vs ~30 in the
+quieter (a)/(c) runs); its bound is roughly 2x the median, a coarse guard
+against gross regressions rather than noise. `bench/regress.sh` reports all
+fifteen metrics within bounds on this run. The wake round trip stays near 4
+syscalls, confirming (c) is in this tree.
+
+Re-verified on the CI host via workflow dispatch (born run #156, commit
+`25f5b35`): runner01 is FreeBSD 15.1-RELEASE-p5 with **6 CPUs**, so the bench
+takes the `ncpu < 12` pinning branch (server CPU 0, clients CPUs 0-5). The
+quiet guard passed (load1 2.68 <= 0.5*6 = 3.00, ip netisr Len 0, QDrops delta
+0) and `regress.sh` reported all fifteen metrics within bounds. runner01's
+faster hardware lowers latency (echo1 p50 17.8 us, wake p50 4.7 us). echo1,
+echo16, storm16 and bulk4 syscalls/req are deterministic and match the
+calibration (3.005, 2.068, 5.132, 5.621). **wake does not match and is not
+deterministic here**: 4.845 against the calibration's 4.232, with five reps
+spanning 4.554-5.044 (spread 0.49). The 6-CPU pinning puts server and clients on
+the same CPUs (0-5), so wake coalescing varies run to run. The median stayed
+under the old 5.0 bound but with only 0.155 headroom, so a busier host could
+push the median over it with no code change; the wake bound is therefore raised
+to 5.6 (review 424). Losing EVFILT_USER still regresses wake to ~8 and trips it.

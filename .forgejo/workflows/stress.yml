@@ -1,0 +1,184 @@
+name: Stress
+# #45 repro shape: 500 suite runs under induced CPU load, weekly. A failure is
+# a release blocker. This workflow is schedule/dispatch only, so it never gates
+# a push or pull request; ci.yml carries the per-commit gates. The workload is
+# bounded (HOGS busy-loops, one suite process at a time) and runs off-peak to
+# avoid contending with other runner jobs.
+on:
+  schedule:
+    - cron: '0 4 * * 0'
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: 'Suite runs per platform'
+        required: false
+        default: '500'
+      hogs:
+        description: 'CPU busy-loops beside the suite (default: ncpu + ncpu/2)'
+        required: false
+        default: ''
+
+env:
+  RUNS: ${{ github.event.inputs.runs || '500' }}
+  HOGS: ${{ github.event.inputs.hogs || '' }}
+  # Pacy World Root CA, the root of the pacyworld.dev chain. The artifact
+  # actions run under Node, which neither reads the runner02 Windows store
+  # nor finds this root in the runner03 container, so the runtime jobs hand
+  # it to Node through NODE_EXTRA_CA_CERTS after checking its fingerprint.
+  PACYWORLD_ROOT_CA_SHA256: F6:56:80:C5:A0:CC:7C:AC:7E:73:CA:3C:FA:45:3E:7E:81:D9:59:40:0C:92:3B:AA:EA:F9:9D:CF:F4:0D:28:A8
+  PACYWORLD_ROOT_CA: |
+    -----BEGIN CERTIFICATE-----
+    MIIGDDCCA/SgAwIBAgIJAPjlE9EKnbAtMA0GCSqGSIb3DQEBCwUAMIGSMQswCQYD
+    VQQGEwJVUzEQMA4GA1UECAwHRmxvcmlkYTEPMA0GA1UEBwwGTmFwbGVzMSkwJwYD
+    VQQKDCBUaGUgRGFuaWVsIE1vcmFudGUgQ29tcGFueSwgSW5jLjEYMBYGA1UECwwP
+    UGFjeSBXb3JsZCwgTExDMRswGQYDVQQDDBJQYWN5IFdvcmxkIFJvb3QgQ0EwHhcN
+    MTgwNzA3MTczNDAxWhcNMzgwNzAyMTczNDAxWjCBkjELMAkGA1UEBhMCVVMxEDAO
+    BgNVBAgMB0Zsb3JpZGExDzANBgNVBAcMBk5hcGxlczEpMCcGA1UECgwgVGhlIERh
+    bmllbCBNb3JhbnRlIENvbXBhbnksIEluYy4xGDAWBgNVBAsMD1BhY3kgV29ybGQs
+    IExMQzEbMBkGA1UEAwwSUGFjeSBXb3JsZCBSb290IENBMIICIjANBgkqhkiG9w0B
+    AQEFAAOCAg8AMIICCgKCAgEAxcG5VqHdWQ00Av5k8qQRtYit6ihHNCRBrOQqvrNV
+    V2pTaDgTc3HjgDhb3KtZpV/63EwTGkg2M+amm4XkCcwI2STiTLzKZ+wmuYf9/udQ
+    tjw5Br0p3T2c9HvZauNqzZ9L3e0HiI5+F4GI7rAjuRNU5oxD8MrfGXap6JgV8V8o
+    1bNkRI9xCYg2ZGCvJLWGBJK0fKxbl6N7A2Vh4FM4VzjMBxElUBYn4iazsyqsmfY0
+    eN1Ln6Yg64n34xYSPuJyEzhSbxLS0wMQO5N3d7UrYcK7REE/PR3lM8naqb/MWN6l
+    AeEB2cH138x1tPQywAk4BGWNaPndrCRnCFXkoianMgj2PztDKa5gk6l9WqSmwo8M
+    FlNhKknYWoaQ75Wz16goG3w1bkWDB/Wc5G+5GC2LD/WZNHAR6rA0tOK785pE/Lmb
+    aWhyqhndMTfRlaAlzEblzAoZX+sSB5ocs0AXf3e1EwV22E3UH+cghORp7z1CfbQI
+    vGF7fNG8c8tTzrgV9ifEphmZtDRrmtcbYYXJubdEKZmxahDN7QjVEnkXrdsuc8b7
+    Egz+KetGjj6n0tIRWCCxrIz9kOf652TBlJc/AWCnzDLgqv+CSw+Wrmm92dGfSgI4
+    W3todx0BW1XdMldbmB3Afo5o5gfc77QIcwSVSYJByiZDvkj9OPC48Hf1/1uGoe+r
+    4FsCAwEAAaNjMGEwHQYDVR0OBBYEFHoERjvfovVsJyua3AVoSD3edl25MB8GA1Ud
+    IwQYMBaAFHoERjvfovVsJyua3AVoSD3edl25MA8GA1UdEwEB/wQFMAMBAf8wDgYD
+    VR0PAQH/BAQDAgGGMA0GCSqGSIb3DQEBCwUAA4ICAQAe3IsTEblRYEGY/MICG8cg
+    l2SfqxYx0t9qvhCz/gLqvA8fiCijneAG3gR2trrHwTAQC5+arWUYs9yy8HilWTul
+    6HempVgguoz/XPqHsAonBW8vaImnSSVOsXIQkqkEX7g+HAAe4RMz71ykIXiWC345
+    LCjBVA3XGFNSIuQKchtzpchJGyVqqQxfbmeQt8rGvHkDkpCH3I8cO/J2xZW4n3bC
+    HUDj0oXuyW7zlKv4ytHK/TN+HYgMwXCd1LITK87OCmf4izLLdNxBwsQnWeaTNWS9
+    7wUGa0E9mWvuKONxx/JMVpUD+ewJQOD/JIYZumzNGBH3k0vl9pNtRAqeE03HmRCy
+    fgxWv8uJ/wz8mo3W8BRFnAd1AyJy6GPyLtMKa1yr11ITY0dJ/BTADmdO/6VKmlk5
+    sla/THr8mR4QYCUWE+zfU8nRGKLmJADg3lQJg0oC8HDTDyxZnAlM+0cFLanc5gDx
+    Q2/u+Z3fKyKGBaOzdruG5hKEWZ1E6bmNH2ttl/nkhiDl1tNFF4FWpC30N6PG1u1/
+    iJC/kgtEf2bSkfbm8xyrznWAygcinPSiH36C46M7y4GKp2+Aq6r95Q8b2YO69Opr
+    I/pDB/oQiCQ78Dp7e4yxY+GLR71QWf/wA5Tw1FbzqPvGnZ+tK//ZKGDeqmuDBCRF
+    3NDrfSHlK+Nk91FpLogS9g==
+    -----END CERTIFICATE-----
+  ZIG_0152_SHA256: 5509ff57cd3f219165caed0da10221739af82742b9edfcda3f7bfaf4da7212dd
+
+jobs:
+  # runner01 builds both test executables (native FreeBSD and cross Linux) at
+  # ReleaseSafe with Zig 0.15.2 and stages bench/stress.sh beside each so the
+  # runtime jobs need no checkout. The stress gate pins one toolchain: it
+  # exercises runtime scheduling, not toolchain codegen (ci.yml owns the
+  # tri-toolchain matrix).
+  build:
+    name: Build stress executables (runner01, zig 0.15.2)
+    runs-on: FreeBSD
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Provision Zig 0.15.2 (pinned sha256, cached)
+        run: |
+          set -eu
+          ver=0.15.2
+          cache="$HOME/.cache/born-zig/$ver"
+          if [ ! -x "$cache/zig" ]; then
+            mkdir -p "$cache"
+            url="https://ziglang.org/download/$ver/zig-x86_64-freebsd-$ver.tar.xz"
+            echo "Downloading $url"
+            if command -v curl >/dev/null 2>&1; then
+              curl -fsSL --retry 3 "$url" -o "$cache/zig.tar.xz"
+            else
+              fetch -o "$cache/zig.tar.xz" "$url"
+            fi
+            echo "$ZIG_0152_SHA256  $cache/zig.tar.xz" | sha256sum -c -
+            tar -xf "$cache/zig.tar.xz" -C "$cache" --strip-components=1
+            rm -f "$cache/zig.tar.xz"
+          fi
+          test "$("$cache/zig" version)" = "$ver"
+          echo "ZIG=$cache/zig" >> "$GITHUB_ENV"
+          echo "host: $(uname -srm), commit $GITHUB_SHA, zig $ver"
+
+      - name: Build native FreeBSD and cross Linux test executables
+        run: |
+          set -eu
+          "$ZIG" build test-bin -Doptimize=ReleaseSafe --prefix zig-out/freebsd --summary all
+          "$ZIG" build test-bin -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe --prefix zig-out/linux --summary all
+          mkdir -p stage-freebsd stage-linux
+          cp zig-out/freebsd/bin/born-tests stage-freebsd/born-tests
+          ( cd zig-out/freebsd/bin && sha256sum born-tests ) > stage-freebsd/born-tests.sha256
+          cp bench/stress.sh stage-freebsd/stress.sh
+          cp zig-out/linux/bin/born-tests stage-linux/born-tests
+          ( cd zig-out/linux/bin && sha256sum born-tests ) > stage-linux/born-tests.sha256
+          cp bench/stress.sh stage-linux/stress.sh
+
+      - name: Upload FreeBSD stress bundle
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: born-stress-freebsd
+          path: stage-freebsd/
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Linux stress bundle
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: born-stress-linux
+          path: stage-linux/
+          if-no-files-found: error
+          retention-days: 14
+
+  # runner01 (FreeBSD, kqueue): the listener exhaustion-resume race and the
+  # timer cases run here. runner01 trusts the Pacy World root, so no CA step.
+  stress-freebsd:
+    name: Stress FreeBSD (runner01, kqueue)
+    runs-on: FreeBSD
+    needs: build
+    timeout-minutes: 150
+    steps:
+      - name: Download FreeBSD stress bundle
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: born-stress-freebsd
+          path: born-stress
+
+      - name: Run stress gate
+        run: |
+          set -eu
+          cd born-stress
+          sha256sum -c born-tests.sha256
+          chmod +x born-tests
+          echo "host: $(uname -srm), commit $GITHUB_SHA, runs=$RUNS hogs=${HOGS:-auto}"
+          STRESS_LABEL="x86_64-freebsd, kqueue, zig 0.15.2, ReleaseSafe" sh stress.sh ./born-tests "$RUNS" "$HOGS"
+
+  # runner03 (Ubuntu 24.04, epoll): the same cases on Linux. The container has
+  # no Zig and no checkout; the bundle carries stress.sh. Node needs the root.
+  stress-linux:
+    name: Stress Linux (runner03, epoll)
+    runs-on: ubuntu-24.04
+    container: node:24-bookworm
+    needs: build
+    timeout-minutes: 150
+    steps:
+      - name: Trust the Pacy World Root CA for Node
+        run: |
+          pem="$RUNNER_TEMP/pacyworld-root.pem"
+          printf '%s' "$PACYWORLD_ROOT_CA" > "$pem"
+          node -e 'const c = new (require("crypto").X509Certificate)(require("fs").readFileSync(process.argv[1])); if (c.fingerprint256 !== process.argv[2]) { console.error("root CA fingerprint mismatch: " + c.fingerprint256); process.exit(1); }' "$pem" "$PACYWORLD_ROOT_CA_SHA256"
+          echo "NODE_EXTRA_CA_CERTS=$pem" >> "$GITHUB_ENV"
+
+      - name: Download Linux stress bundle
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: born-stress-linux
+          path: born-stress
+
+      - name: Run stress gate
+        run: |
+          set -eu
+          cd born-stress
+          sha256sum -c born-tests.sha256
+          chmod +x born-tests
+          echo "host: $(uname -srm), $(. /etc/os-release && echo "$PRETTY_NAME") container, commit $GITHUB_SHA, runs=$RUNS hogs=${HOGS:-auto}"
+          STRESS_LABEL="x86_64-linux-gnu, epoll, zig 0.15.2, ReleaseSafe" sh stress.sh ./born-tests "$RUNS" "$HOGS"

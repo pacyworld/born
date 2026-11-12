@@ -1,0 +1,94 @@
+name: Bench
+# #31 benchmark regression gate: run the kqueue hot-path suite on a quiet
+# runner01 and fail on a syscall/latency regression against bench/thresholds.txt.
+# Schedule/dispatch only, so it never gates a push or pull request. Results are
+# uploaded as an artifact, not committed; recording them in bench/RESULTS.md is
+# a per-release step. A busy host fails the quiet guard rather than yielding an
+# accepted measurement (re-run via dispatch when the host is quiet).
+on:
+  schedule:
+    - cron: '0 6 * * 0'
+  workflow_dispatch:
+    inputs:
+      reps:
+        description: 'Repetitions per scenario'
+        required: false
+        default: '5'
+
+env:
+  REPS: ${{ github.event.inputs.reps || '5' }}
+  ZIG_0152_SHA256: 5509ff57cd3f219165caed0da10221739af82742b9edfcda3f7bfaf4da7212dd
+
+jobs:
+  bench:
+    name: Benchmark regression (runner01, kqueue, zig 0.15.2)
+    runs-on: FreeBSD
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Provision Zig 0.15.2 (pinned sha256, cached)
+        run: |
+          set -eu
+          ver=0.15.2
+          cache="$HOME/.cache/born-zig/$ver"
+          if [ ! -x "$cache/zig" ]; then
+            mkdir -p "$cache"
+            url="https://ziglang.org/download/$ver/zig-x86_64-freebsd-$ver.tar.xz"
+            echo "Downloading $url"
+            if command -v curl >/dev/null 2>&1; then
+              curl -fsSL --retry 3 "$url" -o "$cache/zig.tar.xz"
+            else
+              fetch -o "$cache/zig.tar.xz" "$url"
+            fi
+            echo "$ZIG_0152_SHA256  $cache/zig.tar.xz" | sha256sum -c -
+            tar -xf "$cache/zig.tar.xz" -C "$cache" --strip-components=1
+            rm -f "$cache/zig.tar.xz"
+          fi
+          test "$("$cache/zig" version)" = "$ver"
+          echo "ZIG=$cache/zig" >> "$GITHUB_ENV"
+          echo "host: $(uname -srm), commit $GITHUB_SHA, zig $ver"
+
+      # Accept results only from a quiet host: moderate loadavg and a loopback
+      # netisr that is not dropping packets (#31). Fails the job when busy.
+      - name: Quiet-host guard
+        run: sh bench/quiet.sh
+
+      - name: Build born-bench (ReleaseSafe)
+        run: |
+          set -eu
+          ncpu=$(sysctl -n hw.ncpu)
+          echo "runner01 ncpu=$ncpu"
+          if [ "$ncpu" -ge 12 ]; then
+            echo "SRV_CPUS=2" >> "$GITHUB_ENV"
+            echo "CLI_CPUS=4-11" >> "$GITHUB_ENV"
+          else
+            echo "SRV_CPUS=0" >> "$GITHUB_ENV"
+            echo "CLI_CPUS=0-$((ncpu - 1))" >> "$GITHUB_ENV"
+          fi
+          "$ZIG" build bench -Doptimize=ReleaseSafe --prefix zig-out/bench --summary all
+
+      # truss counts the server's syscalls without root; only its counts are
+      # used, never its latency (bench/README.md).
+      - name: Run benchmark suite
+        run: |
+          set -eu
+          SYSCALLS=truss sh bench/suite.sh zig-out/bench/bin/born-bench bench-out "$REPS"
+
+      - name: Summarize and check thresholds
+        run: |
+          set -eu
+          sh bench/summarize.sh bench-out | tee bench-summary.txt
+          sh bench/regress.sh bench-summary.txt bench/thresholds.txt
+          echo "bench evidence (x86_64-freebsd, kqueue, zig 0.15.2, ReleaseSafe, reps=$REPS): all metrics within thresholds"
+
+      - name: Upload benchmark results
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: born-bench-results
+          path: |
+            bench-summary.txt
+            bench-out/
+          if-no-files-found: error
+          retention-days: 90

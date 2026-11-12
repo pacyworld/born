@@ -45,13 +45,23 @@ env:
     I/pDB/oQiCQ78Dp7e4yxY+GLR71QWf/wA5Tw1FbzqPvGnZ+tK//ZKGDeqmuDBCRF
     3NDrfSHlK+Nk91FpLogS9g==
     -----END CERTIFICATE-----
+  # Official ziglang.org x86_64-freebsd tarball SHA-256 pins (download
+  # index.json). runner01 does all building, so only FreeBSD tarballs are
+  # provisioned; runner02/runner03 only run the cross-built executables.
+  ZIG_0152_SHA256: 5509ff57cd3f219165caed0da10221739af82742b9edfcda3f7bfaf4da7212dd
+  ZIG_0160_SHA256: 390379bfaf6b89b001c6bb4035b8fcbc5c12193fd9fd5048c3a0fe39e5d1cf72
+  ZIG_0171_SHA256: fd8b9728f05db2a9942fc1f18087c0e0d6dfccb7a51557b06cf026d3e4c78542
 
 jobs:
-  # runner01 (FreeBSD): kqueue runtime tests, the seven-target compile gate,
-  # and the Linux and Windows test executables for the runtime jobs below.
-  build:
-    name: FreeBSD tests and cross-builds (runner01)
+  # Exactly one formatting gate, pinned to Zig 0.15.2. The 0.17.1 formatter
+  # rewrites @intFromEnum/@enumFromInt to builtins unavailable in 0.15.2, so
+  # there is deliberately no fmt matrix (AGENTS.md). This job also carries a
+  # README/AGENTS string-presence check; build.zig's embedded README
+  # target-table guard (the real row-count check) runs in every build leg below.
+  fmt:
+    name: Formatting + presence (runner01, 0.15.2)
     runs-on: FreeBSD
+    timeout-minutes: 10
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -62,58 +72,164 @@ jobs:
           zig version
           test "$(zig version)" = "0.15.2"
 
+      - name: Format check (0.15.2 only)
+        run: zig fmt --check .
+
+      - name: README/AGENTS version and target presence
+        run: |
+          set -eu
+          for v in 0.15.2 0.16.0 0.17.1; do
+            grep -q "$v" README.md
+            grep -q "$v" AGENTS.md
+          done
+          grep -q 'zig016' AGENTS.md
+          grep -q 'zig0171' AGENTS.md
+          for t in x86_64-freebsd x86_64-linux-gnu aarch64-macos x86_64-macos x86_64-windows-gnu x86_64-netbsd x86_64-openbsd; do
+            grep -q "$t" README.md
+          done
+          echo "README/AGENTS presence: OK"
+
+  # runner01 (FreeBSD): one leg per toolchain. Each leg runs the native kqueue
+  # suite (Debug and ReleaseSafe), the seven-target compile gate, the API doc
+  # build, and cross-builds the Linux and Windows test executables (Debug and
+  # ReleaseSafe) for the runtime jobs below. max-parallel keeps the legs
+  # sequential on the shared host so they do not contend for CPU or loopback.
+  build:
+    name: FreeBSD tests + cross-builds (runner01, zig ${{ matrix.zig }})
+    runs-on: FreeBSD
+    timeout-minutes: 30
+    strategy:
+      max-parallel: 1
+      matrix:
+        zig: [0.15.2, 0.16.0, 0.17.1]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Provision Zig ${{ matrix.zig }} (pinned sha256, cached)
+        run: |
+          set -eu
+          ver="${{ matrix.zig }}"
+          case "$ver" in
+            0.15.2) sha="$ZIG_0152_SHA256" ;;
+            0.16.0) sha="$ZIG_0160_SHA256" ;;
+            0.17.1) sha="$ZIG_0171_SHA256" ;;
+            *) echo "unknown toolchain $ver"; exit 1 ;;
+          esac
+          cache="$HOME/.cache/born-zig/$ver"
+          if [ ! -x "$cache/zig" ]; then
+            mkdir -p "$cache"
+            url="https://ziglang.org/download/$ver/zig-x86_64-freebsd-$ver.tar.xz"
+            echo "Downloading $url"
+            if command -v curl >/dev/null 2>&1; then
+              curl -fsSL --retry 3 "$url" -o "$cache/zig.tar.xz"
+            else
+              fetch -o "$cache/zig.tar.xz" "$url"
+            fi
+            echo "$sha  $cache/zig.tar.xz" | sha256sum -c -
+            tar -xf "$cache/zig.tar.xz" -C "$cache" --strip-components=1
+            rm -f "$cache/zig.tar.xz"
+          fi
+          test "$("$cache/zig" version)" = "$ver"
+          echo "ZIG=$cache/zig" >> "$GITHUB_ENV"
+          echo "host: $(uname -srm), commit $GITHUB_SHA, zig $ver"
+          "$cache/zig" version
+
+      # Capture the exit code so the test log prints on both success and
+      # failure: a failing leg must still name the failing tests. The native
+      # --summary all output is a "Build Summary:" line, not the standalone
+      # runner's "All N tests passed." line, so the evidence line quotes the
+      # build summary verbatim.
       - name: Unit tests (native Debug)
-        run: zig build test -Doptimize=Debug --summary all
+        run: |
+          set -eu
+          if "$ZIG" build test -Doptimize=Debug --summary all > freebsd-debug.log 2>&1; then rc=0; else rc=$?; fi
+          cat freebsd-debug.log
+          [ "$rc" -eq 0 ] || exit "$rc"
+          summary=$(grep -E 'Build Summary:.*tests passed' freebsd-debug.log) || { echo "born-tests printed no passing build summary"; exit 1; }
+          echo "runtime evidence (x86_64-freebsd, kqueue, zig ${{ matrix.zig }}, Debug): $summary"
 
       - name: Unit tests (native ReleaseSafe)
-        run: zig build test -Doptimize=ReleaseSafe --summary all
+        run: |
+          set -eu
+          if "$ZIG" build test -Doptimize=ReleaseSafe --summary all > freebsd-releasesafe.log 2>&1; then rc=0; else rc=$?; fi
+          cat freebsd-releasesafe.log
+          [ "$rc" -eq 0 ] || exit "$rc"
+          summary=$(grep -E 'Build Summary:.*tests passed' freebsd-releasesafe.log) || { echo "born-tests printed no passing build summary"; exit 1; }
+          echo "runtime evidence (x86_64-freebsd, kqueue, zig ${{ matrix.zig }}, ReleaseSafe): $summary"
 
       - name: Compile tests for all seven supported targets
-        run: zig build check-targets --summary all
+        run: |
+          "$ZIG" build check-targets --summary all
 
       - name: Generate API documentation
         run: |
-          zig build docs --summary all
+          "$ZIG" build docs --summary all
           test -f zig-out/docs/index.html
 
-      - name: Build Linux runtime test executable
+      - name: Cross-build Linux and Windows test executables (Debug + ReleaseSafe)
         run: |
-          zig build test-bin -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe --prefix zig-out/linux --summary all
-          cd zig-out/linux/bin && sha256sum born-tests | tee born-tests.sha256
+          set -eu
+          for opt in Debug ReleaseSafe; do
+            "$ZIG" build test-bin -Dtarget=x86_64-linux-gnu -Doptimize="$opt" --prefix "zig-out/linux-$opt" --summary all
+            ( cd "zig-out/linux-$opt/bin" && sha256sum born-tests | tee born-tests.sha256 )
+            "$ZIG" build test-bin -Dtarget=x86_64-windows-gnu -Doptimize="$opt" --prefix "zig-out/windows-$opt" --summary all
+            ( cd "zig-out/windows-$opt/bin" && sha256sum born-tests.exe | tee born-tests.exe.sha256 )
+          done
 
-      - name: Build Windows runtime test executable
-        run: |
-          zig build test-bin -Dtarget=x86_64-windows-gnu -Doptimize=ReleaseSafe --prefix zig-out/windows --summary all
-          cd zig-out/windows/bin && sha256sum born-tests.exe | tee born-tests.exe.sha256
-
-      - name: Upload Linux test executable
+      - name: Upload Linux test executable (Debug)
         uses: https://code.forgejo.org/forgejo/upload-artifact@v4
         with:
-          name: born-tests-x86_64-linux-gnu
+          name: born-tests-${{ matrix.zig }}-x86_64-linux-gnu-Debug
           path: |
-            zig-out/linux/bin/born-tests
-            zig-out/linux/bin/born-tests.sha256
+            zig-out/linux-Debug/bin/born-tests
+            zig-out/linux-Debug/bin/born-tests.sha256
           if-no-files-found: error
           retention-days: 14
 
-      - name: Upload Windows test executable
+      - name: Upload Linux test executable (ReleaseSafe)
         uses: https://code.forgejo.org/forgejo/upload-artifact@v4
         with:
-          name: born-tests-x86_64-windows-gnu
+          name: born-tests-${{ matrix.zig }}-x86_64-linux-gnu-ReleaseSafe
           path: |
-            zig-out/windows/bin/born-tests.exe
-            zig-out/windows/bin/born-tests.exe.sha256
+            zig-out/linux-ReleaseSafe/bin/born-tests
+            zig-out/linux-ReleaseSafe/bin/born-tests.sha256
           if-no-files-found: error
           retention-days: 14
 
-  # runner03 (Ubuntu 24.04): epoll runtime tests. The job container shares
-  # the runner's kernel, so the syscalls under test are real Linux ones.
+      - name: Upload Windows test executable (Debug)
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: born-tests-${{ matrix.zig }}-x86_64-windows-gnu-Debug
+          path: |
+            zig-out/windows-Debug/bin/born-tests.exe
+            zig-out/windows-Debug/bin/born-tests.exe.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Windows test executable (ReleaseSafe)
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: born-tests-${{ matrix.zig }}-x86_64-windows-gnu-ReleaseSafe
+          path: |
+            zig-out/windows-ReleaseSafe/bin/born-tests.exe
+            zig-out/windows-ReleaseSafe/bin/born-tests.exe.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+  # runner03 (Ubuntu 24.04): epoll runtime tests, one leg per toolchain and
+  # optimize mode. The job container shares the runner's kernel, so the
+  # syscalls under test are real Linux ones. No Zig is needed here.
   linux-runtime:
-    name: Linux runtime tests (runner03, ubuntu-24.04)
+    name: Linux runtime (runner03, zig ${{ matrix.zig }}, ${{ matrix.optimize }})
     runs-on: ubuntu-24.04
     container: node:24-bookworm
     needs: build
     timeout-minutes: 15
+    strategy:
+      matrix:
+        zig: [0.15.2, 0.16.0, 0.17.1]
+        optimize: [Debug, ReleaseSafe]
     steps:
       - name: Trust the Pacy World Root CA for Node
         run: |
@@ -125,7 +241,7 @@ jobs:
       - name: Download Linux test executable
         uses: https://code.forgejo.org/forgejo/download-artifact@v4
         with:
-          name: born-tests-x86_64-linux-gnu
+          name: born-tests-${{ matrix.zig }}-x86_64-linux-gnu-${{ matrix.optimize }}
           path: born-tests
 
       - name: Run born-tests
@@ -133,17 +249,22 @@ jobs:
           cd born-tests
           sha256sum -c born-tests.sha256
           chmod +x born-tests
-          echo "host: $(uname -srm), $(. /etc/os-release && echo "$PRETTY_NAME") container, commit $GITHUB_SHA"
+          echo "host: $(uname -srm), $(. /etc/os-release && echo "$PRETTY_NAME") container, commit $GITHUB_SHA, zig ${{ matrix.zig }} ${{ matrix.optimize }}"
           ./born-tests 2>&1 | tee born-tests.log
           summary=$(grep -E '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$' born-tests.log) || { echo "born-tests printed no passing summary line"; exit 1; }
-          echo "runtime evidence (x86_64-linux-gnu, epoll): $summary"
+          echo "runtime evidence (x86_64-linux-gnu, epoll, zig ${{ matrix.zig }}, ${{ matrix.optimize }}): $summary"
 
-  # runner02 (Windows Server 2022, host mode): IOCP runtime tests.
+  # runner02 (Windows Server 2022, host mode): IOCP runtime tests, one leg per
+  # toolchain and optimize mode. No Zig is needed here.
   windows-runtime:
-    name: Windows runtime tests (runner02, windows-2022)
+    name: Windows runtime (runner02, zig ${{ matrix.zig }}, ${{ matrix.optimize }})
     runs-on: windows-2022
     needs: build
     timeout-minutes: 15
+    strategy:
+      matrix:
+        zig: [0.15.2, 0.16.0, 0.17.1]
+        optimize: [Debug, ReleaseSafe]
     steps:
       - name: Trust the Pacy World Root CA for Node
         run: |
@@ -158,7 +279,7 @@ jobs:
       - name: Download Windows test executable
         uses: https://code.forgejo.org/forgejo/download-artifact@v4
         with:
-          name: born-tests-x86_64-windows-gnu
+          name: born-tests-${{ matrix.zig }}-x86_64-windows-gnu-${{ matrix.optimize }}
           path: born-tests
 
       - name: Run born-tests.exe
@@ -168,7 +289,7 @@ jobs:
           $actual = (Get-FileHash born-tests.exe -Algorithm SHA256).Hash
           if ($actual -ne $expected) { throw "born-tests.exe sha256 $actual does not match the build ($expected)" }
           "born-tests.exe: OK ($actual)"
-          "host: $([System.Environment]::OSVersion.VersionString), commit $env:GITHUB_SHA"
+          "host: $([System.Environment]::OSVersion.VersionString), commit $env:GITHUB_SHA, zig ${{ matrix.zig }} ${{ matrix.optimize }}"
           # cmd redirection keeps the test runner's stderr out of PowerShell's error stream.
           cmd /c "born-tests.exe > born-tests.log 2>&1"
           $rc = $LASTEXITCODE
@@ -176,4 +297,4 @@ jobs:
           if ($rc -ne 0) { throw "born-tests.exe exited with $rc" }
           $summary = Select-String -Path born-tests.log -Pattern '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$'
           if (-not $summary) { throw "born-tests.exe printed no passing summary line" }
-          "runtime evidence (x86_64-windows-gnu, IOCP): $($summary.Line)"
+          "runtime evidence (x86_64-windows-gnu, IOCP, zig ${{ matrix.zig }}, ${{ matrix.optimize }}): $($summary.Line)"
