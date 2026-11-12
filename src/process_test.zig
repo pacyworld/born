@@ -50,11 +50,11 @@ fn waitExit(port: *born.EvPort, udata: *anyopaque, window_ms: u64) !Event {
 }
 
 /// The process table no longer holds `pid`, zombie or not. Polls for up to
-/// two seconds: a running FreeBSD child whose descriptor was closed is
-/// reaped by init.
+/// five seconds: a running FreeBSD child whose descriptor was closed is
+/// reaped by init, which heavy scheduler load can delay (#45).
 fn expectGone(pid: i32) !void {
     const start = try compat.monotonicNs();
-    while (try compat.monotonicNs() - start < 2 * std.time.ns_per_s) {
+    while (try compat.monotonicNs() - start < 5 * std.time.ns_per_s) {
         if (try gone(pid)) return;
         compat.sleepNs(10 * std.time.ns_per_ms);
     }
