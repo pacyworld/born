@@ -29,7 +29,8 @@
 //! CloseHandle.
 
 const std = @import("std");
-const windows = std.os.windows;
+const compat = @import("compat");
+const windows = compat.windows;
 const iocp = @import("evport_iocp.zig");
 const timer_heap = @import("timer_heap.zig");
 const EvPort = iocp.EvPort;
@@ -38,8 +39,8 @@ const TimerError = iocp.TimerError;
 const TimerMode = iocp.TimerMode;
 
 // Thread-pool timer API (threadpoolapiset.h), exported by kernel32.dll
-// since Windows Vista and listed in mingw-w64's kernel32.def. Zig 0.15's
-// std.os.windows does not declare it. All use the WINAPI convention.
+// since Windows Vista and listed in mingw-w64's kernel32.def. These local
+// declarations keep the callback and opaque object types together.
 
 /// PTP_TIMER: an opaque thread-pool timer object.
 const TpTimer = opaque {};
@@ -267,14 +268,9 @@ pub fn harvest(port: *EvPort, payload: usize, out: []Event) usize {
 
 const testing = std.testing;
 
-extern "kernel32" fn GetProcessHandleCount(
-    hProcess: windows.HANDLE,
-    pdwHandleCount: *windows.DWORD,
-) callconv(.winapi) windows.BOOL;
-
 fn handleCount() !u32 {
     var count: windows.DWORD = 0;
-    if (GetProcessHandleCount(windows.GetCurrentProcess(), &count) == 0) return error.Unexpected;
+    if (windows.kernel32.GetProcessHandleCount(windows.kernel32.GetCurrentProcess(), &count) == 0) return error.Unexpected;
     return count;
 }
 
@@ -287,9 +283,9 @@ fn spinUs(us: u64) void {
 
 /// Waits up to `window_ms` for at least one event.
 fn waitOne(port: *EvPort, events: []Event, window_ms: i32) !usize {
-    var t = try std.time.Timer.start();
+    const start_ns = try compat.monotonicNs();
     while (true) {
-        const elapsed: i32 = @intCast(t.read() / std.time.ns_per_ms);
+        const elapsed: i32 = @intCast((try compat.monotonicNs() - start_ns) / std.time.ns_per_ms);
         if (elapsed >= window_ms) return 0;
         const n = try port.wait(events, window_ms - elapsed);
         if (n != 0) return n;
@@ -406,7 +402,7 @@ test "timer_iocp: repeat reports missed periods in fired" {
     var tag: u8 = 1;
     try add(&port, 1, &tag, 5, .repeat);
     // Miss several periods before the first harvest.
-    std.Thread.sleep(60 * std.time.ns_per_ms);
+    compat.sleepNs(60 * std.time.ns_per_ms);
     var events: [4]Event = undefined;
     try testing.expectEqual(@as(usize, 1), try waitOne(&port, &events, 1000));
     try testing.expect(events[0].fired >= 2);
@@ -471,7 +467,7 @@ test "timer_iocp: 1000 create/arm/deinit cycles with a timer due at teardown" {
     }
     // The offsets fall on both sides of the firing.
     try testing.expect(fired > 0 and fired < harvested);
-    std.Thread.sleep(20 * std.time.ns_per_ms);
+    compat.sleepNs(20 * std.time.ns_per_ms);
     // The thread pool may add worker threads (one handle each); a leaked
     // port per cycle would add about a thousand.
     const after = try handleCount();

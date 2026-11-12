@@ -42,7 +42,7 @@ OS per primitive, and lists real runs only.
 | epoll, Linux 6.8 (runner03, Ubuntu 24.04) | Unix domain stream sockets | [run 70, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/70/jobs/1): ReleaseSafe, 65 passed, 13 skipped, 0 failed | 2026-10-19 | [86ef7ec](https://pacyworld.dev/pacyworld/born/commit/86ef7ec20f50151e4719254a79d590b7feb7f4ba) |
 | kqueue, FreeBSD 15 (runner01) | readiness counts, EVFILT_USER wake | [run 102, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/102/jobs/0): Debug and ReleaseSafe, 91 passed, 6 skipped, 0 failed | 2026-10-22 | [0b1ec8e](https://pacyworld.dev/pacyworld/born/commit/0b1ec8edb100dd8484f002227bc2a5544ec548ef) |
 | epoll, Linux 6.8 (runner03, Ubuntu 24.04) | readiness hints without counts (drain contract) | [run 102, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/102/jobs/1): ReleaseSafe, 87 passed, 6 skipped, 0 failed | 2026-10-22 | [0b1ec8e](https://pacyworld.dev/pacyworld/born/commit/0b1ec8edb100dd8484f002227bc2a5544ec548ef) |
-| kqueue, macOS 26 arm64 (macinotsh-desktop, manual) | event port, readiness counts, EVFILT_USER wake | zig build test, Debug: 92 passed, 6 skipped, 0 failed | 2026-10-22 | [622ee3c](https://pacyworld.dev/pacyworld/born/commit/622ee3c) |
+| kqueue, macOS 26.1 arm64 (macinotsh-desktop, manual) | tri-toolchain compat, event port, readiness counts, EVFILT_USER wake | born-tests ReleaseSafe on Zig 0.15.2, 0.16.0, and 0.17.1: 116 passed, 24 skipped, 0 failed each | 2026-11-11 | [d65e2fe](https://pacyworld.dev/pacyworld/born/commit/d65e2fe0a07e45877b20ea299f8e736978a0dbe9) |
 | IOCP, Windows Server 2022 build 20348 (runner02) | no-op readiness hints | [run 134, Windows job](https://pacyworld.dev/pacyworld/born/actions/runs/134/jobs/2): ReleaseSafe, 74 passed, 25 skipped, 0 failed; hint no-op test passed | 2026-11-10 | [1aaf70e](https://pacyworld.dev/pacyworld/born/commit/1aaf70e9d5f61dc8bb4a92aee3f2ca4682057b4c) |
 | IOCP, Windows Server 2022 build 20348 (runner02) | Unix sockets: unsupported contract | [run 134, Windows job](https://pacyworld.dev/pacyworld/born/actions/runs/134/jobs/2): ReleaseSafe, 74 passed, 25 skipped, 0 failed; Unsupported test passed, lifecycle tests skip | 2026-11-10 | [1aaf70e](https://pacyworld.dev/pacyworld/born/commit/1aaf70e9d5f61dc8bb4a92aee3f2ca4682057b4c) |
 | kqueue, FreeBSD 15 (runner01) | process descriptors (pdfork, EVFILT_PROCDESC) | [run 127, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/127/jobs/0): Debug and ReleaseSafe, 108 passed, 8 skipped, 0 failed | 2026-11-09 | [6f4f6ed](https://pacyworld.dev/pacyworld/born/commit/6f4f6ed776306c37e5beaa4cd238263cb980d1be) |
@@ -294,9 +294,9 @@ child.close();
 | IOCP; kqueue on macOS, NetBSD, OpenBSD | none | spawn and watch return `error.Unsupported` | n/a |
 
 - **Born's successful spawn and setup path takes no allocator and performs no
-  user-space heap allocation:** argv and envp are the caller's NUL-terminated arrays, and the
-  fixed descriptor plan is ready before the fork. There is no PATH search
-  (`opts.path` or argv[0] is the program). Between fork and execve the child
+  user-space heap allocation:** argv and envp are the caller's NUL-terminated
+  arrays, and the fixed descriptor plan is ready before the fork. There is no
+  PATH search (`opts.path` or argv[0] is the program). Between fork and execve the child
   makes only async-signal-safe calls. FreeBSD libthr also runs the
   application's `pthread_atfork` handlers around `pdfork`; born registers
   none, and application handlers must obey the same child-side rule for a
@@ -329,10 +329,10 @@ child.close();
   status is already available. A still-exiting child's pidfd goes to a lazily
   spawned detached reaper thread. If that thread cannot be spawned or its
   queue cannot allocate space, `close` itself falls back to a blocking reap;
-  it is therefore not unconditionally nonblocking, and the fallback is not
-  allocation-only. The reaper drains oldest-first, so one stalled exit delays
-  later entries (#52). Loop code should `child.kill(sig)`, wait for the exit
-  event, then `purgeFd` and `close`, which keeps reaping on the spot.
+  it is therefore not unconditionally nonblocking. The reaper drains
+  oldest-first, so one stalled exit delays later entries (#52). Loop code
+  should `child.kill(sig)`, wait for the exit event, then `purgeFd` and `close`,
+  which keeps reaping on the spot.
 - **kill** signals through the descriptor, so it never reaches a recycled
   pid. After born reaps a reported exit, or after an external wait reaps the
   child, Linux answers `error.Exited`; a FreeBSD zombie accepts and ignores
@@ -466,11 +466,15 @@ zig build test-bin -Dtarget=x86_64-windows-gnu --prefix zig-out/windows
 zig build test-bin -Dtarget=x86_64-linux-gnu --prefix zig-out/linux
 ```
 
-Requires Zig 0.15.2. The module propagates its libc or Winsock/kernel32 linkage.
-Forgejo CI checks the exact toolchain version, runs FreeBSD Debug/ReleaseSafe
-tests, compiles the seven-target test matrix, generates API documentation,
-links the Linux/Windows test executables and runs them on an Ubuntu 24.04 and
-a Windows Server 2022 runner.
+Born supports Zig 0.15.2, 0.16.0, and 0.17.1. `src/compat.zig` owns native ABI
+and toolchain-version differences; core code does not depend on `std.Io`.
+TCP companions accept `born.socket.Address`, Born's native sockaddr union, on
+all three toolchains. Callers using `std.net.Address` must migrate to this type.
+
+The module propagates its libc or Winsock/kernel32 linkage. Forgejo CI currently
+uses Zig 0.15.2, runs FreeBSD Debug/ReleaseSafe tests, compiles the seven-target
+test matrix, generates API documentation, links the Linux/Windows test
+executables and runs them on an Ubuntu 24.04 and a Windows Server 2022 runner.
 `check-targets` is deliberately compile-only, not evidence that target
 libraries link or that tests ran on those operating systems. Outside CI, run
 the `test-bin` output on its matching platform (hosts in `AGENTS.md`).

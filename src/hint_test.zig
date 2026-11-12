@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const compat = @import("compat");
 const born = @import("root.zig");
 const socket = born.socket;
 const alloc = std.testing.allocator;
@@ -51,11 +52,11 @@ test "hint: stream count skips the trailing read, and a late arrival raises a ne
     if (is_windows) return error.SkipZigTest;
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
-    var fds: [2]std.posix.fd_t = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
-    defer std.posix.close(fds[1]);
+    var fds: [2]compat.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(compat.AF.UNIX, compat.SOCK.STREAM, 0, &fds));
+    defer compat.close(fds[1]);
     for (fds) |fd| {
-        _ = try std.posix.fcntl(fd, std.posix.F.SETFL, @as(u32, @bitCast(@as(std.posix.O, .{ .NONBLOCK = true }))));
+        _ = try compat.fcntl(fd, compat.F.SETFL, @as(u32, @bitCast(@as(compat.O, .{ .NONBLOCK = true }))));
     }
     var stream: socket.PlainNb = .{ .sock = fds[0] };
     defer {
@@ -64,7 +65,7 @@ test "hint: stream count skips the trailing read, and a late arrival raises a ne
     }
     port.monitorRead(fds[0], &stream);
 
-    _ = try std.posix.write(fds[1], "0123456789");
+    _ = try compat.write(fds[1], "0123456789");
     const ev = try nextReadable(&port, &stream);
     try std.testing.expectEqual(if (have_counts) @as(usize, 10) else 0, ev.avail);
     stream.hintReadable(ev);
@@ -81,7 +82,7 @@ test "hint: stream count skips the trailing read, and a late arrival raises a ne
     try std.testing.expectEqual(@as(usize, 10), got);
 
     // One more byte arrives after the kernel took the count.
-    _ = try std.posix.write(fds[1], "x");
+    _ = try compat.write(fds[1], "x");
     if (have_counts) {
         // The count is spent: no read, even though a byte is queued.
         try std.testing.expectEqual(born.socket.NbRead.want_read, try stream.readNb(&buf));
@@ -101,17 +102,17 @@ test "hint: an EOF event keeps draining until the read that returns zero" {
     if (is_windows) return error.SkipZigTest;
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
-    var fds: [2]std.posix.fd_t = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
-    _ = try std.posix.fcntl(fds[0], std.posix.F.SETFL, @as(u32, @bitCast(@as(std.posix.O, .{ .NONBLOCK = true }))));
+    var fds: [2]compat.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(compat.AF.UNIX, compat.SOCK.STREAM, 0, &fds));
+    _ = try compat.fcntl(fds[0], compat.F.SETFL, @as(u32, @bitCast(@as(compat.O, .{ .NONBLOCK = true }))));
     var stream: socket.PlainNb = .{ .sock = fds[0] };
     defer {
         port.purgeFd(fds[0]);
         stream.deinit();
     }
     port.monitorRead(fds[0], &stream);
-    _ = try std.posix.write(fds[1], "ab");
-    std.posix.close(fds[1]);
+    _ = try compat.write(fds[1], "ab");
+    compat.close(fds[1]);
 
     const ev = try nextReadable(&port, &stream);
     try std.testing.expect(ev.eof);
@@ -128,7 +129,7 @@ test "hint: listener count skips the trailing accept, and a late arrival raises 
     if (is_windows) return error.SkipZigTest;
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
-    var l = socket.Listener.openTcp(alloc, try std.net.Address.parseIp4("127.0.0.1", 0), .{}) catch |err| {
+    var l = socket.Listener.openTcp(alloc, try compat.Address.parseIp4("127.0.0.1", 0), .{}) catch |err| {
         if (err == error.Unsupported) return error.SkipZigTest;
         return err;
     };
@@ -139,8 +140,8 @@ test "hint: listener count skips the trailing accept, and a late arrival raises 
     }
     const addr = try l.localAddress();
 
-    var clients: [3]std.net.Stream = undefined;
-    for (&clients) |*c| c.* = try std.net.tcpConnectToAddress(addr);
+    var clients: [3]compat.Stream = undefined;
+    for (&clients) |*c| c.* = try compat.tcpConnectToAddress(addr);
     defer for (&clients) |*c| c.close();
 
     // The kernel may report fewer than three: a loopback connection can still
@@ -157,11 +158,11 @@ test "hint: listener count skips the trailing accept, and a late arrival raises 
             accepted += 1;
         }
         // A fourth connection arrives after the kernel took the count.
-        var late = try std.net.tcpConnectToAddress(addr);
+        var late = try compat.tcpConnectToAddress(addr);
         defer late.close();
         // The count is spent: no accept, even though connections are queued.
         try std.testing.expectEqual(socket.AcceptResult.want_accept, try l.acceptNb(&streams[accepted], null));
-        try std.testing.expectEqual(@as(std.posix.fd_t, -1), streams[accepted].sock);
+        try std.testing.expectEqual(@as(compat.fd_t, -1), streams[accepted].sock);
         // The arrivals raised new edges, so nothing is stranded.
         try drainAccepts(&port, &l, &streams, &accepted, 4);
     } else {

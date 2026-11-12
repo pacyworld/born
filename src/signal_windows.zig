@@ -62,7 +62,8 @@
 //! the next watch installs it again) and watch again.
 
 const std = @import("std");
-const windows = std.os.windows;
+const compat = @import("compat");
+const windows = compat.windows;
 const kernel32 = windows.kernel32;
 const iocp = @import("evport_iocp.zig");
 const EvPort = iocp.EvPort;
@@ -70,19 +71,17 @@ const Event = iocp.Event;
 const SignalError = iocp.SignalError;
 const Signal = iocp.Signal;
 
-extern "kernel32" fn GetConsoleProcessList(lpdwProcessList: [*]windows.DWORD, dwProcessCount: windows.DWORD) callconv(.winapi) windows.DWORD;
-
 /// The port that receives each signal, null while unwatched.
 var owners: std.EnumArray(Signal, ?*EvPort) = .initFill(null);
 /// Guards `owners`, `ending` and `configuring`; see the file comment.
-var owners_lock: std.Thread.Mutex = .{};
+var owners_lock: compat.Mutex = .{};
 /// A routine holds its thread after CTRL_CLOSE/SHUTDOWN_EVENT.
 var ending = false;
 /// A SetConsoleCtrlHandler call is in flight.
 var configuring = false;
 
 /// Serializes watch and unwatch across threads; guards the fields below.
-var config_lock: std.Thread.Mutex = .{};
+var config_lock: compat.Mutex = .{};
 /// `onConsoleEvent` is registered.
 var installed = false;
 /// CTRL+C was ignored before `.interrupt` was watched.
@@ -91,7 +90,7 @@ var restore_ignore = false;
 /// Per-port watch bookkeeping, a field of EvPort (`signals`). Read and
 /// written only by the thread that owns the port.
 pub const State = struct {
-    watched: std.EnumSet(Signal) = .initEmpty(),
+    watched: std.EnumSet(Signal) = compat.emptyEnumSet(Signal),
     udata: std.EnumArray(Signal, ?*anyopaque) = .initFill(null),
 
     /// Returns state with no watched signals.
@@ -181,7 +180,7 @@ pub fn unwatch(port: *EvPort, sig: Signal) void {
 /// Handles one internal signal completion (`payload` is the Signal
 /// ordinal). Writes at most `out.len` (>= 1) events and returns the count.
 pub fn harvest(port: *EvPort, payload: usize, out: []Event) usize {
-    if (payload >= std.meta.fields(Signal).len) @panic("born: signal_windows.harvest with an invalid payload");
+    if (payload >= compat.enumFields(Signal).len) @panic("born: signal_windows.harvest with an invalid payload");
     const sig: Signal = @enumFromInt(payload);
     const st = &port.signals;
     // Posted before an unwatch on this port: stale, not delivered.
@@ -241,11 +240,11 @@ fn setHandler(routine: ?windows.HANDLER_ROUTINE, add: bool) ?bool {
 /// without one).
 fn hasConsole() bool {
     var pid: [1]windows.DWORD = undefined;
-    return GetConsoleProcessList(&pid, pid.len) != 0;
+    return kernel32.GetConsoleProcessList(&pid, pid.len) != 0;
 }
 
 /// The process ignores CTRL+C: bit 0 of the parameter block's
 /// ConsoleFlags, which SetConsoleCtrlHandler(NULL, ...) writes.
 fn ctrlCIgnored() bool {
-    return windows.peb().ProcessParameters.ConsoleFlags & 1 != 0;
+    return std.os.windows.peb().ProcessParameters.ConsoleFlags & 1 != 0;
 }

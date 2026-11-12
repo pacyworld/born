@@ -75,8 +75,7 @@ process-global reaper thread. That thread takes ownership of the descriptor,
 performs the blocking `waitid`, and closes it. If the thread cannot be spawned
 or its queue cannot allocate space, the handoff fails and `Child.close` itself
 performs the blocking reap. Thus close normally avoids waiting for a running
-child, but it is not unconditionally nonblocking, and the blocking fallback is
-not limited to allocation failure.
+child, but it is not unconditionally nonblocking.
 
 The detached reaper consumes its queue oldest-first with blocking waits. One
 child whose exit stalls therefore delays every later queued pidfd, a known

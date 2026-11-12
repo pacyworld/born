@@ -13,7 +13,7 @@
 //! before `opts.mode` is in place. The umask is not touched: it is
 //! process-wide, and changing it would race other threads creating files.
 //! fchmodat goes by path with AT_SYMLINK_NOFOLLOW (on Linux before 6.6
-//! through std's /proc fallback). The socket's parent directory must be
+//! through compat's /proc fallback). The socket's parent directory must be
 //! writable only by trusted users: bind, fchmodat, ownership checks, and
 //! unlink are separate operations, so an untrusted directory writer could
 //! replace the path between operations. `opts.mode` takes
@@ -42,11 +42,11 @@ const evport = @import("root.zig");
 const io = @import("io_types.zig");
 const Listener = @import("listener_posix.zig").Listener;
 const PlainNb = @import("socket_posix.zig").PlainNb;
-const posix = std.posix;
+const compat = @import("compat");
 
-const sun_path_len = @typeInfo(@FieldType(posix.sockaddr.un, "path")).array.len;
-const Dev = @FieldType(posix.Stat, "dev");
-const Ino = @FieldType(posix.Stat, "ino");
+const sun_path_len = @typeInfo(@FieldType(compat.sockaddr.un, "path")).array.len;
+const Dev = @FieldType(compat.FileStat, "dev");
+const Ino = @FieldType(compat.FileStat, "ino");
 
 /// Unix-only listener state, a field of Listener (`unix`): the path this
 /// process bound, and the identity of the file bind created.
@@ -71,7 +71,7 @@ pub const ListenerState = struct {
     path_len: usize = 0,
     dev: Dev = 0,
     ino: Ino = 0,
-    pid: posix.pid_t = 0,
+    pid: compat.pid_t = 0,
 
     fn path(self: *const ListenerState) []const u8 {
         return self.path_buf[0..self.path_len];
@@ -83,13 +83,13 @@ pub const ListenerState = struct {
         defer self.path_len = 0;
         if (std.c.getpid() != self.pid) return;
         if (!self.ownsPath()) return;
-        posix.unlink(self.path()) catch {};
+        compat.unlink(self.path()) catch {};
     }
 
     /// The path still names the socket file this listener bound.
     fn ownsPath(self: *const ListenerState) bool {
-        const st = posix.fstatat(posix.AT.FDCWD, self.path(), posix.AT.SYMLINK_NOFOLLOW) catch return false;
-        return posix.S.ISSOCK(st.mode) and st.dev == self.dev and st.ino == self.ino;
+        const st = compat.fstatat(compat.AT.FDCWD, self.path(), compat.AT.SYMLINK_NOFOLLOW) catch return false;
+        return compat.S.ISSOCK(st.mode) and st.dev == self.dev and st.ino == self.ino;
     }
 };
 
@@ -97,21 +97,21 @@ pub const ListenerState = struct {
 const PathError = error{ NameTooLong, InvalidPath };
 
 /// `path` as a NUL-terminated sockaddr_un, never truncated.
-fn sockAddr(path: []const u8) PathError!posix.sockaddr.un {
-    if (path.len == 0 or std.mem.indexOfScalar(u8, path, 0) != null) return error.InvalidPath;
+fn sockAddr(path: []const u8) PathError!compat.sockaddr.un {
+    if (path.len == 0 or compat.findScalar(u8, path, 0) != null) return error.InvalidPath;
     if (path.len + 1 > sun_path_len) return error.NameTooLong;
-    var un = std.mem.zeroes(posix.sockaddr.un);
-    un.family = posix.AF.UNIX;
-    if (@hasField(posix.sockaddr.un, "len")) un.len = @sizeOf(posix.sockaddr.un);
+    var un = std.mem.zeroes(compat.sockaddr.un);
+    un.family = compat.AF.UNIX;
+    if (@hasField(compat.sockaddr.un, "len")) un.len = @sizeOf(compat.sockaddr.un);
     @memcpy(un.path[0..path.len], path);
     return un;
 }
 
-fn sockPtr(un: *const posix.sockaddr.un) *const posix.sockaddr {
+fn sockPtr(un: *const compat.sockaddr.un) *const compat.sockaddr {
     return @ptrCast(un);
 }
 
-const addr_len: posix.socklen_t = @sizeOf(posix.sockaddr.un);
+const addr_len: compat.socklen_t = @sizeOf(compat.sockaddr.un);
 
 /// Open a Unix stream listener at `path` with `opts`.
 ///
@@ -126,30 +126,30 @@ pub fn listen(alloc: std.mem.Allocator, path: []const u8, opts: io.UnixOptions) 
         error.InvalidPath => io.ListenError.SocketError,
     };
 
-    const s = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0) catch |err| return switch (err) {
+    const s = compat.socket(compat.AF.UNIX, compat.SOCK.STREAM | compat.SOCK.NONBLOCK | compat.SOCK.CLOEXEC, 0) catch |err| return switch (err) {
         error.AccessDenied => io.ListenError.AccessDenied,
         else => io.ListenError.SocketError,
     };
-    errdefer posix.close(s);
+    errdefer compat.close(s);
 
     try bindPath(s, &un, path, opts.unlink_stale);
 
     // bind created the file: record it, and remove it again on failure.
     var state: ListenerState = .{ .path_len = path.len, .pid = std.c.getpid() };
     @memcpy(state.path_buf[0..path.len], path);
-    const st = posix.fstatat(posix.AT.FDCWD, path, posix.AT.SYMLINK_NOFOLLOW) catch return io.ListenError.SocketError;
-    if (!posix.S.ISSOCK(st.mode)) return io.ListenError.SocketError; // replaced since bind
+    const st = compat.fstatat(compat.AT.FDCWD, path, compat.AT.SYMLINK_NOFOLLOW) catch return io.ListenError.SocketError;
+    if (!compat.S.ISSOCK(st.mode)) return io.ListenError.SocketError; // replaced since bind
     state.dev = st.dev;
     state.ino = st.ino;
     errdefer state.deinit();
 
     // Not listening yet: every connect is refused until listen below.
-    posix.fchmodat(posix.AT.FDCWD, path, @intCast(opts.mode), posix.AT.SYMLINK_NOFOLLOW) catch |err| return switch (err) {
+    compat.fchmodat(compat.AT.FDCWD, path, @intCast(opts.mode), compat.AT.SYMLINK_NOFOLLOW) catch |err| return switch (err) {
         error.AccessDenied, error.PermissionDenied => io.ListenError.AccessDenied,
         else => io.ListenError.SocketError,
     };
 
-    switch (posix.errno(std.c.listen(s, std.math.maxInt(c_int)))) {
+    switch (std.posix.errno(std.c.listen(s, std.math.maxInt(c_int)))) {
         .SUCCESS => {},
         else => return io.ListenError.SocketError,
     }
@@ -157,10 +157,10 @@ pub fn listen(alloc: std.mem.Allocator, path: []const u8, opts: io.UnixOptions) 
 }
 
 /// bind, replacing a stale socket file at most once.
-fn bindPath(s: posix.fd_t, un: *const posix.sockaddr.un, path: []const u8, unlink_stale: bool) io.ListenError!void {
+fn bindPath(s: compat.fd_t, un: *const compat.sockaddr.un, path: []const u8, unlink_stale: bool) io.ListenError!void {
     var retried = false;
     while (true) {
-        switch (posix.errno(std.c.bind(s, sockPtr(un), addr_len))) {
+        switch (std.posix.errno(std.c.bind(s, sockPtr(un), addr_len))) {
             .SUCCESS => return,
             .ADDRINUSE => {
                 if (!unlink_stale or retried) return io.ListenError.AddressInUse;
@@ -177,9 +177,9 @@ fn bindPath(s: posix.fd_t, un: *const posix.sockaddr.un, path: []const u8, unlin
 /// Unlink the file at `path` if it is a stale socket; return so the caller
 /// retries bind. A live socket is error.AddressInUse, anything else
 /// error.PathNotASocket; neither is touched.
-fn removeStale(un: *const posix.sockaddr.un, path: []const u8) io.ListenError!void {
+fn removeStale(un: *const compat.sockaddr.un, path: []const u8) io.ListenError!void {
     const before = try lstat(path) orelse return; // gone since bind: retry
-    if (!posix.S.ISSOCK(before.mode)) return io.ListenError.PathNotASocket;
+    if (!compat.S.ISSOCK(before.mode)) return io.ListenError.PathNotASocket;
 
     switch (try probe(un)) {
         .live => return io.ListenError.AddressInUse,
@@ -191,7 +191,7 @@ fn removeStale(un: *const posix.sockaddr.un, path: []const u8) io.ListenError!vo
     // possible, so the parent directory must be writable only by trusted users.
     const now = try lstat(path) orelse return;
     if (now.dev != before.dev or now.ino != before.ino) return io.ListenError.AddressInUse;
-    switch (posix.errno(std.c.unlink(@ptrCast(&un.path)))) {
+    switch (std.posix.errno(std.c.unlink(@ptrCast(&un.path)))) {
         .SUCCESS, .NOENT => {},
         .ACCES, .PERM => return io.ListenError.AccessDenied,
         else => return io.ListenError.SocketError,
@@ -199,8 +199,8 @@ fn removeStale(un: *const posix.sockaddr.un, path: []const u8) io.ListenError!vo
 }
 
 /// The file at `path` without following a symlink; null when there is none.
-fn lstat(path: []const u8) io.ListenError!?posix.Stat {
-    return posix.fstatat(posix.AT.FDCWD, path, posix.AT.SYMLINK_NOFOLLOW) catch |err| switch (err) {
+fn lstat(path: []const u8) io.ListenError!?compat.FileStat {
+    return compat.fstatat(compat.AT.FDCWD, path, compat.AT.SYMLINK_NOFOLLOW) catch |err| switch (err) {
         error.FileNotFound => null,
         error.AccessDenied, error.PermissionDenied => io.ListenError.AccessDenied,
         error.NameTooLong => io.ListenError.NameTooLong,
@@ -212,13 +212,13 @@ const Probe = enum { live, stale, gone };
 
 /// Datagram connect to the socket file at `un`: ECONNREFUSED means no
 /// socket is attached to it. See the module comment for why not a stream.
-fn probe(un: *const posix.sockaddr.un) io.ListenError!Probe {
-    const p = posix.socket(posix.AF.UNIX, posix.SOCK.DGRAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0) catch |err| return switch (err) {
+fn probe(un: *const compat.sockaddr.un) io.ListenError!Probe {
+    const p = compat.socket(compat.AF.UNIX, compat.SOCK.DGRAM | compat.SOCK.NONBLOCK | compat.SOCK.CLOEXEC, 0) catch |err| return switch (err) {
         error.AccessDenied => io.ListenError.AccessDenied,
         else => io.ListenError.SocketError,
     };
-    defer posix.close(p);
-    return switch (posix.errno(std.c.connect(p, sockPtr(un), addr_len))) {
+    defer compat.close(p);
+    return switch (std.posix.errno(std.c.connect(p, sockPtr(un), addr_len))) {
         .CONNREFUSED => .stale,
         .NOENT => .gone,
         // A datagram socket accepted it, a socket of another type is bound,
@@ -246,15 +246,15 @@ pub fn connectInto(stream: *PlainNb, alloc: std.mem.Allocator, path: []const u8,
         error.InvalidPath => io.ConnectUnixError.ConnectFailed,
     };
 
-    const s = posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, 0) catch return io.ConnectUnixError.SocketError;
-    errdefer posix.close(s);
+    const s = compat.socket(compat.AF.UNIX, compat.SOCK.STREAM | compat.SOCK.NONBLOCK | compat.SOCK.CLOEXEC, 0) catch return io.ConnectUnixError.SocketError;
+    errdefer compat.close(s);
     if (comptime builtin.os.tag.isDarwin()) {
         const one: c_int = 1;
-        if (posix.errno(std.c.setsockopt(s, posix.SOL.SOCKET, posix.SO.NOSIGPIPE, &one, @sizeOf(c_int))) != .SUCCESS)
+        if (std.posix.errno(std.c.setsockopt(s, compat.SOL.SOCKET, compat.SO.NOSIGPIPE, &one, @sizeOf(c_int))) != .SUCCESS)
             return io.ConnectUnixError.SocketError;
     }
 
-    switch (posix.errno(std.c.connect(s, sockPtr(&un), addr_len))) {
+    switch (std.posix.errno(std.c.connect(s, sockPtr(&un), addr_len))) {
         // EINTR: the connect continues asynchronously, like EINPROGRESS.
         .SUCCESS, .INPROGRESS, .INTR => {},
         .AGAIN => return io.ConnectUnixError.BacklogFull,
@@ -296,31 +296,31 @@ const TestPath = struct {
     }
 
     fn deinit(self: *TestPath) void {
-        posix.unlink(self.get()) catch {};
+        compat.unlink(self.get()) catch {};
         if (self.tmp) |*tmp| tmp.cleanup();
     }
 };
 
 fn exists(path: []const u8) bool {
-    _ = posix.fstatat(posix.AT.FDCWD, path, posix.AT.SYMLINK_NOFOLLOW) catch return false;
+    _ = compat.fstatat(compat.AT.FDCWD, path, compat.AT.SYMLINK_NOFOLLOW) catch return false;
     return true;
 }
 
 /// Raw blocking stream connect; true when it succeeded.
 fn rawConnect(path: []const u8) !bool {
     const un = try sockAddr(path);
-    const c = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-    defer posix.close(c);
-    return posix.errno(std.c.connect(c, sockPtr(&un), addr_len)) == .SUCCESS;
+    const c = try compat.socket(compat.AF.UNIX, compat.SOCK.STREAM | compat.SOCK.CLOEXEC, 0);
+    defer compat.close(c);
+    return std.posix.errno(std.c.connect(c, sockPtr(&un), addr_len)) == .SUCCESS;
 }
 
 test "unix_posix: a socket bound but not yet listening is live, not stale" {
     var p = try TestPath.init();
     defer p.deinit();
     const un = try sockAddr(p.get());
-    const raw = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-    defer posix.close(raw);
-    try testing.expectEqual(posix.E.SUCCESS, posix.errno(std.c.bind(raw, sockPtr(&un), addr_len)));
+    const raw = try compat.socket(compat.AF.UNIX, compat.SOCK.STREAM | compat.SOCK.CLOEXEC, 0);
+    defer compat.close(raw);
+    try testing.expectEqual(compat.E.SUCCESS, std.posix.errno(std.c.bind(raw, sockPtr(&un), addr_len)));
     // A stream probe would see ECONNREFUSED here and unlink the path.
     try testing.expectError(error.AddressInUse, Listener.openUnix(testing.allocator, p.get(), .{}));
     try testing.expect(exists(p.get()));
@@ -330,16 +330,16 @@ test "unix_posix: a live listener with a full backlog is not stale" {
     var p = try TestPath.init();
     defer p.deinit();
     const un = try sockAddr(p.get());
-    const srv = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, 0);
-    defer posix.close(srv);
-    try testing.expectEqual(posix.E.SUCCESS, posix.errno(std.c.bind(srv, sockPtr(&un), addr_len)));
+    const srv = try compat.socket(compat.AF.UNIX, compat.SOCK.STREAM | compat.SOCK.CLOEXEC, 0);
+    defer compat.close(srv);
+    try testing.expectEqual(compat.E.SUCCESS, std.posix.errno(std.c.bind(srv, sockPtr(&un), addr_len)));
     // Backlog 1, not 0: XNU replaces 0 with somaxconn.
-    try testing.expectEqual(posix.E.SUCCESS, posix.errno(std.c.listen(srv, 1)));
+    try testing.expectEqual(compat.E.SUCCESS, std.posix.errno(std.c.listen(srv, 1)));
 
     // Fill the queue with connections nobody accepts.
-    var clients: [64]posix.fd_t = undefined;
+    var clients: [64]compat.fd_t = undefined;
     var n: usize = 0;
-    defer for (clients[0..n]) |c| posix.close(c);
+    defer for (clients[0..n]) |c| compat.close(c);
     var port = try evport.EvPort.init(testing.allocator);
     defer port.deinit();
     const full_err = while (n < clients.len) {
@@ -363,7 +363,7 @@ test "unix_posix: close removes its own path and preserves a successor's" {
     defer p.deinit();
     var first = try Listener.openUnix(testing.allocator, p.get(), .{});
     // Another instance takes the path over (removed by hand, rebound).
-    try posix.unlink(p.get());
+    try compat.unlink(p.get());
     var second = try Listener.openUnix(testing.allocator, p.get(), .{});
     first.close();
     try testing.expect(exists(p.get()));
@@ -394,10 +394,10 @@ test "unix_posix: a symlink at the path is refused and kept" {
         ".." ++ std.fs.path.sep_str ++ "{s}" ++ std.fs.path.sep_str ++ "s",
         .{target.tmp.?.sub_path},
     );
-    try posix.symlink(link, p.get());
+    try compat.symlink(link, p.get());
     try testing.expectError(error.PathNotASocket, Listener.openUnix(testing.allocator, p.get(), .{}));
-    const st = try posix.fstatat(posix.AT.FDCWD, p.get(), posix.AT.SYMLINK_NOFOLLOW);
-    try testing.expect(posix.S.ISLNK(st.mode));
+    const st = try compat.fstatat(compat.AT.FDCWD, p.get(), compat.AT.SYMLINK_NOFOLLOW);
+    try testing.expect(compat.S.ISLNK(st.mode));
 }
 
 test "unix_posix: empty paths and embedded NULs are refused" {
@@ -407,7 +407,7 @@ test "unix_posix: empty paths and embedded NULs are refused" {
         try testing.expectError(error.SocketError, Listener.openUnix(testing.allocator, bad, .{}));
         var s: PlainNb = .{};
         try testing.expectError(error.ConnectFailed, connectInto(&s, testing.allocator, bad, &port, null));
-        try testing.expectEqual(@as(posix.fd_t, -1), s.sock);
+        try testing.expectEqual(@as(compat.fd_t, -1), s.sock);
     }
 }
 
@@ -422,7 +422,7 @@ test "unix_posix: the longest path that fits sun_path works, one more byte does 
     );
     @memset(buf[prefix.len..], 'x');
     const fits = buf[0 .. sun_path_len - 1];
-    defer posix.unlink(fits) catch {};
+    defer compat.unlink(fits) catch {};
     var l = try Listener.openUnix(testing.allocator, fits, .{});
     try testing.expect(try rawConnect(fits));
     l.close();

@@ -15,7 +15,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const born = @import("born");
-const posix = std.posix;
+const compat = @import("compat");
+const posix = compat;
 
 const Listener = born.socket.Listener;
 const PlainNb = born.socket.PlainNb;
@@ -37,8 +38,7 @@ const pattern_len = 1 << 20;
 // ------------------------------------------------------------------ time ----
 
 fn nowNs() u64 {
-    const ts = posix.clock_gettime(.MONOTONIC) catch @panic("clock_gettime failed");
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    return compat.monotonicNs() catch @panic("monotonic clock failed");
 }
 
 // ---------------------------------------------------------------- options ----
@@ -61,22 +61,20 @@ const Options = struct {
     read_after_accept: bool = false,
 };
 
-fn parseArgs(alloc: std.mem.Allocator) !Options {
-    const argv = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, argv);
+fn parseArgs(argv: anytype) !Options {
     var o: Options = .{};
     if (argv.len < 2) return usage();
-    o.cmd = std.meta.stringToEnum(@TypeOf(o.cmd), argv[1]) orelse return usage();
+    o.cmd = std.meta.stringToEnum(@TypeOf(o.cmd), std.mem.sliceTo(argv[1], 0)) orelse return usage();
     var i: usize = 2;
     while (i < argv.len) : (i += 1) {
-        const k = argv[i];
+        const k = std.mem.sliceTo(argv[i], 0);
         if (std.mem.eql(u8, k, "--read-after-accept")) {
             o.read_after_accept = true;
             continue;
         }
         i += 1;
         if (i >= argv.len) return usage();
-        const v = argv[i];
+        const v = std.mem.sliceTo(argv[i], 0);
         if (std.mem.eql(u8, k, "--mode")) {
             o.mode = std.meta.stringToEnum(Mode, v) orelse return usage();
         } else if (std.mem.eql(u8, k, "--port")) {
@@ -109,16 +107,28 @@ fn usage() error{Usage} {
 
 fn out(comptime fmt: []const u8, args: anytype) void {
     var buf: [1024]u8 = undefined;
-    var w = std.fs.File.stdout().writerStreaming(&buf);
-    w.interface.print(fmt, args) catch @panic("stdout write failed");
-    w.interface.flush() catch @panic("stdout flush failed");
+    const text = std.fmt.bufPrint(&buf, fmt, args) catch @panic("stdout format failed");
+    var written: usize = 0;
+    while (written < text.len) {
+        written += compat.write(1, text[written..]) catch @panic("stdout write failed");
+    }
 }
 
-pub fn main() !void {
+pub const main = if (builtin.zig_version.minor >= 16) mainWithInit else mainRaw;
+
+fn mainWithInit(init: std.process.Init.Minimal) !void {
+    return mainWithArgs(init.args.vector);
+}
+
+fn mainRaw() !void {
+    return mainWithArgs(std.os.argv);
+}
+
+fn mainWithArgs(argv: anytype) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
-    const alloc = if (builtin.mode == .Debug) gpa.allocator() else std.heap.smp_allocator;
-    const opts = parseArgs(alloc) catch |err| switch (err) {
+    const alloc = if (builtin.mode == std.builtin.OptimizeMode.Debug) gpa.allocator() else std.heap.smp_allocator;
+    const opts = parseArgs(argv) catch |err| switch (err) {
         error.Usage => std.process.exit(2),
         else => return err,
     };
@@ -295,7 +305,7 @@ fn serve(alloc: std.mem.Allocator, opts: Options) !void {
     @memset(pattern, 'r');
     srv.pattern = pattern;
 
-    const addr = try std.net.Address.parseIp4("127.0.0.1", opts.port);
+    const addr = try compat.Address.parseIp4("127.0.0.1", opts.port);
     srv.listener = try Listener.openTcp(alloc, addr, .{ .backlog = listen_backlog });
     defer srv.listener.close();
     try srv.listener.register(&srv.port, &srv.listener);
@@ -338,7 +348,7 @@ const TCP_NODELAY: u32 = 1;
 const Linger = extern struct { onoff: c_int, linger: c_int };
 
 const Worker = struct {
-    addr: std.net.Address,
+    addr: compat.Address,
     mode: Mode,
     size: usize,
     /// Reply bytes per request (equal to `size` when the server echoes).
@@ -358,7 +368,7 @@ const Worker = struct {
     }
 };
 
-fn connectTo(addr: std.net.Address, linger0: bool) !posix.socket_t {
+fn connectTo(addr: compat.Address, linger0: bool) !posix.socket_t {
     const s = try posix.socket(addr.any.family, posix.SOCK.STREAM | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP);
     errdefer posix.close(s);
     const one: c_int = 1;
@@ -426,7 +436,7 @@ fn workerMain(w: *Worker, alloc: std.mem.Allocator) void {
 
 fn client(alloc: std.mem.Allocator, opts: Options) !void {
     if (opts.port == 0) return error.PortRequired;
-    const addr = try std.net.Address.parseIp4("127.0.0.1", opts.port);
+    const addr = try compat.Address.parseIp4("127.0.0.1", opts.port);
     const size: usize = switch (opts.mode) {
         .echo => opts.size,
         .storm => 1,

@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const compat = @import("compat");
 const born = @import("root.zig");
 const socket = born.socket;
 const Listener = socket.Listener;
@@ -37,7 +38,7 @@ const SockPath = struct {
     }
 
     fn deinit(self: *SockPath) void {
-        std.fs.cwd().deleteFile(self.get()) catch {};
+        if (comptime !is_windows) compat.unlink(self.get()) catch {};
         if (self.tmp) |*tmp| tmp.cleanup();
     }
 };
@@ -60,12 +61,12 @@ fn requireUnix() !void {
 
 fn wsaStart() !void {
     if (!is_windows) return;
-    var wsa: std.os.windows.ws2_32.WSADATA = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.os.windows.ws2_32.WSAStartup(0x0202, &wsa));
+    var wsa: compat.windows.ws2_32.WSADATA = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), compat.windows.ws2_32.WSAStartup(0x0202, &wsa));
 }
 
 fn wsaStop() void {
-    if (is_windows) _ = std.os.windows.ws2_32.WSACleanup();
+    if (is_windows) _ = compat.windows.ws2_32.WSACleanup();
 }
 
 /// One listener, one client, one accepted peer on one port; stable in
@@ -132,7 +133,7 @@ const Echo = struct {
     fn close(self: *Echo) !void {
         for ([_]*PlainNb{ &self.client, &self.peer }) |s| {
             if (is_windows) {
-                if (s.sock != std.os.windows.ws2_32.INVALID_SOCKET) self.port.purgeFd(s.handle());
+                if (s.sock != compat.windows.ws2_32.INVALID_SOCKET) self.port.purgeFd(s.handle());
             } else if (s.sock >= 0) self.port.purgeFd(s.handle());
             s.cancelAndClose();
         }
@@ -170,7 +171,7 @@ test "unix: Windows returns Unsupported without changing the output stream" {
         // representation so the snapshot covers unions and padding too.
         var out: PlainNb = undefined;
         @memset(std.mem.asBytes(&out), 0);
-        out.sock = std.os.windows.ws2_32.INVALID_SOCKET;
+        out.sock = compat.windows.ws2_32.INVALID_SOCKET;
         defer out.deinit();
         @memset(&out.recv_buf, 0xa5);
         @memset(&out.send_buf, 0x5a);
@@ -216,17 +217,17 @@ test "unix: a stale socket file is replaced, a live listener is refused" {
     defer path.deinit();
 
     // Stale: bound once, never listened on, closed without unlinking.
-    const raw = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC, 0);
-    const addr = try std.net.Address.initUnix(path.get());
-    try std.posix.bind(raw, &addr.any, addr.getOsSockLen());
-    std.posix.close(raw);
+    const raw = try compat.socket(compat.AF.UNIX, compat.SOCK.STREAM | compat.SOCK.CLOEXEC, 0);
+    const addr = try compat.Address.initUnix(path.get());
+    try compat.bind(raw, &addr.any, addr.getOsSockLen());
+    compat.close(raw);
 
     try std.testing.expectError(error.AddressInUse, Listener.openUnix(alloc, path.get(), .{ .unlink_stale = false }));
     var live = try Listener.openUnix(alloc, path.get(), .{});
     defer live.close();
     // The live listener keeps its path whatever unlink_stale says.
     try std.testing.expectError(error.AddressInUse, Listener.openUnix(alloc, path.get(), .{}));
-    _ = try std.posix.fstatat(std.posix.AT.FDCWD, path.get(), 0);
+    _ = try compat.fstatat(compat.AT.FDCWD, path.get(), 0);
 }
 
 test "unix: a non-socket file at the path is refused and kept" {
@@ -235,11 +236,11 @@ test "unix: a non-socket file at the path is refused and kept" {
     var path: SockPath = .{};
     try path.init();
     defer path.deinit();
-    const f = try std.fs.cwd().createFile(path.get(), .{});
-    f.close();
+    const f = try compat.open(path.get(), .{ .ACCMODE = .WRONLY, .CREAT = true, .EXCL = true, .CLOEXEC = true }, 0o600);
+    compat.close(f);
     try std.testing.expectError(error.PathNotASocket, Listener.openUnix(alloc, path.get(), .{}));
-    const st = try std.posix.fstatat(std.posix.AT.FDCWD, path.get(), 0);
-    try std.testing.expect(std.posix.S.ISREG(st.mode));
+    const st = try compat.fstatat(compat.AT.FDCWD, path.get(), 0);
+    try std.testing.expect((st.mode & compat.S.IFMT) == compat.S.IFREG);
 }
 
 test "unix: the requested mode is applied" {
@@ -251,8 +252,8 @@ test "unix: the requested mode is applied" {
         defer path.deinit();
         var l = try Listener.openUnix(alloc, path.get(), .{ .mode = mode });
         defer l.close();
-        const st = try std.posix.fstatat(std.posix.AT.FDCWD, path.get(), 0);
-        try std.testing.expect(std.posix.S.ISSOCK(st.mode));
+        const st = try compat.fstatat(compat.AT.FDCWD, path.get(), 0);
+        try std.testing.expect((st.mode & compat.S.IFMT) == compat.S.IFSOCK);
         try std.testing.expectEqual(@as(u32, mode), @as(u32, @intCast(st.mode)) & 0o777);
     }
 }

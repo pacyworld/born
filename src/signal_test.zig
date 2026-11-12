@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const compat = @import("compat");
 const born = @import("root.zig");
 const Event = born.Event;
 const Signal = born.Signal;
@@ -14,8 +15,8 @@ const is_windows = builtin.os.tag == .windows;
 const probe: Signal = if (is_windows) .terminate else .user1;
 
 const win = struct {
-    const BOOL = std.os.windows.BOOL;
-    const HANDLE = std.os.windows.HANDLE;
+    const BOOL = compat.windows.BOOL;
+    const HANDLE = compat.windows.HANDLE;
     extern "kernel32" fn GenerateConsoleCtrlEvent(dwCtrlEvent: u32, dwProcessGroupId: u32) callconv(.winapi) BOOL;
     extern "kernel32" fn AllocConsole() callconv(.winapi) BOOL;
     extern "kernel32" fn FreeConsole() callconv(.winapi) BOOL;
@@ -54,7 +55,7 @@ const Console = struct {
         for (win.std_ids, &self.saved) |id, *h| h.* = win.GetStdHandle(id);
         self.attached = win.FreeConsole() != 0;
         if (win.AllocConsole() == 0) {
-            const err = std.os.windows.GetLastError();
+            const err = compat.windows.kernel32.GetLastError();
             self.restore();
             std.debug.print("skip: AllocConsole failed ({t}); console events need a console of the test's own\n", .{err});
             return error.SkipZigTest;
@@ -91,7 +92,7 @@ fn raise(sig: Signal) !void {
         if (win.GenerateConsoleCtrlEvent(ctrl, 0) == 0) return error.TestUnexpectedResult;
     } else {
         // Process-directed: XNU's EVFILT_SIGNAL does not see a thread-directed raise(3).
-        try std.posix.kill(std.c.getpid(), sig.toPosix());
+        try compat.kill(std.c.getpid(), sig.toPosix());
     }
 }
 
@@ -111,9 +112,9 @@ fn watchOrSkip(port: *born.EvPort, sig: Signal, udata: ?*anyopaque) !void {
 /// once `stop` have arrived.
 fn collect(port: *born.EvPort, sig: Signal, seen: *std.ArrayList(Event), window_ms: u64, stop: usize) !void {
     var events: [8]Event = undefined;
-    var timer = try std.time.Timer.start();
+    const start = try compat.monotonicNs();
     while (seen.items.len < stop) {
-        const elapsed = timer.read() / std.time.ns_per_ms;
+        const elapsed = (try compat.monotonicNs() - start) / std.time.ns_per_ms;
         if (elapsed >= window_ms) break;
         const n = try port.wait(&events, @intCast(window_ms - elapsed));
         for (events[0..n]) |ev| {
@@ -128,12 +129,12 @@ fn collect(port: *born.EvPort, sig: Signal, seen: *std.ArrayList(Event), window_
 
 test "signal: Signal maps to and from POSIX numbers" {
     if (is_windows) return error.SkipZigTest;
-    inline for (std.meta.fields(Signal)) |field| {
+    for (compat.enumFields(Signal)) |field| {
         const sig: Signal = @enumFromInt(field.value);
         try std.testing.expectEqual(@as(?Signal, sig), Signal.fromPosix(sig.toPosix()));
     }
-    try std.testing.expectEqual(@as(u8, std.posix.SIG.TERM), Signal.terminate.toPosix());
-    try std.testing.expect(Signal.fromPosix(std.posix.SIG.WINCH) == null);
+    try std.testing.expectEqual(compat.signalNumber(std.posix.SIG.TERM), Signal.terminate.toPosix());
+    try std.testing.expect(Signal.fromPosix(compat.signalNumber(std.posix.SIG.WINCH)) == null);
     try std.testing.expect(Signal.fromPosix(0) == null);
 }
 
@@ -188,25 +189,29 @@ test "signal: terminate is delivered instead of ending the process" {
 }
 
 var user2_hits: u32 = 0;
-fn onUser2(_: c_int) callconv(.c) void {
+fn onUser2Old(_: c_int) callconv(.c) void {
+    user2_hits += 1;
+}
+fn onUser2New(_: compat.NativeSignal) callconv(.c) void {
     user2_hits += 1;
 }
 
 test "signal: unwatch restores the prior disposition" {
     if (is_windows) return error.SkipZigTest;
     const signo = Signal.user2.toPosix();
-    var original: std.posix.Sigaction = undefined;
-    const custom: std.posix.Sigaction = .{ .handler = .{ .handler = onUser2 }, .mask = std.posix.sigemptyset(), .flags = 0 };
-    std.posix.sigaction(signo, &custom, &original);
-    defer std.posix.sigaction(signo, &original, null);
+    var original: compat.Sigaction = undefined;
+    const handler: compat.Sigaction.handler_fn = if (builtin.zig_version.minor < 16) onUser2Old else onUser2New;
+    const custom: compat.Sigaction = .{ .handler = .{ .handler = handler }, .mask = compat.sigemptyset(), .flags = 0 };
+    compat.sigaction(signo, &custom, &original);
+    defer compat.sigaction(signo, &original, null);
 
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
     var tag: u8 = 0;
     try watchOrSkip(&port, .user2, &tag);
     port.unwatchSignal(.user2);
-    var now: std.posix.Sigaction = undefined;
-    std.posix.sigaction(signo, null, &now);
+    var now: compat.Sigaction = undefined;
+    compat.sigaction(signo, null, &now);
     try std.testing.expect(now.handler.handler == custom.handler.handler);
 }
 
@@ -257,13 +262,12 @@ test "signal: Windows CTRL_C arrives as interrupt and unwatch restores CTRL+C ig
     if (!is_windows) return error.SkipZigTest;
     const console = try Console.isolate();
     defer console.restore();
-    const windows = std.os.windows;
-    const params = windows.peb().ProcessParameters;
+    const params = std.os.windows.peb().ProcessParameters;
     const ignored_before = params.ConsoleFlags & 1 != 0;
-    defer _ = windows.kernel32.SetConsoleCtrlHandler(null, @intFromBool(ignored_before));
+    defer _ = compat.windows.kernel32.SetConsoleCtrlHandler(null, @intFromBool(ignored_before));
     // Start ignoring CTRL+C, as a process in a new process group does: the
     // watch must clear that and its unwatch set it again.
-    if (windows.kernel32.SetConsoleCtrlHandler(null, windows.TRUE) == 0) return error.TestUnexpectedResult;
+    if (compat.windows.kernel32.SetConsoleCtrlHandler(null, compat.windows.TRUE) == 0) return error.TestUnexpectedResult;
 
     var port = try born.EvPort.init(alloc);
     defer port.deinit();

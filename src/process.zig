@@ -44,6 +44,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const types = @import("types.zig");
+const compat = @import("compat");
 const Handle = types.Handle;
 
 const os = builtin.os.tag;
@@ -175,7 +176,7 @@ const Plan = struct {
     argv: [*:null]const ?[*:0]const u8,
     envp: [*:null]const ?[*:0]const u8,
     /// Source for child fd i, or -1 to leave fd i as inherited.
-    src: [3 + max_fds]i32 = .{-1} ** (3 + max_fds),
+    src: [3 + max_fds]i32 = @splat(-1),
     /// Child fds 0 .. count-1 are the targets.
     count: usize,
     err_w: i32,
@@ -205,7 +206,7 @@ fn spawnPosix(
         },
     };
 
-    const pipe = std.posix.pipe2(.{ .CLOEXEC = true }) catch return SpawnError.SystemResources;
+    const pipe = compat.pipe2(.{ .CLOEXEC = true }) catch return SpawnError.SystemResources;
     const err_r: i32 = pipe[0];
     defer closeFd(err_r);
     var err_w: i32 = pipe[1];
@@ -221,8 +222,8 @@ fn spawnPosix(
 
     // Every signal stays blocked from before the fork until the child has
     // reset its dispositions, so no parent handler runs in the child.
-    var all = std.posix.sigfillset();
-    var saved: std.posix.sigset_t = undefined;
+    var all = compat.sigfillset();
+    var saved: compat.sigset_t = undefined;
     if (std.c.pthread_sigmask(std.posix.SIG.SETMASK, &all, &saved) != 0) return SpawnError.SystemResources;
     const forked = sys.fork(&plan);
     // Restoring a mask pthread_sigmask just returned cannot fail.
@@ -275,7 +276,7 @@ fn execError(errno: u32) SpawnError {
 }
 
 fn closeFd(fd: i32) void {
-    _ = std.c.close(fd);
+    compat.close(fd);
 }
 
 /// The child side, generic over the OS's async-signal-safe calls. Each
@@ -349,7 +350,7 @@ const freebsd = struct {
 
     /// The kernel reaps or kills; nothing to wait for.
     fn close(fd: c_int) void {
-        _ = std.c.close(fd);
+        compat.close(fd);
     }
 
     /// libc after libthr's pdfork, which re-initializes its locks in the
@@ -383,8 +384,8 @@ const freebsd = struct {
             const dfl: std.posix.Sigaction = .{ .handler = .{ .handler = std.posix.SIG.DFL }, .mask = std.posix.sigemptyset(), .flags = 0 };
             var sig: c_int = 1;
             while (sig <= sig_max) : (sig += 1) {
-                if (sig == std.posix.SIG.KILL or sig == std.posix.SIG.STOP) continue;
-                if (std.c.sigaction(sig, &dfl, null) == 0) continue;
+                if (sig == compat.signalNumber(std.posix.SIG.KILL) or sig == compat.signalNumber(std.posix.SIG.STOP)) continue;
+                if (std.c.sigaction(compat.nativeSignal(@intCast(sig)), &dfl, null) == 0) continue;
                 // EINVAL: a signal libthr reserves for itself (SIGTHR).
                 const e = errno();
                 if (e != @intFromEnum(std.posix.E.INVAL)) return e;
@@ -423,8 +424,8 @@ const linux_impl = struct {
         var pidfd: i32 = -1;
         // A raw clone with no new stack forks; CLONE_PIDFD stores the pidfd
         // (close-on-exec) through the parent_tid argument.
-        const rc = linux.syscall5(.clone, linux.CLONE.PIDFD | linux.SIG.CHLD, 0, @intFromPtr(&pidfd), 0, 0);
-        switch (linux.E.init(rc)) {
+        const rc = linux.syscall5(.clone, linux.CLONE.PIDFD | @as(usize, compat.signalNumber(linux.SIG.CHLD)), 0, @intFromPtr(&pidfd), 0, 0);
+        switch (compat.linuxErrno(rc)) {
             .SUCCESS => {},
             .INVAL, .NOSYS => return SpawnError.Unsupported,
             else => return SpawnError.SystemResources,
@@ -447,23 +448,23 @@ const linux_impl = struct {
                 // A running child answers success with si_pid set to zero.
                 // WNOWAIT: otherwise the probe reaps an already-exited
                 // child and discards its status.
-                const prc = linux.waitid(.PIDFD, pidfd, &probe, linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT);
-                switch (linux.E.init(prc)) {
+                const prc = compat.waitid(.PIDFD, pidfd, &probe, linux.W.EXITED | linux.W.NOHANG | linux.W.NOWAIT);
+                switch (compat.linuxErrno(prc)) {
                     .INTR => continue,
                     .SUCCESS => return true,
                     else => break,
                 }
             }
         }
-        _ = linux.kill(pid, linux.SIG.KILL);
+        _ = linux.kill(pid, compat.nativeSignal(compat.signalNumber(linux.SIG.KILL)));
         var info: linux.siginfo_t = undefined;
-        while (linux.E.init(linux.waitid(.PID, pid, &info, linux.W.EXITED)) == .INTR) {}
-        if (pidfd >= 0) _ = std.c.close(pidfd);
+        while (compat.linuxErrno(compat.waitid(.PID, pid, &info, linux.W.EXITED)) == .INTR) {}
+        if (pidfd >= 0) compat.close(pidfd);
         return false;
     }
 
     fn kill(fd: i32, sig: u8) KillError!void {
-        return switch (linux.E.init(linux.pidfd_send_signal(fd, sig, null, 0))) {
+        return switch (compat.linuxErrno(linux.pidfd_send_signal(fd, compat.nativeSignal(sig), null, 0))) {
             .SUCCESS => {},
             .SRCH => KillError.Exited,
             // EINVAL is also a descriptor that is not a pidfd.
@@ -480,24 +481,24 @@ const linux_impl = struct {
     /// reaper thread. Failure to spawn that thread or queue the pidfd in
     /// `reaper.take` falls back to a blocking reap.
     fn close(fd: i32) void {
-        _ = linux.pidfd_send_signal(fd, linux.SIG.KILL, null, 0);
+        _ = linux.pidfd_send_signal(fd, compat.nativeSignal(compat.signalNumber(linux.SIG.KILL)), null, 0);
         var info: linux.siginfo_t = undefined;
         var werr: linux.E = .INTR;
         while (werr == .INTR) {
             info = undefined;
-            werr = linux.E.init(linux.waitid(.PIDFD, fd, &info, linux.W.EXITED | linux.W.NOHANG));
+            werr = compat.linuxErrno(compat.waitid(.PIDFD, fd, &info, linux.W.EXITED | linux.W.NOHANG));
         }
         // Anything but a successful WNOHANG with nothing collected is
         // finished work; a zero si_pid means the SIGKILLed child is still
         // exiting (address-space teardown takes time), and its reaping is
         // handed off below.
         if (werr != .SUCCESS or info.fields.common.first.piduid.pid != 0) {
-            _ = std.c.close(fd);
+            compat.close(fd);
             return;
         }
         if (reaper.take(fd)) return;
-        while (linux.E.init(linux.waitid(.PIDFD, fd, &info, linux.W.EXITED)) == .INTR) {}
-        _ = std.c.close(fd);
+        while (compat.linuxErrno(compat.waitid(.PIDFD, fd, &info, linux.W.EXITED)) == .INTR) {}
+        compat.close(fd);
     }
 
     /// A lazily spawned detached thread that reaps children whose pidfds a
@@ -509,8 +510,8 @@ const linux_impl = struct {
     /// blocking waitid, so a child whose exit stalls (D-state, a large
     /// exit_mmap) delays later entries until it finishes.
     const reaper = struct {
-        var lock: std.Thread.Mutex = .{};
-        var ready: std.Thread.Condition = .{};
+        var lock: compat.Mutex = .{};
+        var ready: compat.Condition = .{};
         var pending: std.ArrayList(i32) = .empty;
         var started = false;
         /// Pid of the process the running thread belongs to; a fork keeps
@@ -527,7 +528,7 @@ const linux_impl = struct {
                 // In a forked child the reaper thread does not exist; the
                 // inherited pidfds refer to children of the parent, which a
                 // restarted reaper could never wait on. Discard them.
-                for (pending.items) |pfd| _ = std.c.close(pfd);
+                for (pending.items) |pfd| compat.close(pfd);
                 pending.clearRetainingCapacity();
                 started = false;
             }
@@ -542,7 +543,7 @@ const linux_impl = struct {
                 const spawned = std.Thread.spawn(.{}, run, .{});
                 _ = linux.sigprocmask(linux.SIG.SETMASK, &saved, null);
                 const t = spawned catch return false;
-                t.setName("born-reaper") catch {};
+                compat.setThreadName(t, "born-reaper");
                 t.detach();
                 owner = me;
                 started = true;
@@ -559,8 +560,8 @@ const linux_impl = struct {
                 const fd = pending.orderedRemove(0);
                 lock.unlock();
                 var info: linux.siginfo_t = undefined;
-                while (linux.E.init(linux.waitid(.PIDFD, fd, &info, linux.W.EXITED)) == .INTR) {}
-                _ = std.c.close(fd);
+                while (compat.linuxErrno(compat.waitid(.PIDFD, fd, &info, linux.W.EXITED)) == .INTR) {}
+                compat.close(fd);
             }
         }
     };
@@ -568,7 +569,7 @@ const linux_impl = struct {
     /// Raw syscalls only: glibc is never entered after the raw clone.
     const ChildSide = struct {
         fn errno(rc: usize) u32 {
-            return @intFromEnum(linux.E.init(rc));
+            return @intFromEnum(compat.linuxErrno(rc));
         }
 
         fn blockAll() u32 {
@@ -589,7 +590,7 @@ const linux_impl = struct {
 
         fn closeRange(lo: u32, hi: u32) u32 {
             const rc = linux.syscall3(.close_range, lo, hi, 0);
-            if (linux.E.init(rc) != .NOSYS) return errno(rc);
+            if (compat.linuxErrno(rc) != .NOSYS) return errno(rc);
             // Before Linux 5.9: close each descriptor below the limit.
             var lim: linux.rlimit = undefined;
             const lrc = linux.getrlimit(.NOFILE, &lim);
@@ -605,8 +606,8 @@ const linux_impl = struct {
             const dfl: linux.Sigaction = .{ .handler = .{ .handler = linux.SIG.DFL }, .mask = linux.sigemptyset(), .flags = 0 };
             var sig: u8 = 1;
             while (sig < linux.NSIG) : (sig += 1) {
-                if (sig == linux.SIG.KILL or sig == linux.SIG.STOP) continue;
-                const e = errno(linux.sigaction(sig, &dfl, null));
+                if (sig == compat.signalNumber(linux.SIG.KILL) or sig == compat.signalNumber(linux.SIG.STOP)) continue;
+                const e = errno(linux.sigaction(compat.nativeSignal(sig), &dfl, null));
                 if (e != 0) return e;
             }
             return 0;
@@ -673,10 +674,10 @@ test "process: the spawn probe leaves an exited child's status in place" {
     var info: linux.siginfo_t = undefined;
     // Wait for the exit without reaping, so the probe meets a child that
     // has already exited.
-    while (linux.E.init(linux.waitid(.PIDFD, child.handle, &info, linux.W.EXITED | linux.W.NOWAIT)) == .INTR) {}
+    while (compat.linuxErrno(compat.waitid(.PIDFD, child.handle, &info, linux.W.EXITED | linux.W.NOWAIT)) == .INTR) {}
     try std.testing.expect(linux_impl.pidfdUsable(child.handle, child.pid));
     // The status survives the probe: a WNOHANG waitid still collects it.
     info = std.mem.zeroes(linux.siginfo_t);
-    try std.testing.expectEqual(linux.E.SUCCESS, linux.E.init(linux.waitid(.PIDFD, child.handle, &info, linux.W.EXITED | linux.W.NOHANG)));
+    try std.testing.expectEqual(linux.E.SUCCESS, compat.linuxErrno(compat.waitid(.PIDFD, child.handle, &info, linux.W.EXITED | linux.W.NOHANG)));
     try std.testing.expectEqual(child.pid, info.fields.common.first.piduid.pid);
 }

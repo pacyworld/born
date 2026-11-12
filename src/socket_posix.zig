@@ -2,6 +2,7 @@
 //! reads and writes, and MSG_NOSIGNAL sends to avoid SIGPIPE.
 
 const std = @import("std");
+const compat = @import("compat");
 const builtin = @import("builtin");
 const evport = @import("root.zig");
 const types = @import("types.zig");
@@ -19,7 +20,7 @@ const MSG_NOSIGNAL: u32 = switch (builtin.os.tag) {
     .freebsd => 0x00020000,
     .linux => 0x00004000,
     .macos, .ios, .tvos, .watchos, .visionos, .driverkit => 0,
-    else => std.posix.MSG.NOSIGNAL,
+    else => compat.MSG.NOSIGNAL,
 };
 
 /// Plaintext stream socket (TCP and Unix where supported) for readiness I/O.
@@ -27,7 +28,7 @@ const MSG_NOSIGNAL: u32 = switch (builtin.os.tag) {
 /// The stream owns its descriptor. Purge event-port registrations for that
 /// descriptor before closing it.
 pub const PlainNb = struct {
-    sock: std.posix.fd_t = -1,
+    sock: compat.fd_t = -1,
     /// Latches a refusal observed by `connectDone` because SO_ERROR is
     /// read-and-clear.
     connect_err: bool = false,
@@ -57,7 +58,7 @@ pub const PlainNb = struct {
     /// and no allocation: the call to use from an event loop. Same contract
     /// as `startConnectInto` (wantWrite, then connectDone). `self` is left
     /// untouched on failure.
-    pub fn startConnectAddrInto(self: *PlainNb, addr: std.net.Address, evp: *evport.EvPort, key: ?*anyopaque) io.ConnectAddrError!void {
+    pub fn startConnectAddrInto(self: *PlainNb, addr: compat.Address, evp: *evport.EvPort, key: ?*anyopaque) io.ConnectAddrError!void {
         std.debug.assert(self.sock == -1);
         _ = evp;
         _ = key;
@@ -66,18 +67,18 @@ pub const PlainNb = struct {
 
     /// socket(SOCK_NONBLOCK) + connect() to one address. A synchronous
     /// refusal (FreeBSD loopback under load) is ConnectFailed.
-    fn connectAddr(addr: std.net.Address) io.ConnectAddrError!PlainNb {
-        const s = std.posix.socket(addr.any.family, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK, 0) catch return io.ConnectAddrError.SocketError;
+    fn connectAddr(addr: compat.Address) io.ConnectAddrError!PlainNb {
+        const s = compat.socket(addr.any.family, compat.SOCK.STREAM | compat.SOCK.CLOEXEC | compat.SOCK.NONBLOCK, 0) catch return io.ConnectAddrError.SocketError;
         if (comptime builtin.os.tag.isDarwin()) {
-            std.posix.setsockopt(s, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, std.mem.asBytes(&@as(c_int, 1))) catch {
-                std.posix.close(s);
+            compat.setsockopt(s, compat.SOL.SOCKET, compat.SO.NOSIGPIPE, std.mem.asBytes(&@as(c_int, 1))) catch {
+                compat.close(s);
                 return io.ConnectAddrError.SocketError;
             };
         }
-        std.posix.connect(s, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
+        compat.connect(s, &addr.any, addr.getOsSockLen()) catch |err| switch (err) {
             error.WouldBlock => return .{ .sock = s }, // EINPROGRESS
             else => {
-                std.posix.close(s);
+                compat.close(s);
                 return io.ConnectAddrError.ConnectFailed;
             },
         };
@@ -103,14 +104,14 @@ pub const PlainNb = struct {
         _ = key;
         if (comptime builtin.os.tag.isDarwin()) {
             const one: c_int = 1;
-            switch (std.posix.errno(std.c.setsockopt(h, std.posix.SOL.SOCKET, std.posix.SO.NOSIGPIPE, &one, @sizeOf(c_int)))) {
+            switch (std.posix.errno(std.c.setsockopt(h, compat.SOL.SOCKET, compat.SO.NOSIGPIPE, &one, @sizeOf(c_int)))) {
                 .SUCCESS => {},
                 .NOBUFS, .NOMEM => {
-                    std.posix.close(h);
+                    compat.close(h);
                     return io.AcceptError.ResourceExhausted;
                 },
                 else => {
-                    std.posix.close(h);
+                    compat.close(h);
                     return io.AcceptError.SocketError;
                 },
             }
@@ -122,7 +123,7 @@ pub const PlainNb = struct {
     /// EINPROGRESS state or instantly connected (loopback): register write
     /// interest and confirm with `connectDone` on the first write event.
     pub fn startConnect(alloc: std.mem.Allocator, host: []const u8, port: u16) io.ConnectError!PlainNb {
-        const addr_list = std.net.getAddressList(alloc, host, port) catch |err| return switch (err) {
+        const addr_list = compat.getAddressList(alloc, host, port) catch |err| return switch (err) {
             error.OutOfMemory => io.ConnectError.OutOfMemory,
             else => io.ConnectError.ConnectFailed,
         };
@@ -140,7 +141,7 @@ pub const PlainNb = struct {
         if (self.sock < 0) return io.ConnectDoneError.SocketError;
         if (self.connect_err) return io.ConnectDoneError.ConnectFailed; // already latched
         var so_error: c_int = 0;
-        std.posix.getsockopt(self.sock, std.posix.SOL.SOCKET, std.posix.SO.ERROR, std.mem.asBytes(&so_error)) catch return io.ConnectDoneError.SocketError;
+        compat.getsockopt(self.sock, compat.SOL.SOCKET, compat.SO.ERROR, std.mem.asBytes(&so_error)) catch return io.ConnectDoneError.SocketError;
         if (so_error != 0) {
             self.connect_err = true;
             return io.ConnectDoneError.ConnectFailed;
@@ -163,7 +164,7 @@ pub const PlainNb = struct {
         if (self.sock < 0) return io.ReadError.SocketError;
         if (out.len == 0) return .{ .data = 0 };
         if (self.hint.exhausted()) return .want_read;
-        const n = std.posix.read(self.sock, out) catch |err| {
+        const n = compat.read(self.sock, out) catch |err| {
             self.hint.clear();
             return switch (err) {
                 error.WouldBlock => .want_read,
@@ -183,9 +184,9 @@ pub const PlainNb = struct {
     pub fn writeNb(self: *PlainNb, data: []const u8) io.WriteError!NbWrite {
         if (self.sock < 0) return io.WriteError.SocketError;
         // Do not pass an empty slice to send(2): on Linux its dangling pointer
-        // can produce EFAULT, which std.posix.send treats as unreachable.
+        // can produce EFAULT, which compat.send treats as unreachable.
         if (data.len == 0) return .{ .done = 0 };
-        const n = std.posix.send(self.sock, data, MSG_NOSIGNAL) catch |err| switch (err) {
+        const n = compat.send(self.sock, data, MSG_NOSIGNAL) catch |err| switch (err) {
             error.WouldBlock => return .want_write,
             else => return io.WriteError.SocketError,
         };
@@ -194,7 +195,7 @@ pub const PlainNb = struct {
 
     /// Intentionally returns `.unknown` without inspecting the completion;
     /// POSIX readiness sockets have no overlapped operations to absorb.
-    pub fn absorbCompletion(self: *PlainNb, ov: ?*std.os.windows.OVERLAPPED, bytes: usize, err: ?usize) io.CompletionKind {
+    pub fn absorbCompletion(self: *PlainNb, ov: ?*compat.windows.OVERLAPPED, bytes: usize, err: ?usize) io.CompletionKind {
         _ = self;
         _ = ov;
         _ = bytes;
@@ -222,7 +223,7 @@ pub const PlainNb = struct {
     /// Closes the descriptor if open and marks the socket closed. Call
     /// `EvPort.purgeFd(handle())` first; no completion drain is required.
     pub fn deinit(self: *PlainNb) void {
-        if (self.sock >= 0) std.posix.close(self.sock);
+        if (self.sock >= 0) compat.close(self.sock);
         self.sock = -1;
     }
 };

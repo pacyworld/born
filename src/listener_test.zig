@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const compat = @import("compat");
 const born = @import("root.zig");
 const socket = born.socket;
 const Listener = socket.Listener;
@@ -11,7 +12,7 @@ const PlainNb = socket.PlainNb;
 const alloc = std.testing.allocator;
 const is_windows = builtin.os.tag == .windows;
 
-fn openOrSkip(addr: std.net.Address, opts: socket.ListenOptions) !Listener {
+fn openOrSkip(addr: compat.Address, opts: socket.ListenOptions) !Listener {
     return Listener.openTcp(alloc, addr, opts) catch |err| {
         if (err == error.Unsupported) return error.SkipZigTest;
         return err;
@@ -20,12 +21,12 @@ fn openOrSkip(addr: std.net.Address, opts: socket.ListenOptions) !Listener {
 
 fn wsaStart() !void {
     if (!is_windows) return;
-    var wsa: std.os.windows.ws2_32.WSADATA = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.os.windows.ws2_32.WSAStartup(0x0202, &wsa));
+    var wsa: compat.windows.ws2_32.WSADATA = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), compat.windows.ws2_32.WSAStartup(0x0202, &wsa));
 }
 
 fn wsaStop() void {
-    if (is_windows) _ = std.os.windows.ws2_32.WSACleanup();
+    if (is_windows) _ = compat.windows.ws2_32.WSACleanup();
 }
 
 /// Accepts into `streams` as listener events arrive: absorb, then drain
@@ -55,12 +56,12 @@ const Acceptor = struct {
 
 fn pump(port: *born.EvPort, acceptors: []const *Acceptor, total: usize, window_ms: u64) !void {
     var events: [32]born.Event = undefined;
-    var timer = try std.time.Timer.start();
+    const start = try compat.monotonicNs();
     while (true) {
         var have: usize = 0;
         for (acceptors) |a| have += a.count;
         if (have >= total) return;
-        const elapsed = timer.read() / std.time.ns_per_ms;
+        const elapsed = (try compat.monotonicNs() - start) / std.time.ns_per_ms;
         if (elapsed >= window_ms) return error.ListenerAcceptTimeout;
         const n = try port.wait(&events, @intCast(window_ms - elapsed));
         for (events[0..n]) |ev| {
@@ -87,19 +88,19 @@ fn closeListener(port: *born.EvPort, l: *Listener) !void {
     }
 }
 
-fn connectClients(clients: []std.net.Stream, addr: std.net.Address) !void {
-    for (clients) |*c| c.* = try std.net.tcpConnectToAddress(addr);
+fn connectClients(clients: []compat.Stream, addr: compat.Address) !void {
+    for (clients) |*c| c.* = try compat.tcpConnectToAddress(addr);
 }
 
 test "listener: API shape is the same on every target" {
     const T = Listener;
-    try std.testing.expect(@TypeOf(T.openTcp) == fn (std.mem.Allocator, std.net.Address, socket.ListenOptions) socket.ListenError!T);
+    try std.testing.expect(@TypeOf(T.openTcp) == fn (std.mem.Allocator, compat.Address, socket.ListenOptions) socket.ListenError!T);
     try std.testing.expect(@TypeOf(T.openUnix) == fn (std.mem.Allocator, []const u8, socket.UnixOptions) socket.ListenError!T);
     try std.testing.expect(@TypeOf(T.register) == fn (*T, *born.EvPort, ?*anyopaque) socket.ListenerRegisterError!void);
     try std.testing.expect(@TypeOf(T.acceptNb) == fn (*T, *PlainNb, ?*anyopaque) socket.AcceptError!socket.AcceptResult);
-    try std.testing.expect(@TypeOf(T.absorbCompletion) == fn (*T, ?*std.os.windows.OVERLAPPED, usize, ?usize) socket.ListenerCompletion);
+    try std.testing.expect(@TypeOf(T.absorbCompletion) == fn (*T, ?*compat.windows.OVERLAPPED, usize, ?usize) socket.ListenerCompletion);
     try std.testing.expect(@TypeOf(T.pendingOps) == fn (*const T) usize);
-    try std.testing.expect(@TypeOf(T.localAddress) == fn (*const T) socket.LocalAddressError!std.net.Address);
+    try std.testing.expect(@TypeOf(T.localAddress) == fn (*const T) socket.LocalAddressError!compat.Address);
     try std.testing.expect(@TypeOf(T.handle) == fn (*const T) born.Handle);
     try std.testing.expect(@TypeOf(T.close) == fn (*T) void);
     const opts: socket.ListenOptions = .{};
@@ -122,7 +123,7 @@ test "listener: one edge drains a queued backlog" {
     defer wsaStop();
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
-    var l = try openOrSkip(try std.net.Address.parseIp4("127.0.0.1", 0), .{});
+    var l = try openOrSkip(try compat.Address.parseIp4("127.0.0.1", 0), .{});
     try l.register(&port, &l);
     const addr = try l.localAddress();
     try std.testing.expect(addr.getPort() != 0);
@@ -133,7 +134,7 @@ test "listener: one edge drains a queued backlog" {
     for (streams) |*s| s.* = .{};
     var acceptor: Acceptor = .{ .listener = &l, .streams = streams };
     defer acceptor.deinit();
-    var clients: [n]std.net.Stream = undefined;
+    var clients: [n]compat.Stream = undefined;
     // Every connection is queued before the first wait().
     try connectClients(&clients, addr);
     defer for (&clients) |*c| c.close();
@@ -148,7 +149,7 @@ test "listener: .balanced spreads connections over two listeners" {
     defer wsaStop();
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
-    var first = try openOrSkip(try std.net.Address.parseIp4("127.0.0.1", 0), .{ .reuse_port = .balanced });
+    var first = try openOrSkip(try compat.Address.parseIp4("127.0.0.1", 0), .{ .reuse_port = .balanced });
     const addr = try first.localAddress();
     var second = try Listener.openTcp(alloc, addr, .{ .reuse_port = .balanced });
     try first.register(&port, &first);
@@ -162,7 +163,7 @@ test "listener: .balanced spreads connections over two listeners" {
     defer a.deinit();
     var b: Acceptor = .{ .listener = &second, .streams = streams[n..] };
     defer b.deinit();
-    const clients = try alloc.alloc(std.net.Stream, n);
+    const clients = try alloc.alloc(compat.Stream, n);
     defer alloc.free(clients);
     try connectClients(clients, addr);
     defer for (clients) |*c| c.close();
@@ -183,7 +184,7 @@ test "listener: .balanced is Unsupported where the kernel cannot balance" {
     defer wsaStop();
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
-    const any = try std.net.Address.parseIp4("127.0.0.1", 0);
+    const any = try compat.Address.parseIp4("127.0.0.1", 0);
     var l = try openOrSkip(any, .{});
     try closeListener(&port, &l);
     try std.testing.expectError(error.Unsupported, Listener.openTcp(alloc, any, .{ .reuse_port = .balanced }));
@@ -194,7 +195,7 @@ test "listener: close with accepts outstanding drains cleanly, 1000 times" {
     defer wsaStop();
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
-    const loopback = try std.net.Address.parseIp4("127.0.0.1", 0);
+    const loopback = try compat.Address.parseIp4("127.0.0.1", 0);
     const depth: usize = if (is_windows) (socket.ListenOptions{}).accept_depth else 0;
     for (0..1000) |_| {
         var l = try openOrSkip(loopback, .{});
@@ -212,9 +213,9 @@ test "listener: close drops completed connections that were never accepted" {
     defer wsaStop();
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
-    var l = try openOrSkip(try std.net.Address.parseIp4("127.0.0.1", 0), .{});
+    var l = try openOrSkip(try compat.Address.parseIp4("127.0.0.1", 0), .{});
     try l.register(&port, &l);
-    var clients: [2]std.net.Stream = undefined;
+    var clients: [2]compat.Stream = undefined;
     try connectClients(&clients, try l.localAddress());
     defer for (&clients) |*c| c.close();
     // Absorb every listener event of the batch, but accept none.
@@ -238,17 +239,17 @@ test {
     if (is_windows) _ = @import("listener_windows.zig");
 }
 
-/// A born handle as a socket for std.posix calls (a HANDLE on Windows).
-fn socketOf(h: born.Handle) std.posix.socket_t {
+/// A born handle as a socket for compatibility calls (a HANDLE on Windows).
+fn socketOf(h: born.Handle) compat.socket_t {
     return if (is_windows) @ptrCast(h) else h;
 }
 
 /// The next event for `l`, within five seconds.
 fn waitFor(port: *born.EvPort, l: *Listener) !born.Event {
     var events: [8]born.Event = undefined;
-    var timer = try std.time.Timer.start();
+    const start = try compat.monotonicNs();
     while (true) {
-        const elapsed = timer.read() / std.time.ns_per_ms;
+        const elapsed = (try compat.monotonicNs() - start) / std.time.ns_per_ms;
         if (elapsed >= 5000) return error.ListenerEventTimeout;
         const n = try port.wait(&events, @intCast(5000 - elapsed));
         for (events[0..n]) |ev| {
@@ -262,15 +263,15 @@ test "listener: pause with unmonitorRead, resume with register and drain" {
     defer wsaStop();
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
-    var l = try openOrSkip(try std.net.Address.parseIp4("127.0.0.1", 0), .{});
+    var l = try openOrSkip(try compat.Address.parseIp4("127.0.0.1", 0), .{});
     try l.register(&port, &l);
     port.unmonitorRead(l.handle());
 
     const n = 4;
-    var streams = [_]PlainNb{.{}} ** n;
+    var streams: [n]PlainNb = @splat(.{});
     var acceptor: Acceptor = .{ .listener = &l, .streams = &streams };
     defer acceptor.deinit();
-    var clients: [n]std.net.Stream = undefined;
+    var clients: [n]compat.Stream = undefined;
     try connectClients(&clients, try l.localAddress());
     defer for (&clients) |*c| c.close();
 
@@ -288,22 +289,22 @@ test "listener: an accepted stream reports its peer address" {
     defer wsaStop();
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
-    var l = try openOrSkip(try std.net.Address.parseIp4("127.0.0.1", 0), .{});
+    var l = try openOrSkip(try compat.Address.parseIp4("127.0.0.1", 0), .{});
     try l.register(&port, &l);
     var streams = [_]PlainNb{.{}};
     var acceptor: Acceptor = .{ .listener = &l, .streams = &streams };
     defer acceptor.deinit();
-    var client = try std.net.tcpConnectToAddress(try l.localAddress());
+    var client = try compat.tcpConnectToAddress(try l.localAddress());
     defer client.close();
 
     try pump(&port, &.{&acceptor}, 1, 5000);
-    var peer: std.posix.sockaddr.storage = undefined;
-    var peer_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
-    try std.posix.getpeername(socketOf(streams[0].handle()), @ptrCast(&peer), &peer_len);
-    var local: std.posix.sockaddr.storage = undefined;
-    var local_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
-    try std.posix.getsockname(client.handle, @ptrCast(&local), &local_len);
-    try std.testing.expect(std.net.Address.initPosix(@ptrCast(&peer)).eql(std.net.Address.initPosix(@ptrCast(&local))));
+    var peer: compat.sockaddr.storage = undefined;
+    var peer_len: compat.socklen_t = @sizeOf(compat.sockaddr.storage);
+    try compat.getpeername(socketOf(streams[0].handle()), @ptrCast(&peer), &peer_len);
+    var local: compat.sockaddr.storage = undefined;
+    var local_len: compat.socklen_t = @sizeOf(compat.sockaddr.storage);
+    try compat.getsockname(client.handle, @ptrCast(&local), &local_len);
+    try std.testing.expect(compat.Address.initPosix(@ptrCast(&peer)).eql(compat.Address.initPosix(@ptrCast(&local))));
     try closeListener(&port, &l);
 }
 
@@ -312,13 +313,13 @@ test "listener: descriptor exhaustion is ResourceExhausted and the drain resumes
     if (is_windows) return error.SkipZigTest;
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
-    var l = try openOrSkip(try std.net.Address.parseIp4("127.0.0.1", 0), .{});
+    var l = try openOrSkip(try compat.Address.parseIp4("127.0.0.1", 0), .{});
     try l.register(&port, &l);
     const n = 4;
-    var streams = [_]PlainNb{.{}} ** n;
+    var streams: [n]PlainNb = @splat(.{});
     var acceptor: Acceptor = .{ .listener = &l, .streams = &streams };
     defer acceptor.deinit();
-    var clients: [n]std.net.Stream = undefined;
+    var clients: [n]compat.Stream = undefined;
     try connectClients(&clients, try l.localAddress());
     defer for (&clients) |*c| c.close();
     const ev = try waitFor(&port, &l);
@@ -326,8 +327,8 @@ test "listener: descriptor exhaustion is ResourceExhausted and the drain resumes
     // Every descriptor below the lowest free one is open, so a limit equal
     // to it fails the next allocation with EMFILE.
     const saved = try std.posix.getrlimit(.NOFILE);
-    const probe = try std.posix.dup(l.handle());
-    std.posix.close(probe);
+    const probe = try compat.dup(l.handle());
+    compat.close(probe);
     var low = saved;
     low.cur = @intCast(probe);
     try std.posix.setrlimit(.NOFILE, low);

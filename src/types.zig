@@ -1,8 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const compat = @import("compat");
 
 /// Platform-native descriptor: a Windows `HANDLE` or a POSIX file descriptor.
-pub const Handle = if (builtin.os.tag == .windows) std.os.windows.HANDLE else std.posix.fd_t;
+pub const Handle = if (builtin.os.tag == .windows) compat.windows.HANDLE else compat.fd_t;
 
 /// Signals a port can watch (`EvPort.watchSignal`). Windows maps console
 /// control events onto `interrupt` and `terminate` only.
@@ -22,17 +23,17 @@ pub const Signal = enum {
     pub fn toPosix(self: Signal) u8 {
         const SIG = std.posix.SIG;
         return switch (self) {
-            .interrupt => SIG.INT,
-            .terminate => SIG.TERM,
-            .hangup => SIG.HUP,
-            .user1 => SIG.USR1,
-            .user2 => SIG.USR2,
+            .interrupt => compat.signalNumber(SIG.INT),
+            .terminate => compat.signalNumber(SIG.TERM),
+            .hangup => compat.signalNumber(SIG.HUP),
+            .user1 => compat.signalNumber(SIG.USR1),
+            .user2 => compat.signalNumber(SIG.USR2),
         };
     }
 
     /// Inverse of `toPosix`; null for any signal outside this enum.
     pub fn fromPosix(signo: usize) ?Signal {
-        inline for (std.meta.fields(Signal)) |field| {
+        inline for (comptime compat.enumFields(Signal)) |field| {
             const sig: Signal = @enumFromInt(field.value);
             if (signo == sig.toPosix()) return sig;
         }
@@ -129,7 +130,7 @@ pub const Event = struct {
     wake: bool = false,
     /// Which operation completed (the companion classifies by address). Null
     /// for relay posts without an operation and on POSIX.
-    overlapped: ?*std.os.windows.OVERLAPPED = null,
+    overlapped: ?*compat.windows.OVERLAPPED = null,
     /// Byte count supplied by an IOCP completion or post; zero on POSIX.
     bytes: usize = 0,
     /// A timer fired; `udata` is the timer's.

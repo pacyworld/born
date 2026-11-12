@@ -79,6 +79,12 @@ pub const Error = impl.Error;
 /// epoll (signalfd), a no-op on kqueue and Windows. Call it in `main`
 /// before spawning threads.
 pub const blockSignals = impl.blockSignals;
+/// Native Windows completion types exposed through the public API.
+pub const windows = struct {
+    /// Caller-owned overlapped operation storage. It must remain stable until
+    /// every completion has been absorbed.
+    pub const OVERLAPPED = @import("compat").windows.OVERLAPPED;
+};
 /// Portable plaintext stream and listener companions.
 pub const socket = @import("socket.zig");
 /// Child processes behind a descriptor, for `EvPort.watchProcess`.
@@ -108,4 +114,5 @@ test {
     _ = @import("hint_test.zig");
     _ = @import("process.zig");
     _ = @import("process_test.zig");
+    _ = @import("compat_test.zig");
 }

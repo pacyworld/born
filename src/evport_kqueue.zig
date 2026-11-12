@@ -36,6 +36,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const compat = @import("compat");
 const types = @import("types.zig");
 const timer_kqueue = @import("timer_kqueue.zig");
 const signal_kqueue = @import("signal_kqueue.zig");
@@ -44,30 +45,30 @@ const process_kqueue = @import("process_kqueue.zig");
 // Use the target's struct kevent: FreeBSD 12+ needs its extended 64-byte
 // layout (ext[4]), while NetBSD has wider filter/flags fields. A wrong
 // stride corrupts multi-entry changelists and event buffers.
-pub const Kevent = std.posix.Kevent;
-const EVFILT_READ = std.posix.system.EVFILT.READ;
-const EVFILT_WRITE = std.posix.system.EVFILT.WRITE;
-pub const EVFILT_TIMER = std.posix.system.EVFILT.TIMER;
-pub const EVFILT_SIGNAL = std.posix.system.EVFILT.SIGNAL;
+pub const Kevent = compat.Kevent;
+const EVFILT_READ = std.c.EVFILT.READ;
+const EVFILT_WRITE = std.c.EVFILT.WRITE;
+pub const EVFILT_TIMER = std.c.EVFILT.TIMER;
+pub const EVFILT_SIGNAL = std.c.EVFILT.SIGNAL;
 
 /// EVFILT_USER exists on FreeBSD and macOS only.
 const have_user = switch (builtin.os.tag) {
     .freebsd, .macos, .ios, .tvos, .watchos, .visionos => true,
     else => false,
 };
-const EVFILT_USER = if (have_user) std.posix.system.EVFILT.USER else 0;
+const EVFILT_USER = if (have_user) std.c.EVFILT.USER else 0;
 /// sys/event.h NOTE_TRIGGER, the same value on FreeBSD and macOS.
 const NOTE_TRIGGER: u32 = 0x01000000;
 /// The wake knote's ident (EVFILT_USER idents are free-form).
 const wake_ident: usize = 0;
 
-const EV_ADD = std.posix.system.EV.ADD;
-const EV_DELETE = std.posix.system.EV.DELETE;
-const EV_ONESHOT = std.posix.system.EV.ONESHOT;
-const EV_CLEAR = std.posix.system.EV.CLEAR;
+const EV_ADD = std.c.EV.ADD;
+const EV_DELETE = std.c.EV.DELETE;
+const EV_ONESHOT = std.c.EV.ONESHOT;
+const EV_CLEAR = std.c.EV.CLEAR;
 // Zig 0.15 omits EOF on FreeBSD/NetBSD and ERROR on NetBSD (sys/event.h).
-const EV_EOF = if (@hasDecl(std.posix.system.EV, "EOF")) std.posix.system.EV.EOF else 0x8000;
-const EV_ERROR = if (@hasDecl(std.posix.system.EV, "ERROR")) std.posix.system.EV.ERROR else 0x4000;
+const EV_EOF = if (@hasDecl(std.c.EV, "EOF")) std.c.EV.EOF else 0x8000;
+const EV_ERROR = if (@hasDecl(std.c.EV, "ERROR")) std.c.EV.ERROR else 0x4000;
 
 // NetBSD's 40-byte kevent ABI uses __kevent50 and size_t counts; Zig 0.15's
 // unversioned std.c.kevent declaration instead uses int counts.
@@ -82,8 +83,8 @@ const netbsd = struct {
     ) c_int;
 };
 
-// Target-native pipe flags; std.posix.pipe2 uses pipe + fcntl on macOS.
-const PIPE2_FLAGS: std.posix.O = .{ .NONBLOCK = true, .CLOEXEC = true };
+// Target-native pipe flags; compat.pipe2 uses pipe + fcntl on macOS.
+const PIPE2_FLAGS: compat.O = .{ .NONBLOCK = true, .CLOEXEC = true };
 
 pub const Handle = types.Handle;
 pub const Event = types.Event;
@@ -139,19 +140,19 @@ pub const EvPort = struct {
 
     /// Create a kqueue and its wake source, using `alloc` for port bookkeeping.
     pub fn init(alloc: std.mem.Allocator) InitError!EvPort {
-        const kq = std.posix.kqueue() catch return InitError.KqueueFailed;
-        errdefer _ = std.c.close(kq);
+        const kq = compat.kqueue() catch return InitError.KqueueFailed;
+        errdefer compat.close(kq);
 
         var fds = [2]c_int{ -1, -1 };
         if (have_user) {
             var kev = change(wake_ident, EVFILT_USER, EV_ADD | EV_CLEAR, &wake_sentinel);
             kevent1(kq, &kev) catch return InitError.KqueueFailed;
         } else {
-            fds = std.posix.pipe2(PIPE2_FLAGS) catch return InitError.PipeFailed;
+            fds = compat.pipe2(PIPE2_FLAGS) catch return InitError.PipeFailed;
         }
         errdefer if (!have_user) {
-            _ = std.c.close(fds[0]);
-            _ = std.c.close(fds[1]);
+            compat.close(fds[0]);
+            compat.close(fds[1]);
         };
 
         var self = EvPort{
@@ -189,9 +190,9 @@ pub const EvPort = struct {
         self.signals.deinit(self);
         self.timers.deinit(self);
         self.processes.deinit(self);
-        if (self.kq >= 0) _ = std.c.close(self.kq);
-        if (self.wake_r >= 0) _ = std.c.close(self.wake_r);
-        if (self.wake_w >= 0) _ = std.c.close(self.wake_w);
+        if (self.kq >= 0) compat.close(self.kq);
+        if (self.wake_r >= 0) compat.close(self.wake_r);
+        if (self.wake_w >= 0) compat.close(self.wake_w);
         self.kq = -1;
         self.wake_r = -1;
         self.wake_w = -1;
@@ -445,7 +446,7 @@ pub const EvPort = struct {
     fn drainWake(self: *EvPort) void {
         var tmp: [64]u8 = undefined;
         while (true) {
-            _ = std.posix.read(self.wake_r, &tmp) catch break;
+            _ = compat.read(self.wake_r, &tmp) catch break;
         }
     }
 };
@@ -454,7 +455,7 @@ pub const EvPort = struct {
 
 test "kqueue: target-native layout and change encoding" {
     const os = builtin.os.tag;
-    try std.testing.expect(Kevent == std.posix.Kevent);
+    try std.testing.expect(Kevent == compat.Kevent);
     const expected_size: usize = switch (os) {
         .freebsd => 64,
         .netbsd => 40,
@@ -470,8 +471,8 @@ test "kqueue: target-native layout and change encoding" {
     var tag: u8 = 1;
     const kev = EvPort.change(7, EVFILT_READ, EV_ADD | EV_CLEAR, &tag);
     try std.testing.expectEqual(@as(usize, 7), kev.ident);
-    try std.testing.expectEqual(std.posix.system.EVFILT.READ, kev.filter);
-    try std.testing.expectEqual(std.posix.system.EV.ADD | std.posix.system.EV.CLEAR, kev.flags);
+    try std.testing.expectEqual(std.c.EVFILT.READ, kev.filter);
+    try std.testing.expectEqual(std.c.EV.ADD | std.c.EV.CLEAR, kev.flags);
     try std.testing.expectEqual(@as(u32, 0), kev.fflags);
     try std.testing.expectEqual(@as(i64, 0), kev.data);
     try std.testing.expectEqual(@intFromPtr(&tag), kev.udata);
@@ -492,19 +493,19 @@ test "kqueue: wake source is a user knote or a nonblocking close-on-exec pipe" {
         return;
     }
     for ([_]Handle{ port.wake_r, port.wake_w }) |fd| {
-        const flags: std.posix.O = @bitCast(@as(u32, @truncate(try std.posix.fcntl(fd, std.posix.F.GETFL, 0))));
+        const flags: compat.O = @bitCast(@as(u32, @truncate(try compat.fcntl(fd, compat.F.GETFL, 0))));
         try std.testing.expect(flags.NONBLOCK);
-        const fd_flags = try std.posix.fcntl(fd, std.posix.F.GETFD, 0);
-        try std.testing.expect(fd_flags & std.posix.FD_CLOEXEC != 0);
+        const fd_flags = try compat.fcntl(fd, compat.F.GETFD, 0);
+        try std.testing.expect(fd_flags & compat.FD_CLOEXEC != 0);
     }
 }
 
 test "kqueue: registration error survives empty wait with errno payload" {
     var port = try EvPort.init(std.testing.allocator);
     defer port.deinit();
-    const closed = try std.posix.pipe2(PIPE2_FLAGS);
-    std.posix.close(closed[0]);
-    std.posix.close(closed[1]);
+    const closed = try compat.pipe2(PIPE2_FLAGS);
+    compat.close(closed[0]);
+    compat.close(closed[1]);
     const fd = closed[0];
     var tag: u8 = 1;
     port.monitorRead(fd, &tag);
@@ -515,7 +516,7 @@ test "kqueue: registration error survives empty wait with errno payload" {
     var events: [8]Event = undefined;
     try std.testing.expectEqual(@as(usize, 1), try port.wait(&events, 0));
     try std.testing.expect(events[0].err);
-    try std.testing.expectEqual(@as(usize, @intFromEnum(std.posix.E.BADF)), events[0].err_no);
+    try std.testing.expectEqual(@as(usize, @intFromEnum(compat.E.BADF)), events[0].err_no);
     try std.testing.expect(events[0].udata == @as(?*anyopaque, &tag));
     // A failed registration is not readiness.
     try std.testing.expect(!events[0].readable);
@@ -528,9 +529,9 @@ test "kqueue: allocation failure is reported by the next wait, once" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var port = try EvPort.init(failing.allocator());
     defer port.deinit();
-    const pipe_fds = try std.posix.pipe2(PIPE2_FLAGS);
-    defer std.posix.close(pipe_fds[0]);
-    defer std.posix.close(pipe_fds[1]);
+    const pipe_fds = try compat.pipe2(PIPE2_FLAGS);
+    defer compat.close(pipe_fds[0]);
+    defer compat.close(pipe_fds[1]);
     port.monitorRead(pipe_fds[0], null);
     try std.testing.expectEqual(@as(usize, 0), port.changes.items.len);
     var empty: [0]Event = .{};
@@ -546,18 +547,18 @@ test "kqueue: socket read readiness + EV_CLEAR edge semantics" {
     defer evp.deinit();
 
     var fds: [2]c_int = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
-    defer _ = std.c.close(fds[0]);
-    defer _ = std.c.close(fds[1]);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(compat.AF.UNIX, compat.SOCK.STREAM, 0, &fds));
+    defer compat.close(fds[0]);
+    defer compat.close(fds[1]);
     for (fds) |fd| {
-        _ = try std.posix.fcntl(fd, std.posix.F.SETFL, @as(u32, @bitCast(@as(std.posix.O, .{ .NONBLOCK = true }))));
-        _ = try std.posix.fcntl(fd, std.posix.F.SETFD, std.posix.FD_CLOEXEC);
+        _ = try compat.fcntl(fd, compat.F.SETFL, @as(u32, @bitCast(@as(compat.O, .{ .NONBLOCK = true }))));
+        _ = try compat.fcntl(fd, compat.F.SETFD, compat.FD_CLOEXEC);
     }
 
     var tag: u8 = 1;
     evp.monitorRead(fds[0], &tag);
 
-    _ = try std.posix.write(fds[1], "ab");
+    _ = try compat.write(fds[1], "ab");
 
     var events: [8]Event = undefined;
     const n = try evp.wait(&events, 1000);
@@ -570,7 +571,7 @@ test "kqueue: socket read readiness + EV_CLEAR edge semantics" {
     // until new data arrives.
     var buf: [4]u8 = undefined;
     while (true) {
-        _ = std.posix.read(fds[0], &buf) catch |err| switch (err) {
+        _ = compat.read(fds[0], &buf) catch |err| switch (err) {
             error.WouldBlock => break,
             else => return err,
         };
@@ -578,7 +579,7 @@ test "kqueue: socket read readiness + EV_CLEAR edge semantics" {
     try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
 
     // New write = new edge.
-    _ = try std.posix.write(fds[1], "c");
+    _ = try compat.write(fds[1], "c");
     try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));
     try std.testing.expect(events[0].readable);
 }
@@ -588,9 +589,9 @@ test "kqueue: one-shot write interest re-arms on demand" {
     var evp = try EvPort.init(alloc);
     defer evp.deinit();
 
-    const fds = try std.posix.pipe2(PIPE2_FLAGS);
-    defer _ = std.c.close(fds[0]);
-    defer _ = std.c.close(fds[1]);
+    const fds = try compat.pipe2(PIPE2_FLAGS);
+    defer compat.close(fds[0]);
+    defer compat.close(fds[1]);
 
     var tag: u8 = 2;
     evp.wantWrite(fds[1], &tag);
@@ -612,19 +613,19 @@ test "kqueue: peer close delivers eof" {
     var evp = try EvPort.init(alloc);
     defer evp.deinit();
 
-    const fds = try std.posix.pipe2(PIPE2_FLAGS);
-    defer _ = std.c.close(fds[0]);
+    const fds = try compat.pipe2(PIPE2_FLAGS);
+    defer compat.close(fds[0]);
 
     var tag: u8 = 3;
     evp.monitorRead(fds[0], &tag);
-    _ = std.c.close(fds[1]);
+    compat.close(fds[1]);
 
     var events: [8]Event = undefined;
     try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));
     try std.testing.expect(events[0].readable);
     try std.testing.expect(events[0].eof);
     var one: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 0), try std.posix.read(fds[0], &one));
+    try std.testing.expectEqual(@as(usize, 0), try compat.read(fds[0], &one));
 }
 
 test "kqueue: wake posts a single coalesced event" {
@@ -680,14 +681,14 @@ test "kqueue: a refused wake trigger is reported by the next wait" {
 test "kqueue: non-blocking connect completes via write filter" {
     const alloc = std.testing.allocator;
 
-    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+    const addr = try compat.Address.parseIp4("127.0.0.1", 0);
     var server = try addr.listen(.{});
     defer server.deinit();
 
-    const s = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC, 0);
-    defer std.posix.close(s);
+    const s = try compat.socket(compat.AF.INET, compat.SOCK.STREAM | compat.SOCK.NONBLOCK | compat.SOCK.CLOEXEC, 0);
+    defer compat.close(s);
 
-    std.posix.connect(s, &server.listen_address.any, server.listen_address.getOsSockLen()) catch |err| switch (err) {
+    compat.connect(s, &server.listen_address.any, server.listen_address.getOsSockLen()) catch |err| switch (err) {
         error.WouldBlock => {}, // EINPROGRESS: expected
         else => return err,
     };
@@ -702,7 +703,7 @@ test "kqueue: non-blocking connect completes via write filter" {
     try std.testing.expect(events[0].writable);
 
     var so_error: c_int = -1;
-    try std.posix.getsockopt(s, std.posix.SOL.SOCKET, std.posix.SO.ERROR, std.mem.asBytes(&so_error));
+    try compat.getsockopt(s, compat.SOL.SOCKET, compat.SO.ERROR, std.mem.asBytes(&so_error));
     try std.testing.expectEqual(@as(c_int, 0), so_error);
 }
 
@@ -728,14 +729,14 @@ test "kqueue: timer and signal kevents translate to their event fields" {
 
     // A rejected timer change is an error, never a firing.
     kev.flags = EV_ERROR;
-    kev.data = @intFromEnum(std.posix.E.NOENT);
+    kev.data = @intFromEnum(compat.E.NOENT);
     const failed = EvPort.translate(kev);
     try std.testing.expect(failed.err and !failed.timer);
     try std.testing.expectEqual(@as(u32, 0), failed.fired);
-    try std.testing.expectEqual(@as(usize, @intFromEnum(std.posix.E.NOENT)), failed.err_no);
+    try std.testing.expectEqual(@as(usize, @intFromEnum(compat.E.NOENT)), failed.err_no);
 
     // A signal outside Signal is reported, not dropped or mislabelled.
-    const unknown = EvPort.translate(EvPort.change(std.posix.SIG.WINCH, EVFILT_SIGNAL, EV_ADD, &tag));
+    const unknown = EvPort.translate(EvPort.change(compat.signalNumber(std.posix.SIG.WINCH), EVFILT_SIGNAL, EV_ADD, &tag));
     try std.testing.expect(unknown.err and unknown.signal == null);
 
     // Descriptor events leave the timer and signal fields inert.
@@ -765,11 +766,11 @@ test "kqueue: process descriptor kevents translate to the exit fields" {
     // An exit is not end-of-file on any backend, even with EV_EOF fed.
     try std.testing.expect(!coded.eof);
     try std.testing.expectEqual(types.ProcessExit{ .code = 7 }, coded.exit.?);
-    kev.data = std.posix.SIG.KILL;
-    try std.testing.expectEqual(types.ProcessExit{ .signal = std.posix.SIG.KILL }, EvPort.translate(kev).exit.?);
+    kev.data = compat.signalNumber(std.posix.SIG.KILL);
+    try std.testing.expectEqual(types.ProcessExit{ .signal = compat.signalNumber(std.posix.SIG.KILL) }, EvPort.translate(kev).exit.?);
     // A refused watch is an error, never an exit.
     kev.flags = EV_ERROR;
-    kev.data = @intFromEnum(std.posix.E.BADF);
+    kev.data = @intFromEnum(compat.E.BADF);
     const refused = EvPort.translate(kev);
     try std.testing.expect(refused.err and !refused.exited and refused.exit == null);
     // Other filters leave the exit fields inert.
@@ -814,10 +815,14 @@ test "kqueue: stageRaw signal is delivered as Event.signal" {
     const signo = Signal.user2.toPosix();
     // EVFILT_SIGNAL records deliveries under any disposition; ignore the
     // signal so the default action cannot end the test process.
-    var prior: std.posix.Sigaction = undefined;
-    const ignore: std.posix.Sigaction = .{ .handler = .{ .handler = std.posix.SIG.IGN }, .mask = std.posix.sigemptyset(), .flags = 0 };
-    std.posix.sigaction(signo, &ignore, &prior);
-    defer std.posix.sigaction(signo, &prior, null);
+    var prior: compat.Sigaction = undefined;
+    const ignore: compat.Sigaction = .{
+        .handler = .{ .handler = std.posix.SIG.IGN },
+        .mask = compat.sigemptyset(),
+        .flags = 0,
+    };
+    compat.sigaction(signo, &ignore, &prior);
+    defer compat.sigaction(signo, &prior, null);
 
     var port = try EvPort.init(std.testing.allocator);
     defer port.deinit();
@@ -826,7 +831,7 @@ test "kqueue: stageRaw signal is delivered as Event.signal" {
     var events: [4]Event = undefined;
     try std.testing.expectEqual(@as(usize, 0), try port.wait(&events, 0));
     // Process-directed: XNU's EVFILT_SIGNAL does not see a thread-directed raise(3).
-    try std.posix.kill(std.c.getpid(), signo);
+    try compat.kill(std.c.getpid(), signo);
     try std.testing.expectEqual(@as(usize, 1), try port.wait(&events, 1000));
     try std.testing.expectEqual(@as(?Signal, .user2), events[0].signal);
     try std.testing.expect(events[0].fired >= 1);
@@ -840,9 +845,9 @@ test "kqueue: purgeFd leaves a staged timer whose ident equals the fd" {
     defer port.deinit();
     var events: [4]Event = undefined;
     _ = try port.wait(&events, 0);
-    const pipe_fds = try std.posix.pipe2(PIPE2_FLAGS);
-    defer std.posix.close(pipe_fds[0]);
-    defer std.posix.close(pipe_fds[1]);
+    const pipe_fds = try compat.pipe2(PIPE2_FLAGS);
+    defer compat.close(pipe_fds[0]);
+    defer compat.close(pipe_fds[1]);
     const fd = pipe_fds[0];
     var tag: u8 = 1;
     port.monitorRead(fd, &tag);

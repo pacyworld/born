@@ -37,6 +37,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const compat = @import("compat");
 const types = @import("types.zig");
 const timer_epoll = @import("timer_epoll.zig");
 const signal_epoll = @import("signal_epoll.zig");
@@ -75,7 +76,7 @@ pub const InternalKind = enum {
 
 /// Stable addresses used as epoll data for internal sources, one per kind.
 /// They cannot collide with a caller's udata, which never points here.
-var internal_tags = [_]u8{0} ** std.meta.fields(InternalKind).len;
+var internal_tags: [compat.enumFields(InternalKind).len]u8 = @splat(0);
 
 fn internalKind(data: usize) ?InternalKind {
     const base = @intFromPtr(&internal_tags);
@@ -121,7 +122,7 @@ pub const EvPort = struct {
     pseudo_count: usize = 0,
     /// Internal source fd per kind, -1 when absent. The fd is owned by the
     /// kind's module, which closes it after removeInternal.
-    internal: [std.meta.fields(InternalKind).len]i32 = .{-1} ** std.meta.fields(InternalKind).len,
+    internal: [compat.enumFields(InternalKind).len]i32 = @splat(-1),
     /// Timer bookkeeping, owned by timer_epoll.zig.
     timers: timer_epoll.State = .{},
     /// Signal-watch bookkeeping, owned by signal_epoll.zig.
@@ -135,14 +136,14 @@ pub const EvPort = struct {
         // itself. std.posix.errno() would read libc's thread-local errno in
         // this libc-linked binary and report SUCCESS for failed syscalls.
         const ep_rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
-        if (linux.E.init(ep_rc) != .SUCCESS) return InitError.InitFailed;
+        if (compat.linuxErrno(ep_rc) != .SUCCESS) return InitError.InitFailed;
         const ep: i32 = @intCast(ep_rc);
-        errdefer _ = std.c.close(ep);
+        errdefer compat.close(ep);
 
         const wfd_rc = linux.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
-        if (linux.E.init(wfd_rc) != .SUCCESS) return InitError.InitFailed;
+        if (compat.linuxErrno(wfd_rc) != .SUCCESS) return InitError.InitFailed;
         const wfd: i32 = @intCast(wfd_rc);
-        errdefer _ = std.c.close(wfd);
+        errdefer compat.close(wfd);
 
         var self = EvPort{
             .ep = ep,
@@ -162,8 +163,8 @@ pub const EvPort = struct {
         self.signals.deinit(self);
         self.timers.deinit(self);
         self.processes.deinit(self);
-        if (self.ep >= 0) _ = std.c.close(self.ep);
-        if (self.wake_fd >= 0) _ = std.c.close(self.wake_fd);
+        if (self.ep >= 0) compat.close(self.ep);
+        if (self.wake_fd >= 0) compat.close(self.wake_fd);
         self.ep = -1;
         self.wake_fd = -1;
         self.fds.deinit(self.alloc);
@@ -217,7 +218,7 @@ pub const EvPort = struct {
     /// Wake a wait() blocked in another thread.
     pub fn wake(self: *EvPort) void {
         const one: u64 = 1;
-        _ = std.posix.write(self.wake_fd, std.mem.asBytes(&one)) catch {};
+        _ = compat.write(self.wake_fd, std.mem.asBytes(&one)) catch {};
     }
 
     /// Arm a timer. `id` is caller-chosen and unique per port; re-adding a
@@ -266,7 +267,7 @@ pub const EvPort = struct {
             .events = linux.EPOLL.IN,
             .data = .{ .ptr = @intFromPtr(&internal_tags[@intFromEnum(kind)]) },
         };
-        if (linux.E.init(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_ADD, fd, &ev)) != .SUCCESS)
+        if (compat.linuxErrno(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_ADD, fd, &ev)) != .SUCCESS)
             return error.SystemResources;
         slot.* = fd;
     }
@@ -323,7 +324,7 @@ pub const EvPort = struct {
         if (!gop.found_existing) {
             gop.value_ptr.* = st;
             var ev = makeEvent(st);
-            switch (linux.E.init(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_ADD, fd, &ev))) {
+            switch (compat.linuxErrno(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_ADD, fd, &ev))) {
                 .SUCCESS => {},
                 // "I cannot poll this": the pseudo registration above.
                 .PERM => {
@@ -341,7 +342,7 @@ pub const EvPort = struct {
         }
         if (!gop.value_ptr.pseudo) {
             var ev = makeEvent(st);
-            if (linux.E.init(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_MOD, fd, &ev)) != .SUCCESS) {
+            if (compat.linuxErrno(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_MOD, fd, &ev)) != .SUCCESS) {
                 _ = self.fds.remove(fd);
                 self.pending_error = WaitError.RegisterFailed;
                 return;
@@ -387,7 +388,7 @@ pub const EvPort = struct {
         const timeout: i32 = if (self.pseudo_count == 0) timeout_ms orelse -1 else 0;
 
         const n_rc = linux.epoll_wait(self.ep, &ebuf, @intCast(cap), timeout);
-        const n_err = linux.E.init(n_rc);
+        const n_err = compat.linuxErrno(n_rc);
         if (n_err != .SUCCESS) {
             if (n_err == .INTR) return 0;
             return WaitError.WaitFailed;
@@ -445,7 +446,7 @@ pub const EvPort = struct {
     fn drainWake(self: *EvPort) void {
         var tmp: [8]u8 = undefined;
         while (true) {
-            _ = std.posix.read(self.wake_fd, &tmp) catch break;
+            _ = compat.read(self.wake_fd, &tmp) catch break;
         }
     }
 };
@@ -458,13 +459,13 @@ test "epoll: socket read readiness + ET edge semantics" {
     defer evp.deinit();
 
     var fds: [2]c_int = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC, 0, &fds));
-    defer _ = std.c.close(fds[0]);
-    defer _ = std.c.close(fds[1]);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(compat.AF.UNIX, compat.SOCK.STREAM | compat.SOCK.NONBLOCK | compat.SOCK.CLOEXEC, 0, &fds));
+    defer compat.close(fds[0]);
+    defer compat.close(fds[1]);
 
     var tag: u8 = 1;
     evp.monitorRead(fds[0], &tag);
-    _ = try std.posix.write(fds[1], "ab");
+    _ = try compat.write(fds[1], "ab");
 
     var events: [8]Event = undefined;
     const n = try evp.wait(&events, 1000);
@@ -475,14 +476,14 @@ test "epoll: socket read readiness + ET edge semantics" {
     // ET: full drain -> silence until a new edge.
     var buf: [4]u8 = undefined;
     while (true) {
-        _ = std.posix.read(fds[0], &buf) catch |err| switch (err) {
+        _ = compat.read(fds[0], &buf) catch |err| switch (err) {
             error.WouldBlock => break,
             else => return err,
         };
     }
     try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
 
-    _ = try std.posix.write(fds[1], "c");
+    _ = try compat.write(fds[1], "c");
     try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));
     try std.testing.expect(events[0].readable);
 }
@@ -493,9 +494,9 @@ test "epoll: write interest arms and disarms" {
     defer evp.deinit();
 
     var fds: [2]c_int = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC, 0, &fds));
-    defer _ = std.c.close(fds[0]);
-    defer _ = std.c.close(fds[1]);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(compat.AF.UNIX, compat.SOCK.STREAM | compat.SOCK.NONBLOCK | compat.SOCK.CLOEXEC, 0, &fds));
+    defer compat.close(fds[0]);
+    defer compat.close(fds[1]);
 
     var tag: u8 = 2;
     evp.wantWrite(fds[1], &tag);
@@ -517,19 +518,19 @@ test "epoll: peer close delivers eof" {
     defer evp.deinit();
 
     var fds: [2]c_int = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC, 0, &fds));
-    defer _ = std.c.close(fds[0]);
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(compat.AF.UNIX, compat.SOCK.STREAM | compat.SOCK.NONBLOCK | compat.SOCK.CLOEXEC, 0, &fds));
+    defer compat.close(fds[0]);
 
     var tag: u8 = 3;
     evp.monitorRead(fds[0], &tag);
-    _ = std.c.close(fds[1]);
+    compat.close(fds[1]);
 
     var events: [8]Event = undefined;
     try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));
     try std.testing.expect(events[0].readable);
     try std.testing.expect(events[0].eof);
     var one: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 0), try std.posix.read(fds[0], &one));
+    try std.testing.expectEqual(@as(usize, 0), try compat.read(fds[0], &one));
 }
 
 test "epoll: wake posts a single coalesced event" {
@@ -553,20 +554,31 @@ test "epoll: regular file is an always-ready pseudo registration" {
     var evp = try EvPort.init(alloc);
     defer evp.deinit();
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const file = try tmp.dir.createFile("plain.txt", .{});
-    defer file.close();
-    try file.writeAll("x");
-    try file.seekTo(0);
+    var path_buffer: [160:0]u8 = undefined;
+    const stamp = try compat.monotonicNs();
+    const printed = try std.fmt.bufPrint(
+        &path_buffer,
+        "born-epoll-pseudo-{d}-{d}",
+        .{ std.c.getpid(), stamp },
+    );
+    path_buffer[printed.len] = 0;
+    const path = path_buffer[0..printed.len :0];
+    const file = try compat.open(path, .{
+        .ACCMODE = .RDWR,
+        .CREAT = true,
+        .EXCL = true,
+        .CLOEXEC = true,
+    }, 0o600);
+    defer compat.close(file);
+    defer compat.unlink(path) catch {};
 
     // epoll_ctl would refuse this fd with EPERM; born keeps it out of the
     // kernel set and answers readiness itself, matching kqueue.
     var tag: u8 = 5;
-    evp.monitorRead(file.handle, &tag);
-    try std.testing.expect(evp.fds.get(file.handle).?.pseudo);
+    evp.monitorRead(file, &tag);
+    try std.testing.expect(evp.fds.get(file).?.pseudo);
     try std.testing.expectEqual(@as(usize, 1), evp.pseudo_count);
-    evp.wantWrite(file.handle, &tag);
+    evp.wantWrite(file, &tag);
 
     var events: [8]Event = undefined;
     const n = try evp.wait(&events, 1000);
@@ -581,10 +593,10 @@ test "epoll: regular file is an always-ready pseudo registration" {
 
     // Interest changes touch the map only; birth and death leave no kernel
     // residue behind.
-    evp.unmonitorRead(file.handle);
+    evp.unmonitorRead(file);
     try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 0));
     try std.testing.expect(events[0].writable and !events[0].readable);
-    evp.purgeFd(file.handle);
+    evp.purgeFd(file);
     try std.testing.expectEqual(@as(usize, 0), evp.pseudo_count);
     try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
 }
@@ -600,16 +612,16 @@ test "epoll: unpollable descriptors other than regular files are pseudo too" {
     for (cases) |path| {
         var evp = try EvPort.init(alloc);
         defer evp.deinit();
-        const f = try std.fs.openFileAbsolute(path, .{});
-        defer f.close();
+        const f = try compat.open(path, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+        defer compat.close(f);
 
         var tag: u8 = 7;
-        evp.monitorRead(f.handle, &tag);
+        evp.monitorRead(f, &tag);
 
         var events: [4]Event = undefined;
         // No pending_error: the descriptor was accepted, not rejected.
         try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 0));
-        try std.testing.expect(evp.fds.get(f.handle).?.pseudo);
+        try std.testing.expect(evp.fds.get(f).?.pseudo);
         try std.testing.expectEqual(@as(usize, 1), evp.pseudo_count);
         try std.testing.expect(events[0].readable);
         try std.testing.expect(!events[0].err);
@@ -621,8 +633,8 @@ test "epoll: unpollable descriptors other than regular files are pseudo too" {
     // epoll_ctl rejection as unpollable.
     var evp = try EvPort.init(alloc);
     defer evp.deinit();
-    const dfd = try std.posix.open(".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
-    defer std.posix.close(dfd);
+    const dfd = try compat.open(".", .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+    defer compat.close(dfd);
 
     var tag: u8 = 8;
     evp.monitorRead(dfd, &tag);
@@ -674,14 +686,14 @@ test "epoll: allocation failure is reported by the next wait, once" {
 test "epoll: non-blocking connect completes via write interest" {
     const alloc = std.testing.allocator;
 
-    const addr = try std.net.Address.parseIp4("127.0.0.1", 0);
+    const addr = try compat.Address.parseIp4("127.0.0.1", 0);
     var server = try addr.listen(.{});
     defer server.deinit();
 
-    const s = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.NONBLOCK | std.posix.SOCK.CLOEXEC, 0);
-    defer std.posix.close(s);
+    const s = try compat.socket(compat.AF.INET, compat.SOCK.STREAM | compat.SOCK.NONBLOCK | compat.SOCK.CLOEXEC, 0);
+    defer compat.close(s);
 
-    std.posix.connect(s, &server.listen_address.any, server.listen_address.getOsSockLen()) catch |err| switch (err) {
+    compat.connect(s, &server.listen_address.any, server.listen_address.getOsSockLen()) catch |err| switch (err) {
         error.WouldBlock => {}, // EINPROGRESS: expected
         else => return err,
     };
@@ -696,7 +708,7 @@ test "epoll: non-blocking connect completes via write interest" {
     try std.testing.expect(events[0].writable);
 
     var so_error: c_int = -1;
-    try std.posix.getsockopt(s, std.posix.SOL.SOCKET, std.posix.SO.ERROR, std.mem.asBytes(&so_error));
+    try compat.getsockopt(s, compat.SOL.SOCKET, compat.SO.ERROR, std.mem.asBytes(&so_error));
     try std.testing.expectEqual(@as(c_int, 0), so_error);
 }
 
@@ -705,7 +717,7 @@ test "epoll: internal source tags never match caller data" {
     try std.testing.expect(internalKind(@intFromPtr(&tag)) == null);
     try std.testing.expect(internalKind(@intFromPtr(&wake_sentinel)) == null);
     try std.testing.expect(internalKind(0) == null);
-    inline for (std.meta.fields(InternalKind)) |field| {
+    inline for (comptime compat.enumFields(InternalKind)) |field| {
         const kind: InternalKind = @enumFromInt(field.value);
         try std.testing.expectEqual(@as(?InternalKind, kind), internalKind(@intFromPtr(&internal_tags[field.value])));
     }
@@ -722,9 +734,9 @@ test "epoll: internal source table is one fd per kind" {
     var evp = try EvPort.init(std.testing.allocator);
     defer evp.deinit();
     const rc = linux.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
-    try std.testing.expectEqual(linux.E.SUCCESS, linux.E.init(rc));
+    try std.testing.expectEqual(linux.E.SUCCESS, compat.linuxErrno(rc));
     const fd: i32 = @intCast(rc);
-    defer _ = std.c.close(fd);
+    defer compat.close(fd);
 
     try std.testing.expect(evp.internalFd(.timer) == null);
     try evp.addInternal(.timer, fd);

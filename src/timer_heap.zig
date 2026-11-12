@@ -45,7 +45,7 @@
 //!     one entry per id, so positions always fit in u32.
 
 const std = @import("std");
-const builtin = @import("builtin");
+const compat = @import("compat");
 const Allocator = std.mem.Allocator;
 
 /// Allocation failures from heap growth.
@@ -251,13 +251,7 @@ pub const TimerHeap = struct {
 /// CLOCK_MONOTONIC on POSIX, QueryPerformanceCounter on Windows. Never
 /// wall time. error.Unsupported if the kernel refuses the clock.
 pub fn nowNs() error{Unsupported}!u64 {
-    if (builtin.os.tag == .windows) {
-        const ticks = std.os.windows.QueryPerformanceCounter();
-        const freq = std.os.windows.QueryPerformanceFrequency();
-        return (ticks / freq) * std.time.ns_per_s + (ticks % freq) * std.time.ns_per_s / freq;
-    }
-    const ts = std.posix.clock_gettime(std.posix.CLOCK.MONOTONIC) catch return error.Unsupported;
-    return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+    return compat.monotonicNs();
 }
 
 // ---------------------------------------------------------------- tests
@@ -288,7 +282,7 @@ test "timer_heap: 10 000 random deadlines expire in order" {
 
     const n = 10_000;
     var deadline: [n]u64 = undefined;
-    var seen = [_]bool{false} ** n;
+    var seen: [n]bool = @splat(false);
     for (0..n) |i| {
         deadline[i] = rand.uintLessThan(u64, 1_000_000_000);
         try h.add(gpa, 0, @intCast(i), tag(i), deadline[i], 0);
@@ -333,7 +327,7 @@ test "timer_heap: random add/cancel/replace keeps heap and index consistent" {
     const rand = prng.random();
 
     const ids = 512;
-    var live = [_]?u64{null} ** ids;
+    var live: [ids]?u64 = @splat(null);
     for (0..20_000) |_| {
         const id = rand.uintLessThan(u32, ids);
         if (rand.boolean()) {

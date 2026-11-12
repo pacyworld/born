@@ -1,5 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const compat = @import("compat");
+const born = @import("root.zig");
 const backend = switch (builtin.os.tag) {
     .freebsd, .macos, .netbsd, .openbsd => @import("evport_kqueue.zig"),
     .linux => @import("evport_epoll.zig"),
@@ -10,13 +12,13 @@ const backend = switch (builtin.os.tag) {
 test "reactor has exact non-generic handle and event API" {
     const Port = backend.EvPort;
     const Handle = backend.Handle;
-    const NativeHandle = if (builtin.os.tag == .windows) std.os.windows.HANDLE else std.posix.fd_t;
+    const NativeHandle = if (builtin.os.tag == .windows) compat.windows.HANDLE else compat.fd_t;
     try std.testing.expect(Handle == NativeHandle);
     try std.testing.expect(Handle == @import("types.zig").Handle);
     try std.testing.expect(backend.Event == @import("types.zig").Event);
     if (builtin.os.tag == .windows) {
         try std.testing.expect(@TypeOf(Port.associate) == fn (*Port, Handle, ?*anyopaque) backend.AssociateError!void);
-        try std.testing.expect(@TypeOf(Port.post) == fn (*Port, *anyopaque, ?*std.os.windows.OVERLAPPED, usize) void);
+        try std.testing.expect(@TypeOf(Port.post) == fn (*Port, *anyopaque, ?*born.windows.OVERLAPPED, usize) void);
         try std.testing.expect(@TypeOf(Port.wakeKey) == fn () *anyopaque);
     }
     try std.testing.expect(@TypeOf(Port.init) == fn (std.mem.Allocator) backend.InitError!Port);
@@ -40,8 +42,8 @@ test "reactor has exact non-generic handle and event API" {
     // wait() reports only loop failures; primitive refusals stay with the
     // call that caused them.
     inline for (.{ "Unsupported", "InvalidArgument", "SignalInUse", "SignalNotBlocked", "BadHandle" }) |name| {
-        inline for (@typeInfo(backend.WaitError).error_set.?) |e| {
-            try std.testing.expect(!std.mem.eql(u8, e.name, name));
+        for (compat.errorSetNames(backend.WaitError)) |error_name| {
+            try std.testing.expect(!std.mem.eql(u8, error_name, name));
         }
     }
     try std.testing.expect(backend.Error == (backend.InitError || backend.WaitError || types.TimerError || types.SignalError || types.ProcessError ||
@@ -49,7 +51,7 @@ test "reactor has exact non-generic handle and event API" {
     const event = backend.Event{};
     try std.testing.expect(@TypeOf(event.udata) == ?*anyopaque);
     try std.testing.expect(@TypeOf(event.err_no) == usize);
-    try std.testing.expect(@TypeOf(event.overlapped) == ?*std.os.windows.OVERLAPPED);
+    try std.testing.expect(@TypeOf(event.overlapped) == ?*born.windows.OVERLAPPED);
     try std.testing.expect(@TypeOf(event.bytes) == usize);
     inline for (.{ "readable", "writable", "eof", "err", "wake", "timer", "exited" }) |name| {
         try std.testing.expect(@TypeOf(@field(event, name)) == bool);
@@ -67,16 +69,36 @@ test "reactor has exact non-generic handle and event API" {
     try std.testing.expectEqual(@as(usize, 0), event.bytes);
 }
 
+test "public overlapped type executes post and absorbCompletion" {
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    var overlapped: born.windows.OVERLAPPED = std.mem.zeroes(born.windows.OVERLAPPED);
+    var stream: born.socket.PlainNb = .{};
+    try std.testing.expectEqual(
+        born.socket.CompletionKind.unknown,
+        stream.absorbCompletion(&overlapped, 0, null),
+    );
+    if (builtin.os.tag != .windows) return;
+
+    var tag: u8 = 1;
+    port.post(&tag, &overlapped, 7);
+    var events: [4]born.Event = undefined;
+    const n = try port.wait(&events, 1000);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expect(events[0].overlapped == &overlapped);
+    try std.testing.expectEqual(@as(usize, 7), events[0].bytes);
+}
+
 test "reactor interest methods execute with native handles" {
     var port = try backend.EvPort.init(std.testing.allocator);
     defer port.deinit();
     const handles = if (builtin.os.tag == .windows)
-        [_]backend.Handle{ std.os.windows.INVALID_HANDLE_VALUE, std.os.windows.INVALID_HANDLE_VALUE }
+        [_]backend.Handle{ compat.windows.INVALID_HANDLE_VALUE, compat.windows.INVALID_HANDLE_VALUE }
     else
-        try std.posix.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+        try compat.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
     defer if (builtin.os.tag != .windows) {
-        std.posix.close(handles[0]);
-        std.posix.close(handles[1]);
+        compat.close(handles[0]);
+        compat.close(handles[1]);
     };
     var tag: u8 = 1;
     port.monitorRead(handles[0], &tag);
@@ -99,13 +121,19 @@ test "regular file registration behaves identically on every POSIX backend" {
     defer port.deinit();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const file = try tmp.dir.createFile("registration-target", .{});
-    defer file.close();
-    try file.writeAll("x");
-    try file.seekTo(0);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(
+        &path_buf,
+        ".zig-cache" ++ std.fs.path.sep_str ++ "tmp" ++ std.fs.path.sep_str ++ "{s}" ++ std.fs.path.sep_str ++ "registration-target",
+        .{tmp.sub_path},
+    );
+    const fd = try compat.open(path, .{ .ACCMODE = .RDWR, .CREAT = true, .EXCL = true, .CLOEXEC = true }, 0o600);
+    defer compat.close(fd);
+    try std.testing.expectEqual(@as(usize, 1), try compat.write(fd, "x"));
+    try std.testing.expect(std.c.lseek(fd, 0, 0) == 0);
     var tag: u8 = 1;
-    port.monitorRead(file.handle, &tag);
-    port.wantWrite(file.handle, &tag);
+    port.monitorRead(fd, &tag);
+    port.wantWrite(fd, &tag);
     // I/O on a regular file never blocks, so every readiness backend must
     // report it ready: kqueue natively, epoll via its pseudo registrations.
     // kqueue splits read/write filters into separate kevents while epoll
@@ -126,7 +154,7 @@ test "regular file registration behaves identically on every POSIX backend" {
         }
     }
     try std.testing.expect(readable and writable);
-    port.purgeFd(file.handle);
+    port.purgeFd(fd);
 }
 
 test "empty wait preserves queued wake" {
@@ -147,10 +175,10 @@ test "empty wait preserves readiness registrations and events" {
     if (builtin.os.tag == .windows) return error.SkipZigTest;
     var port = try backend.EvPort.init(std.testing.allocator);
     defer port.deinit();
-    var fds: [2]std.posix.fd_t = undefined;
-    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0, &fds));
-    defer std.posix.close(fds[0]);
-    defer std.posix.close(fds[1]);
+    var fds: [2]compat.fd_t = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(compat.AF.UNIX, compat.SOCK.STREAM, 0, &fds));
+    defer compat.close(fds[0]);
+    defer compat.close(fds[1]);
     var tag: u8 = 1;
     port.monitorRead(fds[0], &tag);
     port.wantWrite(fds[0], &tag);
@@ -161,7 +189,7 @@ test "empty wait preserves readiness registrations and events" {
         try std.testing.expectEqual(staged, port.changes.items.len);
         try std.testing.expect(port.armed_write.contains(fds[0]));
     }
-    try std.testing.expectEqual(@as(usize, 1), try std.posix.write(fds[1], "x"));
+    try std.testing.expectEqual(@as(usize, 1), try compat.write(fds[1], "x"));
     try std.testing.expectEqual(@as(usize, 0), try port.wait(&empty, 0));
     var events: [8]backend.Event = undefined;
     const n = try port.wait(&events, 1000);
@@ -180,9 +208,9 @@ test "empty wait preserves readiness registrations and events" {
     try std.testing.expect(writable);
     port.cancelWrite(fds[0]);
     var byte: [1]u8 = undefined;
-    try std.testing.expectEqual(@as(usize, 1), try std.posix.read(fds[0], &byte));
+    try std.testing.expectEqual(@as(usize, 1), try compat.read(fds[0], &byte));
     try std.testing.expectEqual(@as(usize, 0), try port.wait(&events, 0));
-    try std.testing.expectEqual(@as(usize, 1), try std.posix.write(fds[1], "y"));
+    try std.testing.expectEqual(@as(usize, 1), try compat.write(fds[1], "y"));
     try std.testing.expectEqual(@as(usize, 0), try port.wait(&empty, null));
     try std.testing.expectEqual(@as(usize, 1), try port.wait(&events, 1000));
     try std.testing.expect(events[0].readable);

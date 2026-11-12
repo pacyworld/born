@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const linux = std.os.linux;
+const compat = @import("compat");
 const timer_heap = @import("timer_heap.zig");
 const ep = @import("evport_epoll.zig");
 const EvPort = ep.EvPort;
@@ -46,7 +47,7 @@ pub const State = struct {
     pub fn deinit(self: *State, port: *EvPort) void {
         if (self.fd != -1) {
             port.removeInternal(.timer);
-            _ = std.c.close(self.fd);
+            compat.close(self.fd);
             self.fd = -1;
         }
         self.heap.deinit(port.alloc);
@@ -58,10 +59,10 @@ pub const State = struct {
     fn ensureFd(self: *State, port: *EvPort) TimerError!void {
         if (self.fd != -1) return;
         const rc = linux.timerfd_create(.MONOTONIC, .{ .NONBLOCK = true, .CLOEXEC = true });
-        if (linux.E.init(rc) != .SUCCESS) return TimerError.SystemResources;
+        if (compat.linuxErrno(rc) != .SUCCESS) return TimerError.SystemResources;
         const fd: i32 = @intCast(rc);
         port.addInternal(.timer, fd) catch |err| {
-            _ = std.c.close(fd);
+            compat.close(fd);
             return switch (err) {
                 // The timer slot belongs to this module and is empty
                 // whenever self.fd is -1.
@@ -85,7 +86,7 @@ pub const State = struct {
             .it_interval = .{ .sec = 0, .nsec = 0 },
             .it_value = if (want) |ns| timespecOf(@max(ns, 1)) else .{ .sec = 0, .nsec = 0 },
         };
-        if (linux.E.init(linux.timerfd_settime(self.fd, .{ .ABSTIME = true }, &spec, null)) != .SUCCESS) {
+        if (compat.linuxErrno(linux.timerfd_settime(self.fd, .{ .ABSTIME = true }, &spec, null)) != .SUCCESS) {
             self.armed = null;
             stashFailure(port);
             return;
@@ -125,7 +126,7 @@ pub fn harvest(port: *EvPort, out: []Event) usize {
     var ticks: u64 = 0;
     while (true) {
         const rc = linux.read(st.fd, std.mem.asBytes(&ticks), @sizeOf(u64));
-        switch (linux.E.init(rc)) {
+        switch (compat.linuxErrno(rc)) {
             // The armed expiration is consumed: the timerfd is disarmed.
             .SUCCESS => {
                 if (rc != @sizeOf(u64)) stashFailure(port);
@@ -180,7 +181,7 @@ const testing = std.testing;
 /// The timerfd's absolute expiry in ns, or null while disarmed.
 fn armedAt(fd: i32) !?u64 {
     var cur: linux.itimerspec = undefined;
-    try testing.expectEqual(linux.E.SUCCESS, linux.E.init(linux.timerfd_gettime(fd, &cur)));
+    try testing.expectEqual(linux.E.SUCCESS, compat.linuxErrno(linux.timerfd_gettime(fd, &cur)));
     if (cur.it_value.sec == 0 and cur.it_value.nsec == 0) return null;
     // timerfd_gettime reports the time remaining, not the absolute value.
     const now = try timer_heap.nowNs();
@@ -239,7 +240,7 @@ test "timer_epoll: a full buffer leaves the timerfd ready for the rest" {
 
     // One slot per wait(): every timer arrives, one per call, without
     // blocking, because the timerfd is re-armed in the past each time.
-    var seen = [_]bool{false} ** tags.len;
+    var seen: [tags.len]bool = @splat(false);
     var events: [1]Event = undefined;
     for (0..tags.len) |_| {
         try testing.expectEqual(@as(usize, 1), try port.wait(&events, 1000));
@@ -270,5 +271,5 @@ test "timer_epoll: deinit closes the timerfd" {
     try port.addTimer(1, &a, 1000, .repeat);
     const fd = port.timers.fd;
     port.deinit();
-    try testing.expectEqual(linux.E.BADF, linux.E.init(linux.fcntl(fd, linux.F.GETFD, 0)));
+    try testing.expectEqual(linux.E.BADF, compat.linuxErrno(linux.fcntl(fd, linux.F.GETFD, 0)));
 }

@@ -17,7 +17,7 @@ const types = @import("types.zig");
 const io = @import("io_types.zig");
 const unix_posix = @import("unix_posix.zig");
 const PlainNb = @import("socket_posix.zig").PlainNb;
-const posix = std.posix;
+const compat = @import("compat");
 
 /// Darwin has no accept4; its flags are applied with fcntl after accept.
 const have_accept4 = !builtin.os.tag.isDarwin();
@@ -31,8 +31,8 @@ const IPV6_V6ONLY: u32 = switch (builtin.os.tag) {
 /// The socket option behind `.balanced`, or null where the kernel can only
 /// share a port without balancing.
 const balanced_option: ?u32 = switch (builtin.os.tag) {
-    .freebsd => posix.SO.REUSEPORT_LB,
-    .linux => posix.SO.REUSEPORT,
+    .freebsd => compat.SO.REUSEPORT_LB,
+    .linux => compat.SO.REUSEPORT,
     else => null,
 };
 
@@ -41,7 +41,7 @@ const balanced_option: ?u32 = switch (builtin.os.tag) {
 /// The listener owns its descriptor. Purge event-port registrations for that
 /// descriptor before calling `close`.
 pub const Listener = struct {
-    sock: posix.fd_t = -1,
+    sock: compat.fd_t = -1,
     /// Unix-socket state (e.g. the bound path), owned by unix_posix.zig.
     unix: unix_posix.ListenerState = .{},
     /// Connections the last readable event reported; see `hintReadable`.
@@ -51,31 +51,31 @@ pub const Listener = struct {
     /// `.balanced` is SO_REUSEPORT_LB on FreeBSD and SO_REUSEPORT on Linux;
     /// error.Unsupported elsewhere. Every listener sharing the port must ask
     /// for `.balanced` (and, on Linux, run as the same user).
-    pub fn openTcp(alloc: std.mem.Allocator, addr: std.net.Address, opts: io.ListenOptions) io.ListenError!Listener {
+    pub fn openTcp(alloc: std.mem.Allocator, addr: compat.Address, opts: io.ListenOptions) io.ListenError!Listener {
         _ = alloc;
         const reuse: ?u32 = switch (opts.reuse_port) {
             .none => null,
             .balanced => balanced_option orelse return io.ListenError.Unsupported,
         };
         const family = addr.any.family;
-        if (family != posix.AF.INET and family != posix.AF.INET6) return io.ListenError.SocketError;
+        if (family != compat.AF.INET and family != compat.AF.INET6) return io.ListenError.SocketError;
 
-        const s = posix.socket(family, posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC, posix.IPPROTO.TCP) catch |err| return switch (err) {
+        const s = compat.socket(family, compat.SOCK.STREAM | compat.SOCK.NONBLOCK | compat.SOCK.CLOEXEC, compat.IPPROTO.TCP) catch |err| return switch (err) {
             error.AccessDenied => io.ListenError.AccessDenied,
             else => io.ListenError.SocketError,
         };
-        errdefer posix.close(s);
+        errdefer compat.close(s);
 
-        try setFlag(s, posix.SOL.SOCKET, posix.SO.REUSEADDR, true);
-        if (family == posix.AF.INET6) try setFlag(s, posix.IPPROTO.IPV6, IPV6_V6ONLY, opts.v6_only);
-        if (reuse) |opt| try setFlag(s, posix.SOL.SOCKET, opt, true);
+        try setFlag(s, compat.SOL.SOCKET, compat.SO.REUSEADDR, true);
+        if (family == compat.AF.INET6) try setFlag(s, compat.IPPROTO.IPV6, IPV6_V6ONLY, opts.v6_only);
+        if (reuse) |opt| try setFlag(s, compat.SOL.SOCKET, opt, true);
 
-        posix.bind(s, &addr.any, addr.getOsSockLen()) catch |err| return switch (err) {
+        compat.bind(s, &addr.any, addr.getOsSockLen()) catch |err| return switch (err) {
             error.AddressInUse => io.ListenError.AddressInUse,
             error.AccessDenied => io.ListenError.AccessDenied,
             else => io.ListenError.SocketError,
         };
-        posix.listen(s, opts.backlog) catch |err| return switch (err) {
+        compat.listen(s, opts.backlog) catch |err| return switch (err) {
             error.AddressInUse => io.ListenError.AddressInUse,
             else => io.ListenError.SocketError,
         };
@@ -125,10 +125,10 @@ pub const Listener = struct {
         while (true) {
             if (self.hint.exhausted()) return .want_accept;
             const rc = if (have_accept4)
-                std.c.accept4(self.sock, null, null, posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC)
+                std.c.accept4(self.sock, null, null, compat.SOCK.NONBLOCK | compat.SOCK.CLOEXEC)
             else
                 std.c.accept(self.sock, null, null);
-            switch (posix.errno(rc)) {
+            switch (std.posix.errno(rc)) {
                 .SUCCESS => self.hint.consume(1),
                 .INTR => continue,
                 .AGAIN => {
@@ -150,7 +150,7 @@ pub const Listener = struct {
                     return io.AcceptError.SocketError;
                 },
             }
-            const fd: posix.fd_t = @intCast(rc);
+            const fd: compat.fd_t = @intCast(rc);
             if (!have_accept4) try setAcceptFlags(fd);
             out.adoptAccepted(fd, null, null) catch |err| switch (err) {
                 // Darwin: the peer was gone before SO_NOSIGPIPE could be set.
@@ -171,7 +171,7 @@ pub const Listener = struct {
     }
 
     /// No overlapped accepts on POSIX.
-    pub fn absorbCompletion(self: *Listener, ov: ?*std.os.windows.OVERLAPPED, bytes: usize, err: ?usize) io.ListenerCompletion {
+    pub fn absorbCompletion(self: *Listener, ov: ?*compat.windows.OVERLAPPED, bytes: usize, err: ?usize) io.ListenerCompletion {
         _ = self;
         _ = ov;
         _ = bytes;
@@ -187,18 +187,18 @@ pub const Listener = struct {
 
     /// The bound address (the chosen port after binding to port 0, or the
     /// path of a Unix listener).
-    pub fn localAddress(self: *const Listener) io.LocalAddressError!std.net.Address {
+    pub fn localAddress(self: *const Listener) io.LocalAddressError!compat.Address {
         if (self.sock < 0) return io.LocalAddressError.SocketError;
-        var ss: posix.sockaddr.storage = undefined;
-        var len: posix.socklen_t = @sizeOf(posix.sockaddr.storage);
-        posix.getsockname(self.sock, @ptrCast(&ss), &len) catch return io.LocalAddressError.SocketError;
-        const sa: *const posix.sockaddr = @ptrCast(&ss);
+        var ss: compat.sockaddr.storage = undefined;
+        var len: compat.socklen_t = @sizeOf(compat.sockaddr.storage);
+        compat.getsockname(self.sock, @ptrCast(&ss), &len) catch return io.LocalAddressError.SocketError;
+        const sa: *const compat.sockaddr = @ptrCast(&ss);
         switch (sa.family) {
-            posix.AF.INET, posix.AF.INET6 => return std.net.Address.initPosix(@ptrCast(&ss)),
-            posix.AF.UNIX => {
+            compat.AF.INET, compat.AF.INET6 => return compat.Address.initPosix(@ptrCast(&ss)),
+            compat.AF.UNIX => {
                 // getsockname may omit the path's NUL; zero-fill so it stays terminated.
-                var un = std.mem.zeroes(posix.sockaddr.un);
-                const n = @min(@as(usize, len), @sizeOf(posix.sockaddr.un));
+                var un = std.mem.zeroes(compat.sockaddr.un);
+                const n = @min(@as(usize, len), @sizeOf(compat.sockaddr.un));
                 @memcpy(std.mem.asBytes(&un)[0..n], std.mem.asBytes(&ss)[0..n]);
                 return .{ .un = un };
             },
@@ -214,20 +214,20 @@ pub const Listener = struct {
     /// Call `purgeFd(handle())` first, as for any descriptor.
     pub fn close(self: *Listener) void {
         self.unix.deinit();
-        if (self.sock >= 0) posix.close(self.sock);
+        if (self.sock >= 0) compat.close(self.sock);
         self.sock = -1;
     }
 };
 
 /// Boolean socket option; any refusal is error.SocketError.
-fn setFlag(s: posix.fd_t, level: i32, opt: u32, on: bool) io.ListenError!void {
+fn setFlag(s: compat.fd_t, level: i32, opt: u32, on: bool) io.ListenError!void {
     const v: c_int = @intFromBool(on);
-    posix.setsockopt(s, level, opt, std.mem.asBytes(&v)) catch return io.ListenError.SocketError;
+    compat.setsockopt(s, level, opt, std.mem.asBytes(&v)) catch return io.ListenError.SocketError;
 }
 
 /// Errors Linux accept(2) reports for a connection that died while queued;
 /// accept(2) says to treat them like EAGAIN and retry.
-fn linuxSkip(e: posix.E) bool {
+fn linuxSkip(e: compat.E) bool {
     return switch (e) {
         .NETDOWN, .NOPROTOOPT, .HOSTDOWN, .NONET, .HOSTUNREACH, .OPNOTSUPP, .NETUNREACH, .PERM => true,
         else => false,
@@ -236,10 +236,10 @@ fn linuxSkip(e: posix.E) bool {
 
 /// Darwin: accept4's flags by fcntl. A fork between accept and F_SETFD can
 /// leak the fd into the child; Darwin offers no atomic form.
-fn setAcceptFlags(fd: posix.fd_t) io.AcceptError!void {
-    errdefer posix.close(fd);
-    const fl = posix.fcntl(fd, posix.F.GETFL, 0) catch return io.AcceptError.SocketError;
-    const nonblock: u32 = @bitCast(@as(std.posix.O, .{ .NONBLOCK = true }));
-    _ = posix.fcntl(fd, posix.F.SETFL, fl | @as(usize, nonblock)) catch return io.AcceptError.SocketError;
-    _ = posix.fcntl(fd, posix.F.SETFD, posix.FD_CLOEXEC) catch return io.AcceptError.SocketError;
+fn setAcceptFlags(fd: compat.fd_t) io.AcceptError!void {
+    errdefer compat.close(fd);
+    const fl = compat.fcntl(fd, compat.F.GETFL, 0) catch return io.AcceptError.SocketError;
+    const nonblock: u32 = @bitCast(@as(compat.O, .{ .NONBLOCK = true }));
+    _ = compat.fcntl(fd, compat.F.SETFL, fl | @as(usize, nonblock)) catch return io.AcceptError.SocketError;
+    _ = compat.fcntl(fd, compat.F.SETFD, compat.FD_CLOEXEC) catch return io.AcceptError.SocketError;
 }
