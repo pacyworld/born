@@ -59,7 +59,9 @@ The raw event port has a uniform **type surface**, not identical I/O semantics.
 Use `born.socket.PlainNb` for the portable plain-TCP companion. TLS, certificate
 validation, HTTP and application logging are outside born. Backend-specific
 design rationale is in [docs/](docs/README.md); `zig build docs` generates
-declaration-level API documentation.
+declaration-level API documentation. The std.Io analysis includes a
+[VTable gap map](docs/born-vtable-gap.md) and
+[design lessons](docs/learned-from-ioloop.md).
 
 ### kqueue and epoll: readiness
 
