@@ -95,7 +95,10 @@ caller-owned cleanup.
 ## Wakeups and companion primitives
 
 An eventfd provides cross-thread wakeups. POSIX wakeups coalesce and produce
-`Event.wake`.
+`Event.wake`. The eventfd registration is part of `EvPort.init`: if it
+fails, init returns `error.InitFailed` with the epoll set, the eventfd, and
+all bookkeeping released, so a constructed port always has a working wake
+source.
 
 A level-triggered timerfd drives the shared deadline heap. A level-triggered
 signalfd provides signal events; watched signals must be blocked in every
