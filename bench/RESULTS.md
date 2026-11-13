@@ -1,11 +1,11 @@
 # kqueue hot-path results
 
-Host: FreeBSD 15.1-RELEASE-p2 amd64, 20 CPUs, `kern.hz=100`. Zig 0.15.2,
-ReleaseSafe. Server on CPU 2, clients on
-CPUs 4-11 (`bench/README.md`). The host is shared, so throughput and tail
-latency carry noise; every cell is the median of 5 repetitions with (min-max)
-beside it. Syscalls per request come from DTrace on the server; the loop's own
-calls are deterministic.
+Host: FreeBSD 15.1-RELEASE-p2 amd64 shared development host, Intel Xeon
+E5-2620 v4, 20 CPUs, `kern.hz=100`. Zig 0.15.2, ReleaseSafe. Server on CPU 2,
+clients on CPUs 4-11 (`bench/README.md`). The host is shared, so throughput
+and tail latency carry noise; every cell is the median of 5 repetitions with
+(min-max) beside it. Syscalls per request come from DTrace on the server; the
+loop's own calls are deterministic.
 
 Scenarios: `echo1` one connection, 64-byte echo; `echo16` sixteen connections;
 `storm16` sixteen threads of connect, 1 byte, reply, close; `bulk4` four
@@ -123,12 +123,12 @@ only when more than 64 events are ready per wait).
 
 The P4 benchmark regression gate (`bench/regress.sh`, `bench/thresholds.txt`,
 `.forgejo/workflows/bench.yml`) counts syscalls with `truss -c` instead of
-DTrace, so it needs no root on the FreeBSD CI runner. This run calibrates the thresholds to
-that method. Host: FreeBSD 15.1-RELEASE-p2 amd64, 20 CPUs, `kern.hz=100`, Zig
-0.15.2 ReleaseSafe, server CPU 2 / clients CPUs 4-11, `SYSCALLS=truss`, 5 reps,
-2026-11-12. The quiet-host guard (`bench/quiet.sh`) passed before and after the
-run: load1 4.91 then 7.04 (both <= 0.5*20 = 10), ip netisr queue Len 0, QDrops
-delta 0 over 3 s.
+DTrace, so it needs no root on the FreeBSD CI runner. This run calibrates the
+thresholds to that method. Host: FreeBSD 15.1-RELEASE-p2 amd64, 20 CPUs,
+`kern.hz=100`, Zig 0.15.2 ReleaseSafe, server CPU 2 / clients CPUs 4-11,
+`SYSCALLS=truss`, 5 reps, 2026-11-12. The quiet-host guard (`bench/quiet.sh`)
+passed before and after the run: load1 4.91 then 7.04 (both <= 0.5*20 = 10),
+ip netisr queue Len 0, QDrops delta 0 over 3 s.
 
 | Scenario | req/s | p50 us | p99 us | p99.9 us | syscalls/req (truss) |
 |---|---|---|---|---|---|
@@ -154,12 +154,12 @@ fifteen metrics within bounds on this run. The wake round trip stays near 4
 syscalls, confirming (c) is in this tree.
 
 Re-verified on the CI host via workflow dispatch (born run #156, commit
-`25f5b35`): the CI runner is FreeBSD 15.1-RELEASE-p5 with **6 CPUs**, so the bench
-takes the `ncpu < 12` pinning branch (server CPU 0, clients CPUs 0-5). The
-quiet guard passed (load1 2.68 <= 0.5*6 = 3.00, ip netisr Len 0, QDrops delta
-0) and `regress.sh` reported all fifteen metrics within bounds. The CI runner's
-faster hardware lowers latency (echo1 p50 17.8 us, wake p50 4.7 us). echo1,
-echo16, storm16 and bulk4 syscalls/req are deterministic and match the
+`25f5b35`): the CI runner is FreeBSD 15.1-RELEASE-p5 with **6 CPUs**, so the
+bench takes the `ncpu < 12` pinning branch (server CPU 0, clients CPUs 0-5).
+The quiet guard passed (load1 2.68 <= 0.5*6 = 3.00, ip netisr Len 0, QDrops
+delta 0) and `regress.sh` reported all fifteen metrics within bounds. The CI
+runner's faster hardware lowers latency (echo1 p50 17.8 us, wake p50 4.7 us).
+echo1, echo16, storm16 and bulk4 syscalls/req are deterministic and match the
 calibration (3.005, 2.068, 5.132, 5.621). **wake does not match and is not
 deterministic here**: 4.845 against the calibration's 4.232, with five reps
 spanning 4.554-5.044 (spread 0.49). The 6-CPU pinning puts server and clients on

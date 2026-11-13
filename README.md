@@ -492,9 +492,10 @@ in `AGENTS.md`).
 Two scheduled gates run weekly and on dispatch, separate from the per-commit
 CI. `stress.yml` runs the suite 500 times under bounded CPU load on FreeBSD and
 Linux (the #45 repro shape; a failure is a release blocker). `bench.yml` runs
-the kqueue benchmark on a quiet FreeBSD CI runner and fails on a syscall or latency
-regression against `bench/thresholds.txt` (#31). macOS Apple Silicon stays a
-manual harness (`AGENTS.md`).
+the kqueue benchmark on a quiet FreeBSD CI runner and fails on a syscall or
+latency regression against `bench/thresholds.txt` (#31). macOS Apple Silicon
+stays a manual host; the target-coverage list in `AGENTS.md` says which
+targets run in CI, on manual hosts, or compile-only.
 
 ## Provenance
 

@@ -50,6 +50,12 @@ push and pull request; manual hosts are the fallback for a backend CI lacks
 (`AGENTS.local.md`). Record the OS version, commit, executable sha256 and the
 test summary line in the pull request.
 
+### Target coverage
+
+- **Runtime in CI:** FreeBSD, Linux, Windows.
+- **Runtime on manual hosts:** aarch64-macos, NetBSD.
+- **Compile-only:** x86_64-macos, x86_64-openbsd.
+
 ### CI (`.forgejo/workflows/ci.yml`)
 
 Per-commit CI runs a toolchain matrix over Zig 0.15.2, 0.16.0, and 0.17.1. The
