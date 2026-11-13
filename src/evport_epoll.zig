@@ -314,6 +314,14 @@ pub const EvPort = struct {
     /// EEXIST and strands the descriptor. Any other failure, whether allocation
     /// failure before the syscall or an epoll_ctl rejection such as EBADF, is
     /// stashed in pending_error.
+    ///
+    /// A failed CTL_MOD keeps the prior bookkeeping while the kernel
+    /// registration stays live (EBADF, EINVAL, ENOMEM, EPERM): the old state
+    /// still mirrors it and a later apply retries MOD rather than CTL_ADD into
+    /// EEXIST. ENOENT is the exception: the kernel has no registration for the
+    /// fd, because every descriptor for the old open file description was
+    /// closed without purgeFd and the number was reused. The stale entry is
+    /// dropped and the descriptor re-ADDed in the same call.
     fn apply(self: *EvPort, fd: Handle, st: FdState) void {
         if (!st.read and !st.write) {
             if (self.fds.getPtr(fd)) |cur| {
@@ -326,38 +334,51 @@ pub const EvPort = struct {
             }
             return;
         }
+        if (self.fds.getPtr(fd)) |cur| {
+            if (cur.pseudo) {
+                cur.* = st;
+                return;
+            }
+            var ev = makeEvent(st);
+            switch (compat.linuxErrno(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_MOD, fd, &ev))) {
+                .SUCCESS => {
+                    cur.* = st;
+                    return;
+                },
+                // No live registration: drop the stale entry and re-ADD below.
+                .NOENT => _ = self.fds.remove(fd),
+                // Prior registration still live; keep bookkeeping for a MOD retry.
+                else => {
+                    self.pending_error = WaitError.RegisterFailed;
+                    return;
+                },
+            }
+        }
+        self.addRegistration(fd, st);
+    }
+
+    /// Reserve the map slot, then CTL_ADD (reserve rationale in `apply`).
+    fn addRegistration(self: *EvPort, fd: Handle, st: FdState) void {
         const gop = self.fds.getOrPut(self.alloc, fd) catch {
             self.pending_error = WaitError.OutOfMemory;
             return;
         };
-        if (!gop.found_existing) {
-            gop.value_ptr.* = st;
-            var ev = makeEvent(st);
-            switch (compat.linuxErrno(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_ADD, fd, &ev))) {
-                .SUCCESS => {},
-                // "I cannot poll this": the pseudo registration above.
-                .PERM => {
-                    gop.value_ptr.pseudo = true;
-                    self.pseudo_count += 1;
-                },
-                // Anything else (EBADF for a dead descriptor, ENOMEM, ...)
-                // is a real rejection and must reach the caller.
-                else => {
-                    _ = self.fds.remove(fd);
-                    self.pending_error = WaitError.RegisterFailed;
-                },
-            }
-            return;
-        }
-        if (!gop.value_ptr.pseudo) {
-            var ev = makeEvent(st);
-            if (compat.linuxErrno(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_MOD, fd, &ev)) != .SUCCESS) {
+        gop.value_ptr.* = st;
+        var ev = makeEvent(st);
+        switch (compat.linuxErrno(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_ADD, fd, &ev))) {
+            .SUCCESS => {},
+            // "I cannot poll this": the pseudo registration above.
+            .PERM => {
+                gop.value_ptr.pseudo = true;
+                self.pseudo_count += 1;
+            },
+            // Anything else (EBADF for a dead descriptor, ENOMEM, ...)
+            // is a real rejection and must reach the caller.
+            else => {
                 _ = self.fds.remove(fd);
                 self.pending_error = WaitError.RegisterFailed;
-                return;
-            }
+            },
         }
-        gop.value_ptr.* = st;
     }
 
     fn makeEvent(st: FdState) linux.epoll_event {
@@ -676,6 +697,94 @@ test "epoll: rejected descriptor is reported by the next wait, never half-record
     evp.wantWrite(bogus, &tag);
     try std.testing.expectError(Error.RegisterFailed, evp.wait(&events, 0));
     try std.testing.expect(!evp.fds.contains(bogus));
+}
+
+test "epoll: failed CTL_MOD keeps prior bookkeeping so a retry re-mods" {
+    const alloc = std.testing.allocator;
+    var evp = try EvPort.init(alloc);
+    defer evp.deinit();
+
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(compat.AF.UNIX, compat.SOCK.STREAM | compat.SOCK.NONBLOCK | compat.SOCK.CLOEXEC, 0, &fds));
+    defer compat.close(fds[0]);
+    defer compat.close(fds[1]);
+
+    var tag: u8 = 9;
+    evp.monitorRead(fds[0], &tag);
+    try std.testing.expect(evp.fds.get(fds[0]).?.read);
+
+    // epoll(7): a registration is dropped only once every descriptor referring
+    // to the underlying open file description is closed. dup keeps that
+    // description, and the live registration, alive while the original fd
+    // number turns invalid, so the next CTL_MOD fails with EBADF without
+    // unregistering anything.
+    const saved = try compat.dup(fds[0]);
+    defer compat.close(saved);
+    compat.close(fds[0]);
+
+    evp.wantWrite(fds[0], &tag);
+    // MOD failed: the prior bookkeeping must survive, mirroring the still-live
+    // kernel registration (read armed, write not).
+    try std.testing.expect(evp.fds.contains(fds[0]));
+    const st = evp.fds.get(fds[0]).?;
+    try std.testing.expect(st.read);
+    try std.testing.expect(!st.write);
+
+    var events: [8]Event = undefined;
+    try std.testing.expectError(Error.RegisterFailed, evp.wait(&events, 0));
+
+    // Restore the original fd number onto the same description. The kernel
+    // registration was never removed, so the retry must CTL_MOD (not CTL_ADD
+    // into EEXIST) and arm write interest.
+    try compat.dup2(saved, fds[0]);
+    evp.wantWrite(fds[0], &tag);
+    try std.testing.expect(evp.fds.get(fds[0]).?.write);
+    try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));
+    try std.testing.expect(events[0].writable);
+    try std.testing.expect(events[0].udata == @as(?*anyopaque, &tag));
+}
+
+test "epoll: CTL_MOD ENOENT drops stale bookkeeping and re-adds the reused fd" {
+    const alloc = std.testing.allocator;
+    var evp = try EvPort.init(alloc);
+    defer evp.deinit();
+
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(compat.AF.UNIX, compat.SOCK.STREAM | compat.SOCK.NONBLOCK | compat.SOCK.CLOEXEC, 0, &fds));
+    defer compat.close(fds[1]);
+
+    // Allocate the replacement pair while fds[0] is still open so the kernel
+    // cannot hand the soon-to-be-freed number to it.
+    var fds2: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(compat.AF.UNIX, compat.SOCK.STREAM | compat.SOCK.NONBLOCK | compat.SOCK.CLOEXEC, 0, &fds2));
+    defer compat.close(fds2[1]);
+
+    var tag: u8 = 10;
+    evp.monitorRead(fds[0], &tag);
+    try std.testing.expect(evp.fds.get(fds[0]).?.read);
+
+    // Close without purgeFd: the last descriptor of the open file description
+    // is gone, so the kernel drops the registration while the bookkeeping
+    // entry for the fd number survives.
+    compat.close(fds[0]);
+
+    // Reuse the number for the fresh description, which has no registration.
+    try compat.dup2(fds2[0], fds[0]);
+    compat.close(fds2[0]);
+    defer compat.close(fds[0]);
+
+    var tag2: u8 = 11;
+    evp.monitorRead(fds[0], &tag2);
+    // MOD hit ENOENT: the stale entry was dropped and the new descriptor
+    // re-ADDed in the same call, so no error is stashed.
+    try std.testing.expect(evp.fds.get(fds[0]).?.read);
+    try std.testing.expect(evp.pending_error == null);
+
+    _ = try compat.write(fds2[1], "x");
+    var events: [8]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));
+    try std.testing.expect(events[0].readable);
+    try std.testing.expect(events[0].udata == @as(?*anyopaque, &tag2));
 }
 
 test "epoll: init fails when the wake registration cannot allocate" {
