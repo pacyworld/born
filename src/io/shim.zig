@@ -65,6 +65,8 @@ pub const InitError = error{
 
 /// The composite carried by the single `Io.userdata` pointer.
 pub const Shim = struct {
+    /// Born's event port, held for the capability routes added in later
+    /// phases; the baseline forwards every slot to `Io.Threaded` instead.
     port: *born.EvPort,
     allocator: std.mem.Allocator,
     capabilities: Capabilities,

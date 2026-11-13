@@ -48,7 +48,13 @@
 - Dependency direction is one-way: the shim imports the `born` core; the core
   never imports `std.Io` or `src/io/`. `enforceIsolation` in `build.zig` scans
   every core source at graph construction on all three toolchains and fails
-  the build on a back edge. The CI fmt job also runs a visible grep gate.
+  the build on a back edge. It reads born's own build root, never the process
+  working directory, and runs only when born is the root package, so a
+  consumer that depends on born is never scanned or blocked. The scan is a
+  hard text boundary: it matches `std.Io` even inside comments.
+  `test/consumer/` is a path-dependency fixture whose own `src/main.zig` uses
+  `std.Io`; CI builds it on 0.16.0 and 0.17.1 to prove a consumer is unaffected.
+  The CI fmt job also runs a visible grep gate.
 - On Zig >= 0.16, `build test` also runs `born-io-tests`, and `check-targets`
   adds a `born-io-<triple>` semantic compile per target (14 steps total;
   0.15.2 keeps 7). These are compile-only, like the core cross-target steps.

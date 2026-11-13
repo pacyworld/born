@@ -150,10 +150,18 @@ fn linkPlatform(mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
 /// Back-edge isolation gate: the born.io shim (src/io/) imports the core, but
 /// no core source may reference std.Io or the shim. Runs at graph construction
 /// on every toolchain, so a violation fails the build itself, not just review.
+/// Only born's own tree is scanned, and only when born is the root package; as
+/// a dependency the gate is skipped so consumers never pay for it.
 fn enforceIsolation(b: *std.Build) void {
+    // As a dependency, born's build() runs in the consumer's process with the
+    // consumer's working directory. Scanning there would read the consumer's
+    // sources, not born's, so only gate when born is the root package.
+    if (b.pkg_hash.len != 0) return;
+
     if (builtin.zig_version.minor >= 16) {
         const io = b.graph.io;
-        var src = std.Io.Dir.cwd().openDir(io, "src", .{ .iterate = true }) catch
+        const root = if (builtin.zig_version.minor >= 17) b.root.root_dir.handle else b.build_root.handle;
+        var src = root.openDir(io, "src", .{ .iterate = true }) catch
             @panic("isolation gate: cannot open src/");
         defer src.close(io);
         var walker = src.walk(b.allocator) catch @panic("isolation gate: cannot walk src/");
@@ -168,7 +176,7 @@ fn enforceIsolation(b: *std.Build) void {
             scanCoreSource(entry.path, text);
         }
     } else {
-        var src = std.fs.cwd().openDir("src", .{ .iterate = true }) catch
+        var src = b.build_root.handle.openDir("src", .{ .iterate = true }) catch
             @panic("isolation gate: cannot open src/");
         defer src.close();
         var walker = src.walk(b.allocator) catch @panic("isolation gate: cannot walk src/");
@@ -185,6 +193,8 @@ fn enforceIsolation(b: *std.Build) void {
     }
 }
 
+/// Hard text boundary: a needle matches anywhere in the file, including doc
+/// comments, so a core comment that merely mentions std.Io also fails the gate.
 fn scanCoreSource(path: []const u8, text: []const u8) void {
     const needles = [_][]const u8{ "std.Io", "@import(\"io/", "@import(\"born.io\")" };
     for (needles) |needle| {

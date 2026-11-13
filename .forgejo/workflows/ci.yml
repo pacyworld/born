@@ -180,6 +180,23 @@ jobs:
           "$ZIG" build docs --summary all
           test -f zig-out/docs/index.html
 
+      # Regression gate for the isolation fix: a downstream consumer that uses
+      # std.Io in its own src/ must still build born as a path dependency. The
+      # gate scans born's build root and skips non-root packages, so this must
+      # not panic. Needs std.Io, so it runs on 0.16.0 and 0.17.1 only.
+      - name: Consumer fixture (born as a dependency, 0.16+)
+        run: |
+          set -eu
+          case "${{ matrix.zig }}" in
+            0.15.2)
+              echo "consumer fixture needs std.Io (Zig >= 0.16); skipping on ${{ matrix.zig }}"
+              ;;
+            *)
+              ( cd test/consumer && "$ZIG" build --summary all )
+              echo "consumer fixture (zig ${{ matrix.zig }}): a std.Io-using consumer builds born as a dependency"
+              ;;
+          esac
+
       - name: Cross-build Linux and Windows test executables (Debug + ReleaseSafe)
         run: |
           set -eu
