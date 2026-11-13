@@ -91,7 +91,8 @@ pub const Event = types.Event;
 pub const Signal = types.Signal;
 pub const TimerMode = types.TimerMode;
 
-pub const InitError = error{ KqueueFailed, PipeFailed };
+/// OutOfMemory: the wake-pipe registration could not be staged during init.
+pub const InitError = error{ KqueueFailed, PipeFailed, OutOfMemory };
 /// A stashed allocation failure is reported as OutOfMemory; kernel
 /// rejections of staged changes arrive as Event.err instead.
 pub const WaitError = error{ WaitFailed, OutOfMemory };
@@ -139,6 +140,8 @@ pub const EvPort = struct {
     processes: process_kqueue.State = .{},
 
     /// Create a kqueue and its wake source, using `alloc` for port bookkeeping.
+    /// The wake registration is part of init: if it fails, init fails with
+    /// everything released instead of returning a port without a wake source.
     pub fn init(alloc: std.mem.Allocator) InitError!EvPort {
         const kq = compat.kqueue() catch return InitError.KqueueFailed;
         errdefer compat.close(kq);
@@ -163,7 +166,16 @@ pub const EvPort = struct {
             .timers = timer_kqueue.State.init(alloc),
             .signals = signal_kqueue.State.init(alloc),
         };
-        if (!have_user) self.monitorRead(self.wake_r, @as(?*anyopaque, &wake_sentinel));
+        if (!have_user) {
+            self.monitorRead(self.wake_r, @as(?*anyopaque, &wake_sentinel));
+            if (self.pending_error != null) {
+                // The wake pipe is unmonitored: a port without reliable
+                // cross-thread wakeup must not escape init. Free the
+                // bookkeeping; the errdefers close the kqueue and pipe ends.
+                self.changes.deinit(alloc);
+                return InitError.OutOfMemory;
+            }
+        }
         return self;
     }
 
@@ -657,11 +669,16 @@ test "kqueue: null timeout submits readiness beyond the eventlist cap" {
 }
 
 test "kqueue: allocation failure is reported by the next wait, once" {
-    // fail_index 0: the first changelist append fails (on pipe targets it is
-    // init's wake-pipe monitorRead). The port constructs; the stage is stashed.
-    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    var port = try EvPort.init(failing.allocator());
+    var port = try EvPort.init(std.testing.allocator);
     defer port.deinit();
+    // Submit init's staged wake registration (pipe targets), then force
+    // the next stage to allocate: drop the changelist buffer and switch
+    // to an allocator that fails on its first allocation.
+    var events: [1]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try port.wait(&events, 0));
+    port.changes.clearAndFree(port.alloc);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    port.alloc = failing.allocator();
     const pipe_fds = try compat.pipe2(PIPE2_FLAGS);
     defer compat.close(pipe_fds[0]);
     defer compat.close(pipe_fds[1]);
@@ -669,9 +686,26 @@ test "kqueue: allocation failure is reported by the next wait, once" {
     try std.testing.expectEqual(@as(usize, 0), port.changes.items.len);
     var empty: [0]Event = .{};
     try std.testing.expectEqual(@as(usize, 0), try port.wait(&empty, null));
-    var events: [1]Event = undefined;
     try std.testing.expectError(Error.OutOfMemory, port.wait(&events, 0));
     try std.testing.expectEqual(@as(usize, 0), try port.wait(&events, 0));
+}
+
+test "kqueue: init fails when the wake-pipe registration cannot be staged" {
+    if (have_user) return error.SkipZigTest;
+    // fail_index 0: init's wake-pipe monitorRead append fails. Init must
+    // fail, not construct a port whose wake pipe is unmonitored.
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    try std.testing.expectError(Error.OutOfMemory, EvPort.init(failing.allocator()));
+    // Complete cleanup: no leaked bookkeeping.
+    try std.testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
+
+    // A retry constructs a working port whose pipe wake delivers an event.
+    var port = try EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    port.wake();
+    var events: [1]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try port.wait(&events, 1000));
+    try std.testing.expect(events[0].wake);
 }
 
 test "kqueue: socket read readiness + EV_CLEAR edge semantics" {
