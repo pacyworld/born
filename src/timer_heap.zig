@@ -34,7 +34,9 @@
 //!     `out.len`. A one-shot is removed and reports `fired = 1`. A
 //!     repeating entry reports `fired = 1 + missed periods` and is
 //!     re-inserted at `deadline + fired * period_ns`, the first slot of its
-//!     original phase after `now_ns`, so it never drifts. Entries that do
+//!     original phase after `now_ns`, so it never drifts. The period count
+//!     and next deadline saturate at `maxInt(u64)` (`fired` at `maxInt(u32)`),
+//!     so expiration at the clock's upper bound never traps. Entries that do
 //!     not fit in `out` stay due and are returned by the next call.
 //!   - Equal deadlines expire in the order they were added or re-armed.
 //!   - `next()` is what a backend arms its single kernel timer to (timerfd
@@ -174,7 +176,7 @@ pub const TimerHeap = struct {
                 _ = self.index.swapRemove(top.id);
                 self.removeAt(0);
             } else {
-                const periods = (now_ns - top.deadline_ns) / top.period_ns + 1;
+                const periods = (now_ns - top.deadline_ns) / top.period_ns +| 1;
                 out[n] = .{
                     .id = top.id,
                     .udata = top.udata,
@@ -574,4 +576,49 @@ test "timer_heap: nowNs is monotonic" {
     const b = try nowNs();
     try testing.expect(b >= a);
     try testing.expect(a > 0);
+}
+
+test "timer_heap: repeating period count saturates at maxInt(u64)" {
+    const gpa = testing.allocator;
+    var h: TimerHeap = .empty;
+    defer h.deinit(gpa);
+    // period 1 from deadline 0: at now = maxInt(u64) the missed-period count
+    // (now - deadline) / period + 1 exceeds u64, so it must saturate, not trap.
+    try h.add(gpa, 0, 1, null, 0, 1);
+    try testing.expectEqual(@as(?u64, 0), h.next());
+    var out: [1]Expired = undefined;
+    try testing.expectEqual(@as(usize, 1), h.expire(max_ns, &out));
+    try testing.expectEqual(@as(u32, 1), out[0].id);
+    try testing.expectEqual(std.math.maxInt(u32), out[0].fired);
+    try testing.expectEqual(@as(?u64, max_ns), h.next());
+    try validate(&h);
+}
+
+test "timer_heap: repeating next deadline saturates when fired * period overflows" {
+    const gpa = testing.allocator;
+    var h: TimerHeap = .empty;
+    defer h.deinit(gpa);
+    // period 2 from deadline 0: at now = maxInt(u64) the period count fits in
+    // u64 but fired * period does not, so the next deadline saturates.
+    try h.add(gpa, 0, 1, null, 0, 2);
+    var out: [1]Expired = undefined;
+    try testing.expectEqual(@as(usize, 1), h.expire(max_ns, &out));
+    try testing.expectEqual(std.math.maxInt(u32), out[0].fired);
+    try testing.expectEqual(@as(?u64, max_ns), h.next());
+    try validate(&h);
+}
+
+test "timer_heap: repeating timer keeps its phase just below maxInt(u64)" {
+    const gpa = testing.allocator;
+    var h: TimerHeap = .empty;
+    defer h.deinit(gpa);
+    // Near the top of the clock with a period that still fits: the next
+    // deadline advances by exactly the missed periods, without saturating.
+    const base = max_ns - 1000;
+    try h.add(gpa, base, 1, null, 100, 100);
+    var out: [1]Expired = undefined;
+    try testing.expectEqual(@as(usize, 1), h.expire(base + 250, &out));
+    try testing.expectEqual(@as(u32, 2), out[0].fired);
+    try testing.expectEqual(@as(?u64, base + 300), h.next());
+    try validate(&h);
 }
