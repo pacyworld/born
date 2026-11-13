@@ -1576,6 +1576,17 @@ pub fn openZ(path: [*:0]const u8, flags: O, permissions: mode_t) OpenError!fd_t 
     }
 }
 
+/// Opens a directory descriptor for anchoring `*at` operations against a
+/// parent-directory swap. Uses O_PATH where the platform has it (Linux,
+/// FreeBSD) so no read permission on the directory is required; O_RDONLY
+/// elsewhere. The descriptor is close-on-exec and never used for read/write.
+pub fn openDirAnchor(path: []const u8) OpenError!fd_t {
+    if (comptime is_windows) @compileError("openDirAnchor is POSIX-only");
+    var flags: O = .{ .DIRECTORY = true, .CLOEXEC = true };
+    if (comptime @hasField(O, "PATH")) flags.PATH = true;
+    return open(path, flags, 0);
+}
+
 /// Duplicates a descriptor.
 pub fn dup(fd: fd_t) OpenError!fd_t {
     if (comptime is_windows) @compileError("dup is POSIX-only");
@@ -1752,6 +1763,34 @@ pub fn unlinkZ(path: [*:0]const u8) UnlinkError!void {
         .NOTDIR => return error.NotDir,
         .LOOP => return error.SymLinkLoop,
         .INVAL, .FAULT => unreachable,
+        else => return unexpected(),
+    }
+}
+
+/// Removes a file relative to a directory descriptor.
+pub fn unlinkat(dirfd: fd_t, path: []const u8, flags: u32) UnlinkError!void {
+    var buffer: PathBuffer = undefined;
+    const path_z = try pathBuffer(path, &buffer);
+    return unlinkatZ(dirfd, path_z.ptr, flags);
+}
+
+/// Removes a sentinel-terminated file path relative to a directory descriptor.
+pub fn unlinkatZ(dirfd: fd_t, path: [*:0]const u8, flags: u32) UnlinkError!void {
+    if (comptime is_windows) @compileError("unlinkat is POSIX-only");
+    switch (errno(std.c.unlinkat(dirfd, path, flags))) {
+        .SUCCESS => return,
+        .ACCES => return error.AccessDenied,
+        .PERM => return error.PermissionDenied,
+        .NOENT => return error.FileNotFound,
+        .BUSY => return error.FileBusy,
+        .IO => return error.FileSystem,
+        .NAMETOOLONG => return error.NameTooLong,
+        .ISDIR => return error.IsDir,
+        .NOMEM => return error.SystemResources,
+        .ROFS => return error.ReadOnlyFileSystem,
+        .NOTDIR => return error.NotDir,
+        .LOOP => return error.SymLinkLoop,
+        .INVAL, .FAULT, .BADF => unreachable,
         else => return unexpected(),
     }
 }
