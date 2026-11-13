@@ -338,9 +338,14 @@ test "listener: descriptor exhaustion is ResourceExhausted and the drain resumes
     try std.testing.expectEqual(@as(usize, 0), acceptor.count);
 
     // The connections stayed queued; resuming drains them without a new edge.
-    // Darwin's kernel drops the connection whose accept hit the limit.
-    try std.testing.expect(try acceptor.onEvent(ev));
+    // The accept that hit EMFILE left at least one queued, so assert the resumed
+    // drain accepts it on its own (count >= 1) before pumping for the in-flight
+    // remainder to `kept` (#45, the #31 drain pattern). Darwin drops the
+    // connection whose accept hit the limit, so that guard is POSIX-only.
     const kept: usize = if (builtin.os.tag.isDarwin()) n - 1 else n;
+    try std.testing.expect(try acceptor.onEvent(ev));
+    if (!builtin.os.tag.isDarwin()) try std.testing.expect(acceptor.count >= 1);
+    try pump(&port, &.{&acceptor}, kept, 5000);
     try std.testing.expectEqual(kept, acceptor.count);
     try closeListener(&port, &l);
 }
