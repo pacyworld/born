@@ -13,13 +13,12 @@
 //! reference to a running process kills it with SIGKILL and init collects
 //! it. Born never calls a wait function on kqueue.
 //!
-//! State tracks watched descriptors and marks their adds submitted after
-//! every kevent attempt, so `unwatch` stages EV_DELETE only for a marked add
-//! and drops a still-staged add instead. If eventlist exhaustion makes
-//! kevent abandon a suffix, `flushed` marks its unprocessed adds submitted
-//! too (#66), so the mark does not prove that a knote exists. Deliveries for
-//! a descriptor that is no longer watched (a delete that could not be staged)
-//! are suppressed, as is the ENOENT of a delete that found no knote.
+//! State tracks watched descriptors and marks only adds included in each
+//! submitted prefix, so `unwatch` stages EV_DELETE only for a marked add and
+//! drops a still-staged add instead. Adds left for a later wait stay
+//! unflushed. Deliveries for a descriptor that is no longer watched (a delete
+//! that could not be staged) are suppressed, as is the ENOENT of a delete
+//! that found no knote.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -44,9 +43,8 @@ const ENOENT = @intFromEnum(compat.E.NOENT);
 
 /// Per-port watch bookkeeping, a field of EvPort (`processes`).
 pub const State = struct {
-    /// Watched descriptors; the value is true after a wait() attempts to
-    /// submit the add. Eventlist exhaustion can make this true without a
-    /// corresponding knote (#66).
+    /// Watched descriptors; the value is true after a wait() includes the add
+    /// in its submitted prefix.
     live: std.AutoHashMapUnmanaged(c_int, bool) = .empty,
     /// Descriptors whose add is staged and has not been attempted.
     unflushed: std.ArrayList(c_int) = .empty,
@@ -65,8 +63,6 @@ pub const State = struct {
 /// replaces its udata. When the change is processed, a kernel refusal (EBADF,
 /// or a descriptor that is not a process descriptor) arrives at wait() as
 /// Event{ .err, .err_no } with the watch's udata and ends the watch.
-/// Eventlist exhaustion can instead abandon the change with the rest of the
-/// batch (#66).
 pub fn watch(port: *EvPort, fd: c_int, udata: ?*anyopaque) ProcessError!void {
     if (!have_procdesc) return ProcessError.Unsupported;
     if (fd < 0) return ProcessError.BadHandle;
@@ -87,6 +83,7 @@ pub fn watch(port: *EvPort, fd: c_int, udata: ?*anyopaque) ProcessError!void {
 pub fn unwatch(port: *EvPort, fd: c_int) void {
     if (!have_procdesc) return;
     const kv = port.processes.live.fetchRemove(fd) orelse return;
+    removeUnflushed(port, fd);
     purgeStaged(port, fd);
     if (kv.value) port.stageRaw(change(fd, EV_DELETE, null));
 }
@@ -96,17 +93,21 @@ pub fn unwatch(port: *EvPort, fd: c_int) void {
 pub fn purge(port: *EvPort, fd: c_int) void {
     if (!have_procdesc) return;
     _ = port.processes.live.remove(fd);
+    removeUnflushed(port, fd);
 }
 
-/// wait() hook after every kevent attempt, including a failed one. Marks all
-/// staged adds submitted; an eventlist-overflow suffix can therefore be marked
-/// without its knote being installed (#66).
-pub fn flushed(port: *EvPort) void {
-    const st = &port.processes;
-    for (st.unflushed.items) |fd| {
-        if (st.live.getPtr(fd)) |in_kernel| in_kernel.* = true;
+/// wait() hook after every kevent attempt, including a failed one. Marks only
+/// process adds actually included in the submitted prefix. Other change kinds
+/// and adds left for a later wait do not affect process bookkeeping.
+pub fn flushed(port: *EvPort, submitted: []const Kevent) void {
+    for (submitted) |kev| {
+        if (kev.filter != EVFILT_PROCDESC or (kev.flags & EV_ADD) == 0) continue;
+        const fd = std.math.cast(c_int, kev.ident) orelse continue;
+        if (port.processes.live.getPtr(fd)) |in_kernel| {
+            in_kernel.* = true;
+            removeUnflushed(port, fd);
+        }
     }
-    st.unflushed.clearRetainingCapacity();
 }
 
 /// Sees each EVFILT_PROCDESC kevent first; false suppresses it. An exit or
@@ -119,6 +120,18 @@ pub fn observe(port: *EvPort, kev: Kevent) bool {
         return true;
     }
     return port.processes.live.remove(fd);
+}
+
+fn removeUnflushed(port: *EvPort, fd: c_int) void {
+    const st = &port.processes;
+    var i: usize = 0;
+    while (i < st.unflushed.items.len) {
+        if (st.unflushed.items[i] == fd) {
+            _ = st.unflushed.swapRemove(i);
+        } else {
+            i += 1;
+        }
+    }
 }
 
 fn purgeStaged(port: *EvPort, fd: c_int) void {
@@ -147,6 +160,7 @@ fn change(fd: c_int, flags: @FieldType(Kevent, "flags"), udata: ?*anyopaque) Kev
 // --------------------------------------------------------------- tests ----
 
 const testing = std.testing;
+const process = @import("process.zig");
 
 test "process_kqueue: unwatch before a wait drops the staged add" {
     if (!have_procdesc) return error.SkipZigTest;
@@ -160,7 +174,54 @@ test "process_kqueue: unwatch before a wait drops the staged add" {
     try testing.expectEqual(@as(usize, 1), port.changes.items.len);
     unwatch(&port, 900);
     try testing.expectEqual(@as(usize, 0), port.changes.items.len);
+    try testing.expectEqual(@as(usize, 0), port.processes.unflushed.items.len);
     try testing.expect(!port.processes.live.contains(900));
+
+    // Re-watching after a cancelled add cannot leave stale unflushed state.
+    try watch(&port, 900, &tag);
+    try testing.expectEqual(@as(usize, 1), port.processes.unflushed.items.len);
+    try testing.expectEqual(@as(usize, 1), try port.wait(&events, 0));
+    try testing.expectEqual(@as(usize, 0), port.processes.unflushed.items.len);
+}
+
+test "process_kqueue: purgeFd drops staged add state" {
+    if (!have_procdesc) return error.SkipZigTest;
+    var port = try EvPort.init(testing.allocator);
+    defer port.deinit();
+    var tag: u8 = 1;
+    try watch(&port, 900, &tag);
+    port.purgeFd(900);
+    try testing.expectEqual(@as(usize, 0), port.processes.unflushed.items.len);
+    try testing.expectEqual(@as(usize, 0), port.changes.items.len);
+
+    try watch(&port, 900, &tag);
+    var events: [1]kq.Event = undefined;
+    try testing.expectEqual(@as(usize, 1), try port.wait(&events, 0));
+    try testing.expect(events[0].err and events[0].udata == @as(?*anyopaque, &tag));
+    try testing.expectEqual(@as(usize, 0), port.processes.unflushed.items.len);
+}
+
+test "process_kqueue: mixed changes do not count as process adds" {
+    if (!have_procdesc) return error.SkipZigTest;
+    var port = try EvPort.init(testing.allocator);
+    defer port.deinit();
+    const fds = try compat.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    defer compat.close(fds[0]);
+    defer compat.close(fds[1]);
+    var tag: u8 = 1;
+    port.monitorRead(fds[1], null);
+    try watch(&port, fds[0], &tag);
+
+    flushed(&port, port.changes.items[0..1]);
+    _ = port.changes.orderedRemove(0);
+    try testing.expectEqual(@as(usize, 1), port.processes.unflushed.items.len);
+    try testing.expect(!port.processes.live.get(fds[0]).?);
+
+    var event: [1]kq.Event = undefined;
+
+    try testing.expectEqual(@as(usize, 1), try port.wait(&event, 0));
+    try testing.expect(event[0].err and event[0].udata == @as(?*anyopaque, &tag));
+    try testing.expectEqual(@as(usize, 0), port.processes.unflushed.items.len);
 }
 
 test "process_kqueue: a refused add is an error event and ends the watch" {
@@ -180,6 +241,50 @@ test "process_kqueue: a refused add is an error event and ends the watch" {
     try testing.expect(!port.processes.live.contains(fds[0]));
     unwatch(&port, fds[0]);
     try testing.expectEqual(@as(usize, 0), port.changes.items.len);
+}
+
+test "process_kqueue: bounded submissions mark only attempted adds" {
+    if (!have_procdesc) return error.SkipZigTest;
+    var port = try EvPort.init(testing.allocator);
+    defer port.deinit();
+    const fds = try compat.pipe2(.{ .NONBLOCK = true, .CLOEXEC = true });
+    defer compat.close(fds[0]);
+    defer compat.close(fds[1]);
+    const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", "exit 0" };
+    const envp = [_:null]?[*:0]const u8{};
+    var child = process.spawn(&argv, &envp, .{}) catch |err| {
+        if (err == error.Unsupported) return error.SkipZigTest;
+        return err;
+    };
+    defer {
+        port.purgeFd(child.handle);
+        child.close();
+    }
+    var tags: [3]u8 = .{ 1, 2, 3 };
+    try watch(&port, fds[0], &tags[0]);
+    try watch(&port, fds[1], &tags[1]);
+    try watch(&port, child.handle, &tags[2]);
+    try testing.expectEqual(@as(usize, 3), port.processes.unflushed.items.len);
+
+    var event: [1]kq.Event = undefined;
+    try testing.expectEqual(@as(usize, 1), try port.wait(&event, 0));
+    try testing.expect(event[0].err and event[0].udata == @as(?*anyopaque, &tags[0]));
+    try testing.expectEqual(@as(usize, 2), port.processes.unflushed.items.len);
+    try testing.expect(!port.processes.live.get(fds[1]).?);
+
+    try testing.expectEqual(@as(usize, 1), try port.wait(&event, 0));
+    try testing.expect(event[0].err and event[0].udata == @as(?*anyopaque, &tags[1]));
+    try testing.expectEqual(@as(usize, 1), port.processes.unflushed.items.len);
+
+    // The short-lived child may exit before or after its add is submitted.
+    if (try port.wait(&event, 1000) == 1) {
+        try testing.expect(event[0].exited and event[0].udata == @as(?*anyopaque, &tags[2]));
+    } else {
+        try testing.expect(port.processes.live.get(child.handle).?);
+        try testing.expectEqual(@as(usize, 1), try port.wait(&event, 1000));
+        try testing.expect(event[0].exited and event[0].udata == @as(?*anyopaque, &tags[2]));
+    }
+    try testing.expectEqual(@as(usize, 0), port.processes.unflushed.items.len);
 }
 
 test "process_kqueue: allocation failure in watch leaves the port unchanged" {

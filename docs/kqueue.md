@@ -29,13 +29,13 @@ finds no eventlist slot, `kevent()` returns `-1` with that change's errno and
 leaves subsequent changes unprocessed. Earlier changes and copied error
 records are not rolled back. `EV_RECEIPT` records consume the same slots.
 
-Born submits the entire staged changelist with at most 64 event slots and
-clears it even after `-1`. More rejections than available slots can therefore
-surface only `error.WaitFailed`, discard the copied error events, and drop the
-unprocessed suffix, as tracked in
-[#66](https://pacyworld.dev/pacyworld/born/issues/66). An allocation failure
-before submission is instead stashed and returned as `error.OutOfMemory` from
-the next non-empty `wait()`.
+Born submits at most one change per available event slot, up to 64. Every
+rejected change therefore has room for its `EV_ERROR` record. `wait()` submits
+every staged change before it blocks: intermediate chunks use a zero timeout,
+and only the chunk that empties the changelist receives the caller's timeout.
+Earlier records are returned first, and the next wait continues with any
+remaining changes. An allocation failure before submission is instead stashed
+and returned as `error.OutOfMemory` from the next non-empty `wait()`.
 
 Regular files are native kqueue readiness sources and remain perpetually
 ready. Consumers stop monitoring them at EOF to avoid a busy wait.
@@ -70,10 +70,9 @@ with `SIGKILL` and leaves init to reap it asynchronously; the close does not
 wait for that reap. A `pdfork` child sends no `SIGCHLD` and is invisible to a
 generic `wait(2)` for children.
 
-Process changes share the eventlist-overflow caveat above. In particular, the
-current `wait()` marks staged process adds as submitted before checking for a
-`kevent()` failure, so eventlist exhaustion can discard an unprocessed process
-add while its bookkeeping says that it reached the kernel.
+Process adds use the same bounded prefix. Only adds included in the submitted
+prefix are marked submitted; adds left for a later wait remain unflushed and
+are not treated as live knotes.
 
 `EvPort.deinit` closes the kqueue, which drops its knotes, and frees watch
 bookkeeping. It does not close caller-owned `Child.handle` values or perform

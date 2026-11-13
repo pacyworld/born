@@ -330,11 +330,13 @@ pub const EvPort = struct {
         };
     }
 
-    /// Flush the staged changelist and harvest events in one kevent call.
-    /// `timeout_ms` must be null or nonnegative. null blocks until an event,
-    /// zero harvests without blocking, and positive values wait that many
-    /// milliseconds. A stashed allocation failure is reported here once,
-    /// ahead of the syscall. An empty wait neither consumes nor reports it.
+    /// Submit every staged change before blocking, harvesting records as they
+    /// arrive. Earlier records are returned first; the next wait continues
+    /// with any remaining changes. `timeout_ms` must be null or nonnegative.
+    /// null blocks until an event, zero harvests without blocking, and
+    /// positive values wait that many milliseconds. A stashed allocation
+    /// failure is reported here once, ahead of the syscall. An empty wait
+    /// neither consumes nor reports it.
     pub fn wait(self: *EvPort, events: []Event, timeout_ms: ?i32) WaitError!usize {
         if (events.len == 0) return 0;
         if (self.pending_error) |err| {
@@ -351,50 +353,71 @@ pub const EvPort = struct {
             ts = .{ .sec = @intCast(@divTrunc(ms, 1000)), .nsec = @intCast(@mod(ms, 1000) * 1_000_000) };
             tsp = &ts;
         }
+        const zero_ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
 
-        const n = if (builtin.os.tag == .netbsd)
-            netbsd.__kevent50(self.kq, self.changes.items.ptr, self.changes.items.len, &kbuf, cap, tsp)
-        else
-            std.c.kevent(self.kq, self.changes.items.ptr, @intCast(self.changes.items.len), &kbuf, @intCast(cap), tsp);
-        self.changes.clearRetainingCapacity();
-        process_kqueue.flushed(self);
-        if (n < 0) {
-            const e = std.posix.errno(@as(isize, n));
-            if (e == .INTR) return 0;
-            return WaitError.WaitFailed;
-        }
-
+        var consumed: usize = 0;
         var out: usize = 0;
         var woke = false;
-        for (kbuf[0..@intCast(n)]) |kev| {
-            if (kev.udata == @intFromPtr(&wake_sentinel)) {
-                if (!woke) {
-                    woke = true;
-                    if (!have_user) self.drainWake();
-                    events[out] = .{ .wake = true };
-                    out += 1;
-                }
-                continue;
-            }
-            if (kev.filter == EVFILT_WRITE) {
-                // One-shot consumed: the writer must re-arm explicitly.
-                _ = self.armed_write.remove(@intCast(kev.ident));
-            }
-            // The owning module sees its kevents first (live-id bookkeeping,
-            // or suppressing an expected ENOENT from a late delete).
-            const keep = if (kev.filter == EVFILT_TIMER)
-                timer_kqueue.observe(self, kev)
-            else if (kev.filter == EVFILT_SIGNAL)
-                signal_kqueue.observe(self, kev)
-            else if (process_kqueue.have_procdesc and kev.filter == process_kqueue.EVFILT_PROCDESC)
-                process_kqueue.observe(self, kev)
+        while (true) {
+            const remaining = self.changes.items.len - consumed;
+            const submitted = @min(remaining, cap);
+            const last = submitted == remaining;
+            const n = if (builtin.os.tag == .netbsd)
+                netbsd.__kevent50(self.kq, self.changes.items[consumed..].ptr, submitted, &kbuf, cap, if (last) tsp else &zero_ts)
             else
-                true;
-            if (!keep) continue;
-            events[out] = translate(kev);
-            out += 1;
+                std.c.kevent(self.kq, self.changes.items[consumed..].ptr, @intCast(submitted), &kbuf, @intCast(cap), if (last) tsp else &zero_ts);
+            process_kqueue.flushed(self, self.changes.items[consumed..][0..submitted]);
+            consumed += submitted;
+            if (n < 0) {
+                self.consumeChanges(consumed);
+                const e = std.posix.errno(@as(isize, n));
+                if (e == .INTR) return 0;
+                return WaitError.WaitFailed;
+            }
+
+            for (kbuf[0..@intCast(n)]) |kev| {
+                if (kev.udata == @intFromPtr(&wake_sentinel)) {
+                    if (!woke) {
+                        woke = true;
+                        if (!have_user) self.drainWake();
+                        events[out] = .{ .wake = true };
+                        out += 1;
+                    }
+                    continue;
+                }
+                if (kev.filter == EVFILT_WRITE) {
+                    // One-shot consumed: the writer must re-arm explicitly.
+                    _ = self.armed_write.remove(@intCast(kev.ident));
+                }
+                // The owning module sees its kevents first (live-id bookkeeping,
+                // or suppressing an expected ENOENT from a late delete).
+                const keep = if (kev.filter == EVFILT_TIMER)
+                    timer_kqueue.observe(self, kev)
+                else if (kev.filter == EVFILT_SIGNAL)
+                    signal_kqueue.observe(self, kev)
+                else if (process_kqueue.have_procdesc and kev.filter == process_kqueue.EVFILT_PROCDESC)
+                    process_kqueue.observe(self, kev)
+                else
+                    true;
+                if (!keep) continue;
+                events[out] = translate(kev);
+                out += 1;
+            }
+            if (out != 0) {
+                self.consumeChanges(consumed);
+                return out;
+            }
+            if (last) {
+                self.changes.clearRetainingCapacity();
+                return 0;
+            }
         }
-        return out;
+    }
+
+    fn consumeChanges(self: *EvPort, consumed: usize) void {
+        const remaining = self.changes.items.len - consumed;
+        std.mem.copyForwards(Kevent, self.changes.items[0..remaining], self.changes.items[consumed..]);
+        self.changes.items.len = remaining;
     }
 
     /// kevent to Event. A failed change (e.g. EV_ADD on a dead fd) must not
@@ -521,6 +544,111 @@ test "kqueue: registration error survives empty wait with errno payload" {
     // A failed registration is not readiness.
     try std.testing.expect(!events[0].readable);
     try std.testing.expect(!events[0].writable);
+}
+
+test "kqueue: eventlist capacity preserves rejected changes and the suffix" {
+    var port = try EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const closed = try compat.pipe2(PIPE2_FLAGS);
+    compat.close(closed[0]);
+    compat.close(closed[1]);
+    var tags: [2]u8 = .{ 1, 2 };
+    port.monitorRead(closed[0], &tags[0]);
+    port.monitorRead(closed[1], &tags[1]);
+    var timer_tag: u8 = 3;
+    try port.addTimer(99, &timer_tag, 1, .once);
+
+    var event: [1]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try port.wait(&event, 0));
+    try std.testing.expect(event[0].err and event[0].udata == @as(?*anyopaque, &tags[0]));
+    try std.testing.expectEqual(@as(usize, @intFromEnum(compat.E.BADF)), event[0].err_no);
+    try std.testing.expectEqual(@as(usize, 2), port.changes.items.len);
+
+    try std.testing.expectEqual(@as(usize, 1), try port.wait(&event, 0));
+    try std.testing.expect(event[0].err and event[0].udata == @as(?*anyopaque, &tags[1]));
+    try std.testing.expectEqual(@as(usize, @intFromEnum(compat.E.BADF)), event[0].err_no);
+    try std.testing.expectEqual(@as(usize, 1), port.changes.items.len);
+
+    try std.testing.expectEqual(@as(usize, 1), try port.wait(&event, 1000));
+    try std.testing.expect(event[0].timer and event[0].udata == @as(?*anyopaque, &timer_tag));
+    try std.testing.expectEqual(@as(usize, 0), port.changes.items.len);
+}
+
+test "kqueue: 65 rejections cross the 64-slot boundary without loss" {
+    var port = try EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    // The single-threaded test runner keeps these closed numbers distinct;
+    // parallel descriptor activity could reuse them.
+    var closed: [65]Handle = undefined;
+    for (&closed) |*fd| fd.* = try compat.open("/dev/null", .{ .ACCMODE = .RDWR, .CLOEXEC = true }, 0);
+    for (closed) |fd| compat.close(fd);
+    var tags: [65]u8 = @splat(0);
+    for (&tags, 0..) |*tag, i| port.monitorRead(closed[i], tag);
+    var timer_tag: u8 = 1;
+    try port.addTimer(100, &timer_tag, 1, .once);
+
+    var events: [64]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 64), try port.wait(&events, 0));
+    for (events) |event| try std.testing.expect(event.err);
+    try std.testing.expectEqual(@as(usize, 2), port.changes.items.len);
+
+    try std.testing.expectEqual(@as(usize, 1), try port.wait(&events, 0));
+    try std.testing.expect(events[0].err);
+    try std.testing.expectEqual(@as(usize, 0), port.changes.items.len);
+
+    try std.testing.expectEqual(@as(usize, 1), try port.wait(&events, 1000));
+    try std.testing.expect(events[0].timer and events[0].udata == @as(?*anyopaque, &timer_tag));
+    try std.testing.expectEqual(@as(usize, 0), port.changes.items.len);
+}
+
+test "kqueue: readiness beyond the eventlist cap is submitted before timeout" {
+    var port = try EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const idle = try compat.pipe2(PIPE2_FLAGS);
+    defer compat.close(idle[0]);
+    defer compat.close(idle[1]);
+    const ready = try compat.pipe2(PIPE2_FLAGS);
+    defer compat.close(ready[0]);
+    defer compat.close(ready[1]);
+    var tags: [2]u8 = .{ 1, 2 };
+    port.monitorRead(idle[0], &tags[0]);
+    port.monitorRead(ready[0], &tags[1]);
+    _ = try compat.write(ready[1], "x");
+
+    var event: [1]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try port.wait(&event, 2000));
+    try std.testing.expect(event[0].readable and event[0].udata == @as(?*anyopaque, &tags[1]));
+    try std.testing.expectEqual(@as(usize, 0), port.changes.items.len);
+}
+
+test "kqueue: null timeout submits readiness beyond the eventlist cap" {
+    var port = try EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const idle = try compat.pipe2(PIPE2_FLAGS);
+    defer compat.close(idle[0]);
+    defer compat.close(idle[1]);
+    const ready = try compat.pipe2(PIPE2_FLAGS);
+    defer compat.close(ready[0]);
+    defer compat.close(ready[1]);
+    var tags: [2]u8 = .{ 1, 2 };
+    port.monitorRead(idle[0], &tags[0]);
+    port.monitorRead(ready[0], &tags[1]);
+    _ = try compat.write(ready[1], "x");
+
+    // The wake only bounds a regression; correct code returns the readable
+    // event before the helper fires instead of sleeping with changes staged.
+    const Waker = struct {
+        fn run(p: *EvPort) void {
+            compat.sleepNs(50 * std.time.ns_per_ms);
+            p.wake();
+        }
+    };
+    const thread = try std.Thread.spawn(.{}, Waker.run, .{&port});
+    defer thread.join();
+    var event: [1]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try port.wait(&event, null));
+    try std.testing.expect(event[0].readable and event[0].udata == @as(?*anyopaque, &tags[1]));
+    try std.testing.expectEqual(@as(usize, 0), port.changes.items.len);
 }
 
 test "kqueue: allocation failure is reported by the next wait, once" {

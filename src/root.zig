@@ -25,7 +25,8 @@
 //!   `associate` fails immediately. kqueue reports kernel rejections as
 //!   `Event.err` and `Event.err_no`, and stashes allocation failures for the
 //!   same deferred channel. IOCP post and wake failures use that channel too.
-//!   The kqueue eventlist-overflow exception is documented in docs/kqueue.md.
+//!   kqueue bounds each submission to the eventlist capacity, as documented
+//!   in docs/kqueue.md.
 //! - Regular files are portable readiness sources. kqueue reports them ready
 //!   natively, and epoll emulates that with always-ready pseudo registrations.
 //! - Process exits from `EvPort.watchProcess` arrive as `Event.exited` and
