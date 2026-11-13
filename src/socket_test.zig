@@ -372,6 +372,68 @@ fn connectRefused(how: Pair.Connect) !void {
     try std.testing.expectError(error.ConnectFailed, pair.client.connectDone());
 }
 
+test "plain socket hostname connect retains a socket-creation failure" {
+    // RLIMIT_NOFILE is POSIX; the Windows companion has its own path.
+    if (is_windows) return error.SkipZigTest;
+    // With the limit at the lowest free descriptor, socket() fails EMFILE
+    // while numeric-host resolution still succeeds. The address loop must
+    // report SocketError, not collapse it into ConnectFailed.
+    const warm = try compat.getAddressList(alloc, "127.0.0.1", 1);
+    warm.deinit();
+    const saved = try std.posix.getrlimit(.NOFILE);
+    const probe = try compat.dup(2);
+    compat.close(probe);
+    var low = saved;
+    low.cur = @intCast(probe);
+    try std.posix.setrlimit(.NOFILE, low);
+    const exhausted = PlainNb.startConnect(alloc, "127.0.0.1", 1);
+    try std.posix.setrlimit(.NOFILE, saved);
+    try std.testing.expectError(error.SocketError, exhausted);
+}
+
+test "plain socket hostname connect retains a connection refusal" {
+    if (is_windows) return error.SkipZigTest;
+    // A bound, non-listening port refuses the connect. FreeBSD and Linux
+    // refuse synchronously; XNU drops the SYN, so the refusal may surface
+    // at connectDone instead. Either way the loop reports ConnectFailed.
+    var address = try compat.Address.parseIp4("127.0.0.1", 0);
+    const refused_socket = try compat.socket(compat.AF.INET, compat.SOCK.STREAM | compat.SOCK.CLOEXEC, 0);
+    var reserved = true;
+    defer if (reserved) closeRaw(refused_socket);
+    try compat.bind(refused_socket, &address.any, address.getOsSockLen());
+    var address_len = address.getOsSockLen();
+    try compat.getsockname(refused_socket, &address.any, &address_len);
+    const refused_port = address.getPort();
+    if (builtin.os.tag.isDarwin()) {
+        compat.close(refused_socket);
+        reserved = false;
+    }
+    var refused = PlainNb.startConnect(alloc, "127.0.0.1", refused_port);
+    if (refused) |*s| {
+        defer s.deinit();
+        // NetBSD keeps the connect pending without delivering write
+        // readiness for the refusal (the connectRefused tests fail there
+        // for the same reason); that delivery gap is tracked in #76.
+        if (builtin.os.tag == .netbsd) return error.SkipZigTest;
+        var port = try born.EvPort.init(alloc);
+        defer port.deinit();
+        port.wantWrite(s.handle(), s);
+        var events: [4]born.Event = undefined;
+        while (true) {
+            const n = try port.wait(&events, 10000);
+            if (n == 0) return error.SocketEventTimeout;
+            var ready = false;
+            for (events[0..n]) |ev| {
+                if (ev.udata == @as(?*anyopaque, s)) ready = true;
+            }
+            if (ready) break;
+        }
+        try std.testing.expectError(error.ConnectFailed, s.connectDone());
+    } else |err| {
+        try std.testing.expectEqual(error.ConnectFailed, err);
+    }
+}
+
 test "plain socket cancellation before connect completion is absorbed" {
     var pair: Pair = undefined;
     try pair.init();
