@@ -16,6 +16,13 @@ fn addOrSkip(port: *born.EvPort, id: u32, udata: ?*anyopaque, after_ms: u32, mod
 
 const Seen = struct { udata: ?*anyopaque, fired: u32, batch: usize };
 
+/// A generous liveness deadline for "the timer fires" assertions: long enough
+/// that a correct timer always fires within it even under heavy scheduler load
+/// (#45). It guards against a lost firing, not a latency bound — latency
+/// measurements belong in bench/. A test stops early once its expected events
+/// arrive, so this only bounds the wait when a firing is genuinely missing.
+const liveness_ms: u64 = 5000;
+
 /// Timer events harvested within `window_ms`, stopping early once `stop`
 /// have arrived. Each records which wait() batch delivered it.
 fn collect(port: *born.EvPort, seen: *std.ArrayList(Seen), window_ms: u64, stop: usize, buf_len: usize) !void {
@@ -46,7 +53,7 @@ test "timer: one-shot fires exactly once" {
     try addOrSkip(&port, 1, &a, 20, .once);
     var seen: std.ArrayList(Seen) = .empty;
     defer seen.deinit(alloc);
-    try collect(&port, &seen, 1000, 1, 16);
+    try collect(&port, &seen, liveness_ms, 1, 16);
     try std.testing.expectEqual(@as(usize, 1), seen.items.len);
     try std.testing.expect(seen.items[0].udata == @as(?*anyopaque, &a));
     try std.testing.expectEqual(@as(u32, 1), seen.items[0].fired);
@@ -61,7 +68,7 @@ test "timer: repeat fires again until cancelled" {
     try addOrSkip(&port, 2, &a, 10, .repeat);
     var seen: std.ArrayList(Seen) = .empty;
     defer seen.deinit(alloc);
-    try collect(&port, &seen, 2000, 3, 16);
+    try collect(&port, &seen, liveness_ms, 3, 16);
     var fired: u32 = 0;
     for (seen.items) |s| {
         try std.testing.expect(s.udata == @as(?*anyopaque, &a));
@@ -96,7 +103,7 @@ test "timer: a cancelled id is reusable" {
     try port.addTimer(4, &b, 10, .once);
     var seen: std.ArrayList(Seen) = .empty;
     defer seen.deinit(alloc);
-    try collect(&port, &seen, 1000, 1, 16);
+    try collect(&port, &seen, liveness_ms, 1, 16);
     try std.testing.expectEqual(@as(usize, 1), seen.items.len);
     try std.testing.expect(seen.items[0].udata == @as(?*anyopaque, &b));
     port.cancelTimer(4);
@@ -111,9 +118,13 @@ test "timer: re-adding a live id replaces it" {
     try port.addTimer(5, &b, 60, .once);
     var seen: std.ArrayList(Seen) = .empty;
     defer seen.deinit(alloc);
-    try collect(&port, &seen, 300, std.math.maxInt(usize), 16);
+    // The replacement fires once and the cancelled 30ms timer must not. Stop
+    // at the first firing, then listen briefly for a stray second one (#45).
+    try collect(&port, &seen, liveness_ms, 1, 16);
     try std.testing.expectEqual(@as(usize, 1), seen.items.len);
     try std.testing.expect(seen.items[0].udata == @as(?*anyopaque, &b));
+    try collect(&port, &seen, 100, std.math.maxInt(usize), 16);
+    try std.testing.expectEqual(@as(usize, 1), seen.items.len);
 }
 
 test "timer: cancelling an unknown or expired id is a no-op" {
@@ -123,7 +134,7 @@ test "timer: cancelling an unknown or expired id is a no-op" {
     try addOrSkip(&port, 6, &a, 5, .once);
     var seen: std.ArrayList(Seen) = .empty;
     defer seen.deinit(alloc);
-    try collect(&port, &seen, 1000, 1, 16);
+    try collect(&port, &seen, liveness_ms, 1, 16);
     try std.testing.expectEqual(@as(usize, 1), seen.items.len);
     // Neither may surface later as an error event or a wait() error.
     port.cancelTimer(6);
@@ -145,7 +156,7 @@ test "timer: deadlines are delivered in order across waits" {
     }
     var seen: std.ArrayList(Seen) = .empty;
     defer seen.deinit(alloc);
-    try collect(&port, &seen, 3000, count, 16);
+    try collect(&port, &seen, liveness_ms, count, 16);
     try std.testing.expectEqual(@as(usize, count), seen.items.len);
     // Within one batch order is free; across batches every deadline in a
     // later batch is no earlier than every deadline in an earlier one.
@@ -177,7 +188,7 @@ test "timer: expirations beyond the event buffer wait for the next wait()" {
     compat.sleepNs(40 * std.time.ns_per_ms);
     var seen: std.ArrayList(Seen) = .empty;
     defer seen.deinit(alloc);
-    try collect(&port, &seen, 2000, count, 3);
+    try collect(&port, &seen, liveness_ms, count, 3);
     try std.testing.expectEqual(@as(usize, count), seen.items.len);
     var delivered: [count]bool = @splat(false);
     for (seen.items) |s| {
@@ -196,7 +207,26 @@ test "timer: zero delays" {
     try std.testing.expectError(error.InvalidArgument, port.addTimer(8, &a, 0, .repeat));
     var seen: std.ArrayList(Seen) = .empty;
     defer seen.deinit(alloc);
-    try collect(&port, &seen, 500, 1, 16);
+    try collect(&port, &seen, liveness_ms, 1, 16);
     try std.testing.expectEqual(@as(usize, 1), seen.items.len);
     try std.testing.expect(seen.items[0].udata == @as(?*anyopaque, &a));
+}
+
+test "timer: a deadline never fires early" {
+    var port = try born.EvPort.init(alloc);
+    defer port.deinit();
+    var a: u8 = 0;
+    const delay_ms: u32 = 80;
+    const armed = try compat.monotonicNs();
+    try addOrSkip(&port, 9, &a, delay_ms, .once);
+    var seen: std.ArrayList(Seen) = .empty;
+    defer seen.deinit(alloc);
+    try collect(&port, &seen, liveness_ms, 1, 16);
+    try std.testing.expectEqual(@as(usize, 1), seen.items.len);
+    // Harvest is at or after the kernel's firing, which is at or after the
+    // deadline armed no earlier than `armed`. Two milliseconds cover the
+    // kernel's millisecond rounding; scheduler load only delays harvest, it
+    // never advances the firing (#45).
+    const elapsed_ms = (try compat.monotonicNs() - armed) / std.time.ns_per_ms;
+    try std.testing.expect(elapsed_ms + 2 >= delay_ms);
 }
