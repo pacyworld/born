@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const compat = @import("src/compat.zig");
 
 pub const supported_targets = [_][]const u8{
@@ -12,6 +13,8 @@ pub const supported_targets = [_][]const u8{
 };
 
 pub fn build(b: *std.Build) void {
+    enforceIsolation(b);
+
     const readme = @embedFile("README.md");
     if (std.mem.count(u8, readme, "| `") != supported_targets.len)
         @panic("README platform table must match supported_targets");
@@ -44,9 +47,26 @@ pub fn build(b: *std.Build) void {
 
     const tests = b.addTest(.{ .name = "born-tests", .root_module = mod });
     const run_tests = b.addRunArtifact(tests);
-    b.step("test", "Run the event port tests").dependOn(&run_tests.step);
+    const test_step = b.step("test", "Run the event port tests");
+    test_step.dependOn(&run_tests.step);
     const install_tests = b.addInstallArtifact(tests, .{});
     b.step("test-bin", "Install the selected target's test executable without running it").dependOn(&install_tests.step);
+
+    // born.io: the std.Io compatibility shim over the event port, exported
+    // only where std.Io exists (Zig >= 0.16). On 0.15.2 this block is
+    // comptime-dead and the build graph is unchanged. The core never imports
+    // the shim; enforceIsolation gates that back edge on every toolchain.
+    if (builtin.zig_version.minor >= 16) {
+        const io_mod = b.addModule("born.io", .{
+            .root_source_file = b.path("src/io/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "born", .module = mod }},
+        });
+        linkPlatform(io_mod, target);
+        const io_tests = b.addTest(.{ .name = "born-io-tests", .root_module = io_mod });
+        test_step.dependOn(&b.addRunArtifact(io_tests).step);
+    }
 
     const docs_obj = b.addObject(.{
         .name = "born-docs",
@@ -98,6 +118,23 @@ pub fn build(b: *std.Build) void {
             .root_module = cross_mod,
         });
         check.dependOn(&cross.step);
+
+        // The shim is part of the claimed surface on Zig >= 0.16: prove it
+        // semantically compiles for every supported target too.
+        if (builtin.zig_version.minor >= 16) {
+            const cross_io_mod = b.createModule(.{
+                .root_source_file = b.path("src/io/root.zig"),
+                .target = cross_target,
+                .optimize = optimize,
+                .imports = &.{.{ .name = "born", .module = cross_mod }},
+            });
+            linkPlatform(cross_io_mod, cross_target);
+            const cross_io = b.addTest(.{
+                .name = b.fmt("born-io-{s}", .{triple}),
+                .root_module = cross_io_mod,
+            });
+            check.dependOn(&cross_io.step);
+        }
     }
 }
 
@@ -107,5 +144,51 @@ fn linkPlatform(mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
         mod.linkSystemLibrary("kernel32", .{});
     } else {
         mod.link_libc = true;
+    }
+}
+
+/// Back-edge isolation gate: the born.io shim (src/io/) imports the core, but
+/// no core source may reference std.Io or the shim. Runs at graph construction
+/// on every toolchain, so a violation fails the build itself, not just review.
+fn enforceIsolation(b: *std.Build) void {
+    if (builtin.zig_version.minor >= 16) {
+        const io = b.graph.io;
+        var src = std.Io.Dir.cwd().openDir(io, "src", .{ .iterate = true }) catch
+            @panic("isolation gate: cannot open src/");
+        defer src.close(io);
+        var walker = src.walk(b.allocator) catch @panic("isolation gate: cannot walk src/");
+        defer walker.deinit();
+        while (walker.next(io) catch @panic("isolation gate: cannot walk src/")) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+            if (std.mem.startsWith(u8, entry.path, "io/")) continue;
+            const text = src.readFileAlloc(io, entry.path, b.allocator, std.Io.Limit.limited(1 << 20)) catch
+                @panic("isolation gate: cannot read source file");
+            defer b.allocator.free(text);
+            scanCoreSource(entry.path, text);
+        }
+    } else {
+        var src = std.fs.cwd().openDir("src", .{ .iterate = true }) catch
+            @panic("isolation gate: cannot open src/");
+        defer src.close();
+        var walker = src.walk(b.allocator) catch @panic("isolation gate: cannot walk src/");
+        defer walker.deinit();
+        while (walker.next() catch @panic("isolation gate: cannot walk src/")) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.basename, ".zig")) continue;
+            if (std.mem.startsWith(u8, entry.path, "io/")) continue;
+            const text = src.readFileAlloc(b.allocator, entry.path, 1 << 20) catch
+                @panic("isolation gate: cannot read source file");
+            defer b.allocator.free(text);
+            scanCoreSource(entry.path, text);
+        }
+    }
+}
+
+fn scanCoreSource(path: []const u8, text: []const u8) void {
+    const needles = [_][]const u8{ "std.Io", "@import(\"io/", "@import(\"born.io\")" };
+    for (needles) |needle| {
+        if (std.mem.indexOf(u8, text, needle) != null)
+            std.debug.panic("isolation gate: src/{s} references {s}; the core must not import std.Io or the born.io shim", .{ path, needle });
     }
 }

@@ -31,7 +31,7 @@
 - Zig 0.15.2 `Build.Step.Compile` has no `emit_bin` field. An `addTest`
   step with no binary consumer emits `-fno-emit-bin` automatically;
   verified with `zig build check-targets --verbose`. Do not add an install,
-  run, or `getEmittedBin` consumer to these seven steps. This gate checks
+  run, or `getEmittedBin` consumer to these compile-only steps. This gate checks
   semantic compilation, not target linking or runtime behavior.
 - Build installable runtime tests without executing them on the build host:
   - `zig build test-bin -Dtarget=x86_64-linux-gnu -Doptimize=ReleaseSafe --prefix zig-out/linux --summary all`
@@ -39,6 +39,26 @@
   - Outputs: `zig-out/linux/bin/born-tests` and
     `zig-out/windows/bin/born-tests.exe`. Run each on its actual target OS;
     a successful cross-build is not runtime evidence.
+
+## born.io compatibility shim
+
+- `src/io/` is an isolated `std.Io` compatibility shim exported as the
+  `born.io` module only on Zig >= 0.16. On 0.15.2 the export block is
+  comptime-dead and the build graph is unchanged.
+- Dependency direction is one-way: the shim imports the `born` core; the core
+  never imports `std.Io` or `src/io/`. `enforceIsolation` in `build.zig` scans
+  every core source at graph construction on all three toolchains and fails
+  the build on a back edge. The CI fmt job also runs a visible grep gate.
+- On Zig >= 0.16, `build test` also runs `born-io-tests`, and `check-targets`
+  adds a `born-io-<triple>` semantic compile per target (14 steps total;
+  0.15.2 keeps 7). These are compile-only, like the core cross-target steps.
+- The foundation baseline forwards every vtable slot to `Io.Threaded` through
+  explicit thunks. It is composition and compatibility evidence only, not
+  evidence that any operation runs on Born's reactor. A requested Born
+  capability route that is not yet implemented is rejected at construction
+  with `error.CapabilityUnsupported`, never silently delegated.
+- Removal is `git rm -r src/io` plus the conditional export lines in
+  `build.zig`; nothing in the core depends on the shim.
 
 ## Runtime evidence
 
