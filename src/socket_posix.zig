@@ -122,6 +122,9 @@ pub const PlainNb = struct {
     /// socket(SOCK_NONBLOCK) + connect(). On success the fd is either in
     /// EINPROGRESS state or instantly connected (loopback): register write
     /// interest and confirm with `connectDone` on the first write event.
+    /// When every address fails, the last address error is returned
+    /// (SocketError for a failed socket creation, ConnectFailed for a
+    /// refused connect), like the Windows companion.
     pub fn startConnect(alloc: std.mem.Allocator, host: []const u8, port: u16) io.ConnectError!PlainNb {
         const addr_list = compat.getAddressList(alloc, host, port) catch |err| return switch (err) {
             error.OutOfMemory => io.ConnectError.OutOfMemory,
@@ -130,10 +133,14 @@ pub const PlainNb = struct {
         defer addr_list.deinit();
         if (addr_list.addrs.len == 0) return io.ConnectError.ConnectFailed;
 
+        var last_err: io.ConnectError = error.ConnectFailed;
         for (addr_list.addrs) |addr| {
-            return connectAddr(addr) catch continue;
+            return connectAddr(addr) catch |err| {
+                last_err = err;
+                continue;
+            };
         }
-        return io.ConnectError.ConnectFailed;
+        return last_err;
     }
 
     /// Confirm the connect after the first write event (SO_ERROR).
