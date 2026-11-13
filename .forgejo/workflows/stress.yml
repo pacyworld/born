@@ -22,8 +22,8 @@ env:
   RUNS: ${{ github.event.inputs.runs || '500' }}
   HOGS: ${{ github.event.inputs.hogs || '' }}
   # Pacy World Root CA, the root of the pacyworld.dev chain. The artifact
-  # actions run under Node, which neither reads the runner02 Windows store
-  # nor finds this root in the runner03 container, so the runtime jobs hand
+  # actions run under Node, which neither reads the Windows runner's store
+  # nor finds this root in the Linux container, so the runtime jobs hand
   # it to Node through NODE_EXTRA_CA_CERTS after checking its fingerprint.
   PACYWORLD_ROOT_CA_SHA256: F6:56:80:C5:A0:CC:7C:AC:7E:73:CA:3C:FA:45:3E:7E:81:D9:59:40:0C:92:3B:AA:EA:F9:9D:CF:F4:0D:28:A8
   PACYWORLD_ROOT_CA: |
@@ -65,13 +65,13 @@ env:
   ZIG_0152_SHA256: 5509ff57cd3f219165caed0da10221739af82742b9edfcda3f7bfaf4da7212dd
 
 jobs:
-  # runner01 builds both test executables (native FreeBSD and cross Linux) at
-  # ReleaseSafe with Zig 0.15.2 and stages bench/stress.sh beside each so the
-  # runtime jobs need no checkout. The stress gate pins one toolchain: it
+  # The FreeBSD runner builds both test executables (native FreeBSD and cross
+  # Linux) at ReleaseSafe with Zig 0.15.2 and stages bench/stress.sh beside each
+  # so the runtime jobs need no checkout. The stress gate pins one toolchain: it
   # exercises runtime scheduling, not toolchain codegen (ci.yml owns the
   # tri-toolchain matrix).
   build:
-    name: Build stress executables (runner01, zig 0.15.2)
+    name: Build stress executables (FreeBSD, zig 0.15.2)
     runs-on: FreeBSD
     timeout-minutes: 30
     steps:
@@ -129,10 +129,11 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # runner01 (FreeBSD, kqueue): the listener exhaustion-resume race and the
-  # timer cases run here. runner01 trusts the Pacy World root, so no CA step.
+  # FreeBSD runner (kqueue): the listener exhaustion-resume race and the
+  # timer cases run here. The FreeBSD runner trusts the Pacy World root, so no
+  # CA step.
   stress-freebsd:
-    name: Stress FreeBSD (runner01, kqueue)
+    name: Stress FreeBSD (kqueue)
     runs-on: FreeBSD
     needs: build
     timeout-minutes: 150
@@ -152,10 +153,11 @@ jobs:
           echo "host: $(uname -srm), commit $GITHUB_SHA, runs=$RUNS hogs=${HOGS:-auto}"
           STRESS_LABEL="x86_64-freebsd, kqueue, zig 0.15.2, ReleaseSafe" sh stress.sh ./born-tests "$RUNS" "$HOGS"
 
-  # runner03 (Ubuntu 24.04, epoll): the same cases on Linux. The container has
-  # no Zig and no checkout; the bundle carries stress.sh. Node needs the root.
+  # Linux runner (Ubuntu 24.04, epoll): the same cases on Linux. The container
+  # has no Zig and no checkout; the bundle carries stress.sh. Node needs the
+  # root.
   stress-linux:
-    name: Stress Linux (runner03, epoll)
+    name: Stress Linux (epoll)
     runs-on: ubuntu-24.04
     container: node:24-bookworm
     needs: build
