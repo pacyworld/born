@@ -2,14 +2,14 @@
 
 ## Toolchain and checks
 
-- Support Zig **0.15.2**, **0.16.0**, and **0.17.1**. On
-  freebsd-dev1.morante.com (FreeBSD 15.1 amd64), use `zig`, `zig016`, and
-  `zig0171`. The side-by-side installations live under `/opt/zig-*`.
+- Support Zig **0.15.2**, **0.16.0**, and **0.17.1**. The three compilers are
+  installed side by side; the gate commands below name the selected one as
+  `<toolchain>`. Local command names and install paths are in `AGENTS.local.md`.
 - Keep unavoidable toolchain dispatch and native ABI replacements in
   `src/compat.zig`. Core code must not import `std.Io`; use the named `compat`
   module supplied by `build.zig`.
-- Run shell/build commands asynchronously; this workstation is FreeBSD,
-  not Linux. Check the current branch and working tree before editing.
+- Run shell/build commands asynchronously. Check the current branch and working
+  tree before editing.
 - Run `zig fmt` and `zig fmt --check` only with Zig 0.15.2. The 0.17.1
   formatter rewrites `@intFromEnum` and `@enumFromInt` to builtins unavailable
   in 0.15.2. P4 keeps one 0.15.2 formatting gate, not an fmt matrix. If a later
@@ -42,23 +42,33 @@
 
 ## Runtime evidence
 
-Every epoll or IOCP change needs a run of `born-tests` on Linux or Windows,
-and kqueue changes a run on FreeBSD. CI produces all three on every push
-and pull request; the manual hosts below are the fallback.
+Every backend change needs a run of `born-tests` on its actual OS: epoll on
+Linux, IOCP on Windows, EVFILT_USER kqueue on FreeBSD or macOS, and pipe-wake
+kqueue or the `__kevent50` ABI on NetBSD. A successful cross-build is not
+runtime evidence. CI produces the FreeBSD, Linux and Windows runs on every
+push and pull request; manual hosts are the fallback for a backend CI lacks
+(`AGENTS.local.md`). Record the OS version, commit, executable sha256 and the
+test summary line in the pull request.
+
+### Target coverage
+
+- **Runtime in CI:** FreeBSD, Linux, Windows.
+- **Runtime on manual hosts:** aarch64-macos, NetBSD.
+- **Compile-only:** x86_64-macos, x86_64-openbsd.
 
 ### CI (`.forgejo/workflows/ci.yml`)
 
-Per-commit CI runs a toolchain matrix over Zig 0.15.2, 0.16.0, and 0.17.1.
-runner01 provisions each toolchain from the official ziglang.org FreeBSD
+Per-commit CI runs a toolchain matrix over Zig 0.15.2, 0.16.0, and 0.17.1. The
+FreeBSD runner provisions each toolchain from the official ziglang.org FreeBSD
 tarball, verified against a pinned SHA-256 and cached under
-`~/.cache/born-zig/<version>`; runner02/runner03 need no Zig.
+`~/.cache/born-zig/<version>`; the Linux and Windows runners need no Zig.
 
-| Job | Runner (`runs-on`) | What it does |
+| Job | Runner role (`runs-on`) | What it does |
 |---|---|---|
-| `fmt` | runner01, FreeBSD 15 (`FreeBSD`) | The single Zig 0.15.2 `zig fmt --check .` gate plus README/AGENTS version-and-target presence (versions, `zig016`/`zig0171`, seven target names); `build.zig` carries the real target-table row guard. No fmt matrix |
-| `build` | runner01, FreeBSD 15 (`FreeBSD`) | Matrix `zig: [0.15.2, 0.16.0, 0.17.1]`, `max-parallel: 1`; native Debug and ReleaseSafe tests (kqueue); `check-targets`; API docs; cross-builds both `born-tests` executables in Debug and ReleaseSafe and uploads each with its sha256 |
-| `linux-runtime` | runner03, Ubuntu 24.04 (`ubuntu-24.04`) | Matrix `zig × optimize`; runs the Linux executable in a `node:24-bookworm` container on the runner's kernel (epoll) |
-| `windows-runtime` | runner02, Windows Server 2022 (`windows-2022`) | Matrix `zig × optimize`; runs `born-tests.exe` on the host (IOCP) |
+| `fmt` | FreeBSD (`FreeBSD`) | The single Zig 0.15.2 `zig fmt --check .` gate plus README/AGENTS version-and-target presence (three versions, seven target names); `build.zig` carries the real target-table row guard. No fmt matrix |
+| `build` | FreeBSD (`FreeBSD`) | Matrix `zig: [0.15.2, 0.16.0, 0.17.1]`, `max-parallel: 1`; native Debug and ReleaseSafe tests (kqueue); `check-targets`; API docs; cross-builds both `born-tests` executables in Debug and ReleaseSafe and uploads each with its sha256 |
+| `linux-runtime` | Linux (`ubuntu-24.04`) | Matrix `zig × optimize`; runs the Linux executable in a `node:24-bookworm` container on the runner's kernel (epoll) |
+| `windows-runtime` | Windows (`windows-2022`) | Matrix `zig × optimize`; runs `born-tests.exe` on the host (IOCP) |
 
 - The runtime jobs need no Zig. Each checks the executable's sha256
   against the build, prints the host kernel or OS version and the commit,
@@ -77,16 +87,6 @@ tarball, verified against a pinned SHA-256 and cached under
 - Artifacts use `https://code.forgejo.org/forgejo/upload-artifact@v4` and
   `download-artifact@v4`. GitHub's `actions/upload-artifact@v4` refuses
   this Forgejo (16.0.5) as GHES; `@v3` works but runs on a retired Node.
-- pacyworld.dev chains to the private Pacy World Root CA. Node trusts it
-  on runner01, but not on runner02 (Node ignores the Windows store, which
-  does trust it) or in the runner03 container. The workflow carries the
-  root PEM and its SHA-256 fingerprint and gives it to Node through
-  `NODE_EXTRA_CA_CERTS`.
-- runner02 has Node 24, `curl.exe`, `git` and `tar`, and its default
-  shell is Windows PowerShell 5.1. Run native executables through
-  `cmd /c "... > log 2>&1"` so their stderr does not become PowerShell
-  errors. Downloads from public hosts need `curl.exe --ssl-no-revoke` and
-  a pinned sha256.
 
 To cite CI evidence, link the job: `https://pacyworld.dev/pacyworld/born/actions/runs/<run number>`
 (the number shown in the web UI, not the API id), with its summary line.
@@ -94,63 +94,33 @@ To cite CI evidence, link the job: `https://pacyworld.dev/pacyworld/born/actions
 ### Scheduled gates (`.forgejo/workflows/stress.yml`, `bench.yml`)
 
 These run weekly and on `workflow_dispatch`, never on push/PR, so they do not
-gate a commit. Both pin Zig 0.15.2 on runner01.
+gate a commit. Both pin Zig 0.15.2 on the FreeBSD runner.
 
 - **Stress (#45 repro shape):** `bench/stress.sh BIN RUNS [HOGS]` runs the suite
-  RUNS times (default 500) with HOGS CPU busy-loops beside it, on FreeBSD
-  (runner01) and Linux (runner03). HOGS defaults to `ncpu + ncpu/2` (~1.5x the
-  core count, #45's original load ratio) derived per host; pass HOGS via
-  dispatch to override. It records `vm.loadavg` (`/proc/loadavg` on Linux) at
-  the start, each 50-run progress line, and the end. Any failure is a release
-  blocker. It targets the listener exhaustion-resume race and `timer_test`
-  under load.
+  RUNS times (default 500) with HOGS CPU busy-loops beside it, on FreeBSD and
+  Linux. HOGS defaults to `ncpu + ncpu/2` (~1.5x the core count, #45's original
+  load ratio) derived per host; pass HOGS via dispatch to override. It records
+  `vm.loadavg` (`/proc/loadavg` on Linux) at the start, each 50-run progress
+  line, and the end. Any failure is a release blocker. It targets the listener
+  exhaustion-resume race and `timer_test` under load.
 - **Benchmark regression (#31):** `bench.yml` runs `bench/suite.sh` with
-  `SYSCALLS=truss` on a quiet runner01, then `bench/regress.sh` compares the
-  median syscalls/req and p50/p99 latency against `bench/thresholds.txt`.
+  `SYSCALLS=truss` on a quiet FreeBSD runner, then `bench/regress.sh` compares
+  the median syscalls/req and p50/p99 latency against `bench/thresholds.txt`.
   `bench/quiet.sh` guards acceptance: 1-min loadavg ≤ 0.5·ncpu, ip netisr queue
   Len 0 and no QDrops advance over 3 s. A busy host fails the guard rather than
   yielding an accepted measurement. Results upload as an artifact; recording
   them in `bench/RESULTS.md` is a per-release step.
-
-runner01 is shared between the per-commit matrix and these gates. A stress run
-loads it with ~1.5x ncpu busy-loops for roughly 100 minutes (500 FreeBSD runs),
-so CI results on runner01 during a stress window are under load: treat
-latency-sensitive numbers from that window as noisy, and re-run on a quiet host
-before accepting them. The Sunday 04:00 stress schedule (bench at 06:00, after
-the expected end) keeps the overlap rare, but a manual dispatch can still
-coincide with a push.
-
-### Manual hosts
-
-Use these when a runner is down or a change needs a host CI lacks. Build
-on freebsd-dev1 with the `test-bin` commands above, then:
-
-- **Linux:** ubuntu-desktop (Ubuntu 26.04.1 on vSphere, always up):
-  ```
-  scp zig-out/linux/bin/born-tests ubuntu-desktop:/tmp/born-tests
-  ssh ubuntu-desktop 'uname -srm; /tmp/born-tests'
-  ```
-  The Fedora 44 VM (192.168.0.89) is a second Linux host, available only
-  while Daniel's desktop VMs run.
-- **Windows:** win11-dev (Windows 11, build 26100; PowerShell login shell):
-  ```
-  scp zig-out/windows/bin/born-tests.exe win11-dev:born-tests.exe
-  ssh win11-dev 'cmd /c "born-tests.exe > born-tests.log 2>&1"; "rc=$LASTEXITCODE"; Get-Content born-tests.log'
-  ```
-- **macOS (Apple Silicon):** macinotsh-desktop, Zig at
-  `/usr/local/bin/zig`; build and run natively there. `x86_64-macos` stays
-  compile-only.
-
-Paste the host, OS version, commit, sha256 of the executable and the
-summary line into the pull request.
 
 ### README results table
 
 The README's "Runtime evidence" table records the last run per backend and
 primitive: backend, primitive, run, date, commit. Only runs that happened
 on that OS go in it. When a primitive's contract tests stop skipping, add
-its run in the same pull request. Cells must not start with a backtick:
-`build.zig` counts `| ` followed by a backtick to check the target table.
+its run in the same pull request. Describe each host by OS, version and role
+(for example `kqueue, macOS 26.1 arm64 (manual host)` or `epoll, Linux 6.8
+(CI Linux runner, Ubuntu 24.04)`), never by hostname. Cells must not start
+with a backtick: `build.zig` counts `| ` followed by a backtick to check the
+target table.
 
 ## Invariants
 
@@ -169,3 +139,5 @@ its run in the same pull request. Cells must not start with a backtick:
   not make pending completion storage safe to free.
 - Preserve existing comments and scope changes to the requested work.
   Do not claim runtime support on an OS without an actual test run there.
+
+Maintainers: environment-specific hosts and commands live in AGENTS.local.md (not tracked). Read it if present.

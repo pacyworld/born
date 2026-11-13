@@ -12,11 +12,11 @@
 # Syscalls/req is deterministic on the calibration host (run-to-run spread
 # < 0.01), so its bound sits roughly 0.5-0.9 above the measured median: a
 # regression of about one syscall per request trips it. This catches losing an
-# adopted optimization (echo1 3.009 -> ~4 without readiness counts). wake is the
-# exception on a small host: on runner01 (6 CPUs, server and clients pinned to
-# CPUs 0-5) wake coalescing varies (run 156: median 4.845, reps 4.554-5.044,
-# spread 0.49), so its bound is 5.6 for headroom rather than ~5.0; losing
-# EVFILT_USER still puts wake at ~8 back on the pipe and trips it.
+# adopted optimization (echo1 3.009 -> ~4 without readiness counts). wake is
+# the exception on a small host: on the FreeBSD CI runner (6 CPUs, server and
+# clients pinned to CPUs 0-5) wake coalescing varies (run 156: median 4.845,
+# reps 4.554-5.044, spread 0.49), so its bound is 5.6 for headroom rather than
+# ~5.0; losing EVFILT_USER still puts wake at ~8 back on the pipe and trips it.
 # Latency is noisy on the shared host, so its bound is roughly 2x the measured
 # median: a coarse guard against gross regressions, not run-to-run noise.
 # Accept results only from a quiet host (bench/quiet.sh).

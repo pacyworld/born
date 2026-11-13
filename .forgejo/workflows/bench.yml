@@ -1,10 +1,11 @@
 name: Bench
 # #31 benchmark regression gate: run the kqueue hot-path suite on a quiet
-# runner01 and fail on a syscall/latency regression against bench/thresholds.txt.
-# Schedule/dispatch only, so it never gates a push or pull request. Results are
-# uploaded as an artifact, not committed; recording them in bench/RESULTS.md is
-# a per-release step. A busy host fails the quiet guard rather than yielding an
-# accepted measurement (re-run via dispatch when the host is quiet).
+# FreeBSD runner and fail on a syscall/latency regression against
+# bench/thresholds.txt. Schedule/dispatch only, so it never gates a push or pull
+# request. Results are uploaded as an artifact, not committed; recording them in
+# bench/RESULTS.md is a per-release step. A busy host fails the quiet guard
+# rather than yielding an accepted measurement (re-run via dispatch when the
+# host is quiet).
 on:
   schedule:
     - cron: '0 6 * * 0'
@@ -21,7 +22,7 @@ env:
 
 jobs:
   bench:
-    name: Benchmark regression (runner01, kqueue, zig 0.15.2)
+    name: Benchmark regression (FreeBSD, kqueue, zig 0.15.2)
     runs-on: FreeBSD
     timeout-minutes: 40
     steps:
@@ -59,7 +60,7 @@ jobs:
         run: |
           set -eu
           ncpu=$(sysctl -n hw.ncpu)
-          echo "runner01 ncpu=$ncpu"
+          echo "ncpu=$ncpu"
           if [ "$ncpu" -ge 12 ]; then
             echo "SRV_CPUS=2" >> "$GITHUB_ENV"
             echo "CLI_CPUS=4-11" >> "$GITHUB_ENV"

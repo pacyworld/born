@@ -5,8 +5,8 @@ on:
 
 env:
   # Pacy World Root CA, the root of the pacyworld.dev chain. The artifact
-  # actions run under Node, which neither reads the runner02 Windows store
-  # nor finds this root in the runner03 container, so the runtime jobs hand
+  # actions run under Node, which neither reads the Windows runner's store
+  # nor finds this root in the Linux container, so the runtime jobs hand
   # it to Node through NODE_EXTRA_CA_CERTS after checking its fingerprint.
   PACYWORLD_ROOT_CA_SHA256: F6:56:80:C5:A0:CC:7C:AC:7E:73:CA:3C:FA:45:3E:7E:81:D9:59:40:0C:92:3B:AA:EA:F9:9D:CF:F4:0D:28:A8
   PACYWORLD_ROOT_CA: |
@@ -46,8 +46,9 @@ env:
     3NDrfSHlK+Nk91FpLogS9g==
     -----END CERTIFICATE-----
   # Official ziglang.org x86_64-freebsd tarball SHA-256 pins (download
-  # index.json). runner01 does all building, so only FreeBSD tarballs are
-  # provisioned; runner02/runner03 only run the cross-built executables.
+  # index.json). The FreeBSD runner does all building, so only FreeBSD
+  # tarballs are provisioned; the Linux and Windows runners only run the
+  # cross-built executables.
   ZIG_0152_SHA256: 5509ff57cd3f219165caed0da10221739af82742b9edfcda3f7bfaf4da7212dd
   ZIG_0160_SHA256: 390379bfaf6b89b001c6bb4035b8fcbc5c12193fd9fd5048c3a0fe39e5d1cf72
   ZIG_0171_SHA256: fd8b9728f05db2a9942fc1f18087c0e0d6dfccb7a51557b06cf026d3e4c78542
@@ -56,10 +57,11 @@ jobs:
   # Exactly one formatting gate, pinned to Zig 0.15.2. The 0.17.1 formatter
   # rewrites @intFromEnum/@enumFromInt to builtins unavailable in 0.15.2, so
   # there is deliberately no fmt matrix (AGENTS.md). This job also carries a
-  # README/AGENTS string-presence check; build.zig's embedded README
-  # target-table guard (the real row-count check) runs in every build leg below.
+  # README/AGENTS version-and-target presence check (three Zig versions, seven
+  # target triples); build.zig's embedded README target-table guard (the real
+  # row-count check) runs in every build leg below.
   fmt:
-    name: Formatting + presence (runner01, 0.15.2)
+    name: Formatting + presence (FreeBSD, 0.15.2)
     runs-on: FreeBSD
     timeout-minutes: 10
     steps:
@@ -82,20 +84,18 @@ jobs:
             grep -q "$v" README.md
             grep -q "$v" AGENTS.md
           done
-          grep -q 'zig016' AGENTS.md
-          grep -q 'zig0171' AGENTS.md
           for t in x86_64-freebsd x86_64-linux-gnu aarch64-macos x86_64-macos x86_64-windows-gnu x86_64-netbsd x86_64-openbsd; do
             grep -q "$t" README.md
           done
           echo "README/AGENTS presence: OK"
 
-  # runner01 (FreeBSD): one leg per toolchain. Each leg runs the native kqueue
+  # FreeBSD runner: one leg per toolchain. Each leg runs the native kqueue
   # suite (Debug and ReleaseSafe), the seven-target compile gate, the API doc
   # build, and cross-builds the Linux and Windows test executables (Debug and
   # ReleaseSafe) for the runtime jobs below. max-parallel keeps the legs
   # sequential on the shared host so they do not contend for CPU or loopback.
   build:
-    name: FreeBSD tests + cross-builds (runner01, zig ${{ matrix.zig }})
+    name: FreeBSD tests + cross-builds (zig ${{ matrix.zig }})
     runs-on: FreeBSD
     timeout-minutes: 30
     strategy:
@@ -217,11 +217,11 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # runner03 (Ubuntu 24.04): epoll runtime tests, one leg per toolchain and
+  # Linux runner (Ubuntu 24.04): epoll runtime tests, one leg per toolchain and
   # optimize mode. The job container shares the runner's kernel, so the
   # syscalls under test are real Linux ones. No Zig is needed here.
   linux-runtime:
-    name: Linux runtime (runner03, zig ${{ matrix.zig }}, ${{ matrix.optimize }})
+    name: Linux runtime (zig ${{ matrix.zig }}, ${{ matrix.optimize }})
     runs-on: ubuntu-24.04
     container: node:24-bookworm
     needs: build
@@ -254,10 +254,10 @@ jobs:
           summary=$(grep -E '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$' born-tests.log) || { echo "born-tests printed no passing summary line"; exit 1; }
           echo "runtime evidence (x86_64-linux-gnu, epoll, zig ${{ matrix.zig }}, ${{ matrix.optimize }}): $summary"
 
-  # runner02 (Windows Server 2022, host mode): IOCP runtime tests, one leg per
-  # toolchain and optimize mode. No Zig is needed here.
+  # Windows runner (Windows Server 2022, host mode): IOCP runtime tests, one leg
+  # per toolchain and optimize mode. No Zig is needed here.
   windows-runtime:
-    name: Windows runtime (runner02, zig ${{ matrix.zig }}, ${{ matrix.optimize }})
+    name: Windows runtime (zig ${{ matrix.zig }}, ${{ matrix.optimize }})
     runs-on: windows-2022
     needs: build
     timeout-minutes: 15
