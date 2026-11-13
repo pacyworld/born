@@ -26,7 +26,8 @@
 //!   `Event.err` and `Event.err_no`, and stashes allocation failures for the
 //!   same deferred channel. IOCP post and wake failures use that channel too.
 //!   kqueue bounds each submission to the eventlist capacity, as documented
-//!   in docs/kqueue.md.
+//!   in docs/kqueue.md. `EvPort.init` itself fails when its wake source
+//!   cannot be registered, releasing everything it allocated.
 //! - Regular files are portable readiness sources. kqueue reports them ready
 //!   natively, and epoll emulates that with always-ready pseudo registrations.
 //! - Process exits from `EvPort.watchProcess` arrive as `Event.exited` and

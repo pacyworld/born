@@ -131,6 +131,8 @@ pub const EvPort = struct {
     processes: process_epoll.State = .{},
 
     /// Create an epoll instance and eventfd, using `alloc` for port bookkeeping.
+    /// The wake registration is part of init: if it fails, init fails with
+    /// everything released instead of returning a port without a wake source.
     pub fn init(alloc: std.mem.Allocator) InitError!EvPort {
         // Raw linux syscalls do not set libc errno; decode the return value
         // itself. std.posix.errno() would read libc's thread-local errno in
@@ -153,6 +155,13 @@ pub const EvPort = struct {
             .signals = signal_epoll.State.init(alloc),
         };
         self.register(wfd, true, false, @as(?*anyopaque, &wake_sentinel));
+        if (self.pending_error != null) {
+            // The wake source is unregistered: a port without reliable
+            // cross-thread wakeup must not escape init. Free the bookkeeping;
+            // the errdefers close ep and wfd.
+            self.fds.deinit(alloc);
+            return InitError.InitFailed;
+        }
         return self;
     }
 
@@ -778,18 +787,69 @@ test "epoll: CTL_MOD ENOENT drops stale bookkeeping and re-adds the reused fd" {
     try std.testing.expect(events[0].udata == @as(?*anyopaque, &tag2));
 }
 
-test "epoll: allocation failure is reported by the next wait, once" {
-    // fail_index 0 lands inside init's wake-fd registration: the port
-    // constructs, but the bookkeeping slot never gets reserved.
+test "epoll: init fails when the wake registration cannot allocate" {
+    // fail_index 0 lands inside init's wake-fd registration. Init must
+    // fail, not construct a port whose wake source is unregistered.
+    const before = try openFdCount();
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    var evp = try EvPort.init(failing.allocator());
+    try std.testing.expectError(Error.InitFailed, EvPort.init(failing.allocator()));
+    // Complete cleanup: no leaked bookkeeping, no leaked descriptors.
+    try std.testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
+    try std.testing.expectEqual(before, try openFdCount());
+
+    // A retry constructs a working port whose wake delivers an event.
+    var evp = try EvPort.init(std.testing.allocator);
     defer evp.deinit();
-    try std.testing.expect(!evp.fds.contains(evp.wake_fd));
+    try std.testing.expect(evp.fds.contains(evp.wake_fd));
+    evp.wake();
+    var events: [1]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));
+    try std.testing.expect(events[0].wake);
+}
+
+test "epoll: allocation failure after init is reported by the next wait, once" {
+    var evp = try EvPort.init(std.testing.allocator);
+    defer evp.deinit();
+    try std.testing.expect(evp.fds.contains(evp.wake_fd));
+    // Force the next registration to allocate: drop the map buffer and
+    // switch to an allocator that fails on its first allocation. The
+    // kernel wake registration stays live; only bookkeeping is dropped.
+    evp.fds.clearAndFree(evp.alloc);
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    evp.alloc = failing.allocator();
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(compat.AF.UNIX, compat.SOCK.STREAM | compat.SOCK.NONBLOCK | compat.SOCK.CLOEXEC, 0, &fds));
+    defer compat.close(fds[0]);
+    defer compat.close(fds[1]);
+    evp.monitorRead(fds[0], null);
+    try std.testing.expect(!evp.fds.contains(fds[0]));
     var empty: [0]Event = .{};
     try std.testing.expectEqual(@as(usize, 0), try evp.wait(&empty, null));
     var events: [1]Event = undefined;
     try std.testing.expectError(Error.OutOfMemory, evp.wait(&events, 0));
     try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
+}
+
+/// Open descriptor count via /proc/self/fd, for init-cleanup assertions.
+fn openFdCount() error{FdCountFailed}!usize {
+    const rc = linux.open("/proc/self/fd", .{ .DIRECTORY = true, .CLOEXEC = true }, 0);
+    if (compat.linuxErrno(rc) != .SUCCESS) return error.FdCountFailed;
+    const dir: i32 = @intCast(rc);
+    defer compat.close(dir);
+    var buf: [4096]u8 align(@alignOf(linux.dirent64)) = undefined;
+    var count: usize = 0;
+    while (true) {
+        const n_rc = linux.getdents64(dir, &buf, buf.len);
+        if (compat.linuxErrno(n_rc) != .SUCCESS) return error.FdCountFailed;
+        const n: usize = @intCast(n_rc);
+        if (n == 0) return count;
+        var off: usize = 0;
+        while (off < n) {
+            const dent: *const linux.dirent64 = @ptrCast(@alignCast(&buf[off]));
+            off += dent.reclen;
+            count += 1;
+        }
+    }
 }
 
 test "epoll: non-blocking connect completes via write interest" {
