@@ -157,9 +157,11 @@ kqueue and NTSTATUS on IOCP, not a portable error enumeration.
 Each `EvPort` operation returns its own error set: `born.InitError` from
 `init`, `born.WaitError` from `wait`, `born.TimerError` from timer calls,
 `born.SignalError` from signal calls, and `born.ProcessError` from
-`watchProcess`. `born.Error` is their union. `wait` reports only loop
-failures (including stashed registration failures), never a refused timer,
-signal, or process watch.
+`watchProcess`. `born.Error` is their union. `born.InitError` is the same
+on every backend: `SystemResources` when the kernel refuses the port or its
+wake source, and `OutOfMemory` when port bookkeeping cannot be allocated.
+`wait` reports only loop failures (including stashed registration failures),
+never a refused timer, signal, or process watch.
 
 `wake()` may be called from another thread and produces `Event{ .wake = true }`.
 POSIX wakeups coalesce; IOCP queues one completion per post. All other event-port

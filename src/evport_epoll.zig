@@ -48,7 +48,9 @@ pub const Event = types.Event;
 pub const Signal = types.Signal;
 pub const TimerMode = types.TimerMode;
 
-pub const InitError = error{InitFailed};
+/// SystemResources: the epoll set, the eventfd, or its CTL_ADD was refused.
+/// OutOfMemory: the wake registration's bookkeeping could not be allocated.
+pub const InitError = types.InitError;
 /// RegisterFailed and OutOfMemory are stashed registration failures;
 /// SourceFailed is an internal source (timerfd, signalfd, the process set)
 /// that could not be harvested or re-armed.
@@ -138,12 +140,12 @@ pub const EvPort = struct {
         // itself. std.posix.errno() would read libc's thread-local errno in
         // this libc-linked binary and report SUCCESS for failed syscalls.
         const ep_rc = linux.epoll_create1(linux.EPOLL.CLOEXEC);
-        if (compat.linuxErrno(ep_rc) != .SUCCESS) return InitError.InitFailed;
+        if (compat.linuxErrno(ep_rc) != .SUCCESS) return InitError.SystemResources;
         const ep: i32 = @intCast(ep_rc);
         errdefer compat.close(ep);
 
         const wfd_rc = linux.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
-        if (compat.linuxErrno(wfd_rc) != .SUCCESS) return InitError.InitFailed;
+        if (compat.linuxErrno(wfd_rc) != .SUCCESS) return InitError.SystemResources;
         const wfd: i32 = @intCast(wfd_rc);
         errdefer compat.close(wfd);
 
@@ -155,12 +157,12 @@ pub const EvPort = struct {
             .signals = signal_epoll.State.init(alloc),
         };
         self.register(wfd, true, false, @as(?*anyopaque, &wake_sentinel));
-        if (self.pending_error != null) {
+        if (self.pending_error) |err| {
             // The wake source is unregistered: a port without reliable
             // cross-thread wakeup must not escape init. Free the bookkeeping;
             // the errdefers close ep and wfd.
             self.fds.deinit(alloc);
-            return InitError.InitFailed;
+            return if (err == WaitError.OutOfMemory) InitError.OutOfMemory else InitError.SystemResources;
         }
         return self;
     }
@@ -792,7 +794,7 @@ test "epoll: init fails when the wake registration cannot allocate" {
     // fail, not construct a port whose wake source is unregistered.
     const before = try openFdCount();
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    try std.testing.expectError(Error.InitFailed, EvPort.init(failing.allocator()));
+    try std.testing.expectError(Error.OutOfMemory, EvPort.init(failing.allocator()));
     // Complete cleanup: no leaked bookkeeping, no leaked descriptors.
     try std.testing.expectEqual(@as(usize, 0), failing.allocated_bytes);
     try std.testing.expectEqual(before, try openFdCount());

@@ -84,7 +84,7 @@ FreeBSD and macOS use an `EVFILT_USER` knote for cross-thread wakeups.
 NetBSD and OpenBSD use a non-blocking pipe because they lack `EVFILT_USER`.
 POSIX wakeups coalesce, and `Event.wake` identifies the resulting event.
 Wake registration is part of `EvPort.init`: a refused `EVFILT_USER` add
-fails init with `error.KqueueFailed`, and a pipe registration that cannot
+fails init with `error.SystemResources`, and a pipe registration that cannot
 be staged fails init with `error.OutOfMemory`. Init releases the kqueue,
 any pipe ends, and all bookkeeping on failure, so a constructed port always
 has a working wake source.
