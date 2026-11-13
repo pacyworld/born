@@ -18,7 +18,9 @@
 //! the first wait is not lost. wake triggers it with NOTE_TRIGGER through a
 //! kevent call with no eventlist; triggers coalesce into one event. NetBSD and
 //! OpenBSD use a nonblocking pipe instead: wake writes one byte and wait drains
-//! the pipe to one event. EVFILT_SIGNAL is not a wake channel.
+//! the pipe to one event. A refused wake write or drain, or a wake pipe
+//! at EOF, is reported by the next non-empty wait on both wake channels.
+//! EVFILT_SIGNAL is not a wake channel.
 //!
 //! Closing a descriptor removes its live filters. At the end-of-batch reap
 //! point, callers use purgeFd before close so staged entries cannot apply to
@@ -122,8 +124,10 @@ pub const EvPort = struct {
     /// Wake pipe ends; -1 where EVFILT_USER does the waking.
     wake_r: c_int = -1,
     wake_w: c_int = -1,
-    /// Set by a wake() whose trigger the kernel refused; the next
-    /// non-empty wait() reports it as WaitFailed. EVFILT_USER targets only.
+    /// Set by a wake() the kernel refused (EVFILT_USER trigger or pipe
+    /// write) or by a pipe-wake drain that failed or hit EOF; the next
+    /// non-empty wait() reports it as WaitFailed. Atomic because wake()
+    /// runs on any thread.
     wake_failed: std.atomic.Value(bool) = .init(false),
     /// fds with write interest currently registered (staged or live).
     /// Deduplicates wantWrite/cancelWrite across the one-shot lifecycle:
@@ -277,7 +281,10 @@ pub const EvPort = struct {
 
     /// Wake a wait() blocked in another thread. Non-blocking; wakes that
     /// land before the loop runs coalesce into one event. EVFILT_USER: a
-    /// refused trigger is reported by the next non-empty wait().
+    /// refused trigger is reported by the next non-empty wait(). Pipe: INTR
+    /// is retried inside compat.write, a full pipe (WouldBlock) is benign
+    /// because a wakeup is already pending, and any other refusal is
+    /// reported by the next non-empty wait().
     pub fn wake(self: *EvPort) void {
         if (have_user) {
             var kev = change(wake_ident, EVFILT_USER, 0, &wake_sentinel);
@@ -285,7 +292,10 @@ pub const EvPort = struct {
             kevent1(self.kq, &kev) catch self.wake_failed.store(true, .release);
         } else {
             const b = [1]u8{1};
-            _ = std.c.write(self.wake_w, &b, 1);
+            _ = compat.write(self.wake_w, &b) catch |err| switch (err) {
+                error.WouldBlock => {},
+                else => self.wake_failed.store(true, .release),
+            };
         }
     }
 
@@ -352,8 +362,8 @@ pub const EvPort = struct {
     /// arrive. Earlier records are returned first; the next wait continues
     /// with any remaining changes. `timeout_ms` must be null or nonnegative.
     /// null blocks until an event, zero harvests without blocking, and
-    /// positive values wait that many milliseconds. A stashed allocation
-    /// failure is reported here once, ahead of the syscall. An empty wait
+    /// positive values wait that many milliseconds. A stashed allocation or
+    /// wake failure is reported here once, ahead of the syscall. An empty wait
     /// neither consumes nor reports it.
     pub fn wait(self: *EvPort, events: []Event, timeout_ms: ?i32) WaitError!usize {
         if (events.len == 0) return 0;
@@ -361,7 +371,7 @@ pub const EvPort = struct {
             self.pending_error = null;
             return err;
         }
-        if (have_user and self.wake_failed.swap(false, .acquire)) return WaitError.WaitFailed;
+        if (self.wake_failed.swap(false, .acquire)) return WaitError.WaitFailed;
         var kbuf: [64]Kevent = undefined;
         const cap = @min(events.len, kbuf.len);
 
@@ -487,7 +497,19 @@ pub const EvPort = struct {
     fn drainWake(self: *EvPort) void {
         var tmp: [64]u8 = undefined;
         while (true) {
-            _ = compat.read(self.wake_r, &tmp) catch break;
+            const n = compat.read(self.wake_r, &tmp) catch |err| switch (err) {
+                error.WouldBlock => break,
+                else => {
+                    self.wake_failed.store(true, .release);
+                    break;
+                },
+            };
+            // A zero-byte read is EOF (write end closed): the wake channel
+            // is dead. Stop instead of spinning and report the dead channel.
+            if (n == 0) {
+                self.wake_failed.store(true, .release);
+                break;
+            }
         }
     }
 };
@@ -885,6 +907,81 @@ test "kqueue: a refused wake trigger is reported by the next wait" {
     var events: [4]Event = undefined;
     try std.testing.expectError(Error.WaitFailed, evp.wait(&events, 0));
     try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
+}
+
+test "kqueue: a refused pipe wake write is reported by the next wait, once" {
+    if (have_user) return error.SkipZigTest;
+    var evp = try EvPort.init(std.testing.allocator);
+    defer evp.deinit();
+    // Point the write path at an invalid descriptor without closing the
+    // pipe: the write fails EBADF while the pipe stays healthy. Closing
+    // the write end instead would leave EOF readiness on the wake knote.
+    const saved = evp.wake_w;
+    evp.wake_w = -1;
+    defer compat.close(saved);
+    evp.wake();
+    var events: [4]Event = undefined;
+    try std.testing.expectError(Error.WaitFailed, evp.wait(&events, 0));
+    try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
+}
+
+test "kqueue: wake with a full pipe stays benign" {
+    if (have_user) return error.SkipZigTest;
+    var evp = try EvPort.init(std.testing.allocator);
+    defer evp.deinit();
+    // Fill the pipe so the next write returns EAGAIN; a wakeup is already
+    // pending, so wake() must not stash an error.
+    var buf: [4096]u8 = @splat(1);
+    while (true) {
+        _ = compat.write(evp.wake_w, &buf) catch |err| switch (err) {
+            error.WouldBlock => break,
+            else => return err,
+        };
+    }
+    evp.wake();
+    var events: [4]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 0));
+    try std.testing.expect(events[0].wake);
+    // Drained: a later wake works normally.
+    evp.wake();
+    try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));
+    try std.testing.expect(events[0].wake);
+}
+
+test "kqueue: a failed pipe wake drain is reported by the next wait" {
+    if (have_user) return error.SkipZigTest;
+    var evp = try EvPort.init(std.testing.allocator);
+    defer evp.deinit();
+    var events: [4]Event = undefined;
+    // Flush the staged wake registration so the knote exists.
+    try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
+    evp.wake();
+    // Point the drain at the write end: the read fails EBADF while the
+    // registered read end stays open, so the knote still fires. Closing
+    // the monitored number instead would remove the knote on NetBSD even
+    // with a dup holding the description.
+    const real_r = evp.wake_r;
+    evp.wake_r = evp.wake_w;
+    defer evp.wake_r = real_r;
+    try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));
+    try std.testing.expect(events[0].wake);
+    try std.testing.expectError(Error.WaitFailed, evp.wait(&events, 0));
+}
+
+test "kqueue: a pipe wake at EOF drains without spinning" {
+    if (have_user) return error.SkipZigTest;
+    var evp = try EvPort.init(std.testing.allocator);
+    defer evp.deinit();
+    var events: [4]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
+    // Close the write end: the wake knote reports EOF readiness and the
+    // drain must terminate on the zero-byte read instead of spinning.
+    compat.close(evp.wake_w);
+    evp.wake_w = -1;
+    try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));
+    try std.testing.expect(events[0].wake);
+    // EOF means the wake channel is dead: the next wait reports it once.
+    try std.testing.expectError(Error.WaitFailed, evp.wait(&events, 0));
 }
 
 test "kqueue: non-blocking connect completes via write filter" {
