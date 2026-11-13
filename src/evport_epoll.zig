@@ -282,10 +282,16 @@ pub const EvPort = struct {
     }
 
     /// Internal hook: drop the `kind` source before its owner closes the fd.
+    /// A refused CTL_DEL is stashed as error.SourceFailed for the next wait,
+    /// unless an earlier error is already pending.
     pub fn removeInternal(self: *EvPort, kind: InternalKind) void {
         const slot = &self.internal[@intFromEnum(kind)];
         if (slot.* == -1) return;
-        _ = linux.epoll_ctl(self.ep, linux.EPOLL.CTL_DEL, slot.*, null);
+        if (compat.linuxErrno(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_DEL, slot.*, null)) != .SUCCESS and
+            self.pending_error == null)
+        {
+            self.pending_error = WaitError.SourceFailed;
+        }
         slot.* = -1;
     }
 
@@ -322,13 +328,19 @@ pub const EvPort = struct {
     /// fd, because every descriptor for the old open file description was
     /// closed without purgeFd and the number was reused. The stale entry is
     /// dropped and the descriptor re-ADDed in the same call.
+    ///
+    /// An empty mask drops the bookkeeping whatever CTL_DEL returns, since no
+    /// later call could address the entry. ENOENT already matches the
+    /// requested state. Any other refusal, typically EBADF after a close
+    /// without purgeFd while a dup keeps the registration live, is stashed.
     fn apply(self: *EvPort, fd: Handle, st: FdState) void {
         if (!st.read and !st.write) {
             if (self.fds.getPtr(fd)) |cur| {
                 if (cur.pseudo) {
                     self.pseudo_count -= 1;
-                } else {
-                    _ = linux.epoll_ctl(self.ep, linux.EPOLL.CTL_DEL, fd, null);
+                } else switch (compat.linuxErrno(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_DEL, fd, null))) {
+                    .SUCCESS, .NOENT => {},
+                    else => self.pending_error = WaitError.RegisterFailed,
                 }
                 _ = self.fds.remove(fd);
             }
@@ -785,6 +797,86 @@ test "epoll: CTL_MOD ENOENT drops stale bookkeeping and re-adds the reused fd" {
     try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));
     try std.testing.expect(events[0].readable);
     try std.testing.expect(events[0].udata == @as(?*anyopaque, &tag2));
+}
+
+test "epoll: a refused CTL_DEL is reported by the next wait" {
+    const alloc = std.testing.allocator;
+    var evp = try EvPort.init(alloc);
+    defer evp.deinit();
+
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(compat.AF.UNIX, compat.SOCK.STREAM | compat.SOCK.NONBLOCK | compat.SOCK.CLOEXEC, 0, &fds));
+    defer compat.close(fds[1]);
+
+    var tag: u8 = 12;
+    evp.monitorRead(fds[0], &tag);
+
+    // The dup keeps the description and its registration alive while the
+    // fd number turns invalid, so CTL_DEL fails with EBADF.
+    const saved = try compat.dup(fds[0]);
+    defer compat.close(saved);
+    compat.close(fds[0]);
+
+    evp.unmonitorRead(fds[0]);
+    // No later call could address the entry, so it is gone either way.
+    try std.testing.expect(!evp.fds.contains(fds[0]));
+
+    var events: [8]Event = undefined;
+    try std.testing.expectError(Error.RegisterFailed, evp.wait(&events, 0));
+    try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
+}
+
+test "epoll: CTL_DEL ENOENT drops the entry without an error" {
+    const alloc = std.testing.allocator;
+    var evp = try EvPort.init(alloc);
+    defer evp.deinit();
+
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(compat.AF.UNIX, compat.SOCK.STREAM | compat.SOCK.NONBLOCK | compat.SOCK.CLOEXEC, 0, &fds));
+    defer compat.close(fds[1]);
+    var fds2: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(compat.AF.UNIX, compat.SOCK.STREAM | compat.SOCK.NONBLOCK | compat.SOCK.CLOEXEC, 0, &fds2));
+    defer compat.close(fds2[1]);
+
+    var tag: u8 = 13;
+    evp.monitorRead(fds[0], &tag);
+
+    // Closing the only descriptor drops the kernel registration; reusing the
+    // number for an unregistered description makes CTL_DEL return ENOENT.
+    compat.close(fds[0]);
+    try compat.dup2(fds2[0], fds[0]);
+    compat.close(fds2[0]);
+    defer compat.close(fds[0]);
+
+    evp.unmonitorRead(fds[0]);
+    try std.testing.expect(!evp.fds.contains(fds[0]));
+    try std.testing.expect(evp.pending_error == null);
+
+    _ = try compat.write(fds2[1], "x");
+    var events: [8]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
+}
+
+test "epoll: a refused internal-source CTL_DEL is reported once, never overwriting" {
+    var evp = try EvPort.init(std.testing.allocator);
+    defer evp.deinit();
+    var events: [4]Event = undefined;
+
+    inline for (.{ false, true }) |earlier| {
+        const rc = linux.eventfd(0, linux.EFD.NONBLOCK | linux.EFD.CLOEXEC);
+        try std.testing.expectEqual(linux.E.SUCCESS, compat.linuxErrno(rc));
+        const fd: i32 = @intCast(rc);
+        try evp.addInternal(.timer, fd);
+        // Closing the only descriptor drops the registration, so the
+        // remove's CTL_DEL fails with EBADF.
+        compat.close(fd);
+        if (earlier) evp.pending_error = WaitError.OutOfMemory;
+        evp.removeInternal(.timer);
+        try std.testing.expect(evp.internalFd(.timer) == null);
+        const expected: WaitError = if (earlier) WaitError.OutOfMemory else WaitError.SourceFailed;
+        try std.testing.expectError(expected, evp.wait(&events, 0));
+        try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
+    }
 }
 
 test "epoll: init fails when the wake registration cannot allocate" {
