@@ -221,14 +221,19 @@ pub const EvPort = struct {
     /// send-buffer space after a short write. No-op while already armed.
     pub fn wantWrite(self: *EvPort, fd: Handle, udata: ?*anyopaque) void {
         if (self.armed_write.contains(fd)) return;
-        // Reserve the dedup slot before staging so the armed bit and the
-        // staged change agree even when the stage append later fails.
+        // Reserve both collections before mutating either, then commit with
+        // infallible operations. A failed reservation leaves the armed bit
+        // clear and nothing staged, so a retry re-arms cleanly.
         self.armed_write.ensureUnusedCapacity(self.alloc, 1) catch {
             self.pending_error = WaitError.OutOfMemory;
             return;
         };
+        self.changes.ensureUnusedCapacity(self.alloc, 1) catch {
+            self.pending_error = WaitError.OutOfMemory;
+            return;
+        };
         self.armed_write.putAssumeCapacity(fd, {});
-        self.stage(change(fd, EVFILT_WRITE, EV_ADD | EV_ONESHOT, udata));
+        self.changes.appendAssumeCapacity(change(fd, EVFILT_WRITE, EV_ADD | EV_ONESHOT, udata));
     }
 
     /// Drop write interest on an fd that STAYS OPEN (flow control only).
@@ -768,6 +773,47 @@ test "kqueue: one-shot write interest re-arms on demand" {
     evp.wantWrite(fds[1], &tag);
     try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));
     try std.testing.expect(events[0].writable);
+}
+
+test "kqueue: wantWrite retries after a changelist allocation failure" {
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const alloc = failing.allocator();
+    var port = try EvPort.init(alloc);
+    defer port.deinit();
+    const fds = try compat.pipe2(PIPE2_FLAGS);
+    defer compat.close(fds[0]);
+    defer compat.close(fds[1]);
+
+    var tags: [2]u8 = .{ 1, 2 };
+    port.monitorRead(fds[0], &tags[0]);
+    // Flush everything staged (including init's wake monitorRead on pipe
+    // targets) and release the changelist capacity, so the next staging
+    // append is guaranteed to allocate on every kqueue platform.
+    var events: [8]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 0), try port.wait(&events, 0));
+    port.changes.clearAndFree(alloc);
+
+    // Fail the changelist reservation, the second allocation in wantWrite.
+    // Failing the first (armed_write) reservation instead would leave the
+    // armed bit clear even without the fix, hiding the lost write interest.
+    failing.fail_index = failing.alloc_index + 1;
+    port.wantWrite(fds[1], &tags[1]);
+    try std.testing.expect(!port.armed_write.contains(fds[1]));
+    try std.testing.expectEqual(@as(usize, 0), port.changes.items.len);
+
+    // Recover and retry: the arm must stage a fresh change.
+    failing.fail_index = std.math.maxInt(usize);
+    port.wantWrite(fds[1], &tags[1]);
+    try std.testing.expect(port.armed_write.contains(fds[1]));
+    try std.testing.expectEqual(@as(usize, 1), port.changes.items.len);
+
+    // The stashed failure is reported once, then the retried change is
+    // submitted and the pipe write end delivers writability.
+    try std.testing.expectError(Error.OutOfMemory, port.wait(&events, 0));
+    try std.testing.expectEqual(@as(usize, 1), try port.wait(&events, 1000));
+    try std.testing.expect(events[0].writable);
+    try std.testing.expect(events[0].udata == @as(?*anyopaque, &tags[1]));
+    try std.testing.expect(!port.armed_write.contains(fds[1]));
 }
 
 test "kqueue: peer close delivers eof" {
