@@ -305,6 +305,10 @@ pub const EvPort = struct {
     /// EEXIST and strands the descriptor. Any other failure, whether allocation
     /// failure before the syscall or an epoll_ctl rejection such as EBADF, is
     /// stashed in pending_error.
+    ///
+    /// A failed CTL_MOD keeps the prior bookkeeping: the kernel registration
+    /// stays live, so the old state still mirrors it and a later apply retries
+    /// MOD rather than CTL_ADD into EEXIST.
     fn apply(self: *EvPort, fd: Handle, st: FdState) void {
         if (!st.read and !st.write) {
             if (self.fds.getPtr(fd)) |cur| {
@@ -343,7 +347,11 @@ pub const EvPort = struct {
         if (!gop.value_ptr.pseudo) {
             var ev = makeEvent(st);
             if (compat.linuxErrno(linux.epoll_ctl(self.ep, linux.EPOLL.CTL_MOD, fd, &ev)) != .SUCCESS) {
-                _ = self.fds.remove(fd);
+                // A failed MOD leaves the previous kernel registration live.
+                // Keep the prior bookkeeping (still the old state, since the
+                // assignment below runs only on success) so it mirrors the
+                // kernel and a later apply retries MOD instead of CTL_ADD
+                // into EEXIST.
                 self.pending_error = WaitError.RegisterFailed;
                 return;
             }
@@ -667,6 +675,51 @@ test "epoll: rejected descriptor is reported by the next wait, never half-record
     evp.wantWrite(bogus, &tag);
     try std.testing.expectError(Error.RegisterFailed, evp.wait(&events, 0));
     try std.testing.expect(!evp.fds.contains(bogus));
+}
+
+test "epoll: failed CTL_MOD keeps prior bookkeeping so a retry re-mods" {
+    const alloc = std.testing.allocator;
+    var evp = try EvPort.init(alloc);
+    defer evp.deinit();
+
+    var fds: [2]c_int = undefined;
+    try std.testing.expectEqual(@as(c_int, 0), std.c.socketpair(compat.AF.UNIX, compat.SOCK.STREAM | compat.SOCK.NONBLOCK | compat.SOCK.CLOEXEC, 0, &fds));
+    defer compat.close(fds[0]);
+    defer compat.close(fds[1]);
+
+    var tag: u8 = 9;
+    evp.monitorRead(fds[0], &tag);
+    try std.testing.expect(evp.fds.get(fds[0]).?.read);
+
+    // epoll(7): a registration is dropped only once every descriptor referring
+    // to the underlying open file description is closed. dup keeps that
+    // description, and the live registration, alive while the original fd
+    // number turns invalid, so the next CTL_MOD fails with EBADF without
+    // unregistering anything.
+    const saved = try compat.dup(fds[0]);
+    defer compat.close(saved);
+    compat.close(fds[0]);
+
+    evp.wantWrite(fds[0], &tag);
+    // MOD failed: the prior bookkeeping must survive, mirroring the still-live
+    // kernel registration (read armed, write not).
+    try std.testing.expect(evp.fds.contains(fds[0]));
+    const st = evp.fds.get(fds[0]).?;
+    try std.testing.expect(st.read);
+    try std.testing.expect(!st.write);
+
+    var events: [8]Event = undefined;
+    try std.testing.expectError(Error.RegisterFailed, evp.wait(&events, 0));
+
+    // Restore the original fd number onto the same description. The kernel
+    // registration was never removed, so the retry must CTL_MOD (not CTL_ADD
+    // into EEXIST) and arm write interest.
+    try compat.dup2(saved, fds[0]);
+    evp.wantWrite(fds[0], &tag);
+    try std.testing.expect(evp.fds.get(fds[0]).?.write);
+    try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));
+    try std.testing.expect(events[0].writable);
+    try std.testing.expect(events[0].udata == @as(?*anyopaque, &tag));
 }
 
 test "epoll: allocation failure is reported by the next wait, once" {
