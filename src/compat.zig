@@ -1610,8 +1610,8 @@ pub fn openZ(path: [*:0]const u8, flags: O, permissions: mode_t) OpenError!fd_t 
 
 /// Opens a directory descriptor for anchoring `*at` operations against a
 /// parent-directory swap. Prefers O_PATH (Linux, FreeBSD), which needs no read
-/// permission on the directory; then O_SEARCH (NetBSD), which needs only search
-/// permission; then O_RDONLY (macOS, OpenBSD), which requires read permission on
+/// permission on the directory; then O_SEARCH (NetBSD, macOS), which needs only
+/// search permission; then O_RDONLY (OpenBSD), which requires read permission on
 /// the parent. The descriptor is close-on-exec and never used for read/write.
 pub fn openDirAnchor(path: []const u8) OpenError!fd_t {
     if (comptime is_windows) @compileError("openDirAnchor is POSIX-only");
@@ -1620,6 +1620,10 @@ pub fn openDirAnchor(path: []const u8) OpenError!fd_t {
         flags.PATH = true;
     } else if (comptime @hasField(O, "SEARCH")) {
         flags.SEARCH = true;
+    } else if (comptime is_darwin) {
+        // Darwin's O_SEARCH is O_EXEC | O_DIRECTORY, but std.c.O omits the
+        // field; set the O_EXEC bit so the anchor needs only search permission.
+        flags = @bitCast(@as(u32, @bitCast(flags)) | 0x40000000);
     }
     return open(path, flags, 0);
 }

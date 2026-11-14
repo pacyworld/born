@@ -14,14 +14,15 @@
 //! it is process-wide, and changing it would race other threads creating files.
 //!
 //! Directory anchoring: the parent directory is opened once (O_PATH on Linux
-//! and FreeBSD, O_SEARCH on NetBSD, else O_RDONLY) and bind, the stale-path
-//! probe, and every post-bind operation (fstatat, fchmodat, unlinkat) target
-//! that descriptor and the path's final component. This pins the directory
-//! inode, so a writer who renames or replaces the parent cannot redirect those
-//! operations to another directory. Bind and the probe are anchored where the
-//! platform allows it: FreeBSD bindat/connectat with a relative sun_path, Linux
-//! bind/connect through /proc/self/fd/<dir_fd>/<base>. fchmodat uses
-//! AT_SYMLINK_NOFOLLOW (on Linux before 6.6 through compat's /proc fallback).
+//! and FreeBSD, O_SEARCH on NetBSD and macOS, else O_RDONLY) and bind, the
+//! stale-path probe, and every post-bind operation (fstatat, fchmodat, unlinkat)
+//! target that descriptor and the path's final component. This pins the
+//! directory inode, so a writer who renames or replaces the parent cannot
+//! redirect those operations to another directory. Bind and the probe are
+//! anchored where the platform allows it: FreeBSD bindat/connectat with a
+//! relative sun_path, Linux bind/connect through /proc/self/fd/<dir_fd>/<base>.
+//! fchmodat uses AT_SYMLINK_NOFOLLOW (on Linux before 6.6 through compat's
+//! /proc fallback).
 //!
 //! Residual race: within the pinned directory the identity check and the
 //! unlink are still separate operations, and POSIX has no atomic
@@ -34,8 +35,9 @@
 //! still create the socket in, or probe, another directory. The same window
 //! opens on Linux when /proc is unavailable or the anchored path would not fit
 //! sun_path and the full path is used instead. Anchored bind on FreeBSD and
-//! Linux closes it. The O_RDONLY anchor on macOS and OpenBSD also needs read
-//! permission on the parent, where a full-path bind needed only search.
+//! Linux closes it. The O_RDONLY anchor on OpenBSD also needs read permission
+//! on the parent, where a full-path bind needed only search; macOS and NetBSD
+//! use O_SEARCH, which needs only search permission.
 //! `opts.mode` takes permission bits only (0o777); anything else is
 //! error.SocketError.
 //!
