@@ -185,23 +185,21 @@ pub const Listener = struct {
         return 0;
     }
 
-    /// The bound address (the chosen port after binding to port 0, or the
-    /// path of a Unix listener).
+    /// The bound address: the chosen port after binding to port 0, or the
+    /// caller's path for a Unix listener. A Unix listener returns its stored
+    /// path rather than getsockname, because anchored bind records the final
+    /// component (FreeBSD) or the /proc/self/fd form (Linux) in the kernel. A
+    /// client's getpeername on those platforms reports that anchored name, not
+    /// this path; the listener's own address is unaffected.
     pub fn localAddress(self: *const Listener) io.LocalAddressError!compat.Address {
         if (self.sock < 0) return io.LocalAddressError.SocketError;
+        if (self.unix.local_un.family == compat.AF.UNIX) return .{ .un = self.unix.local_un };
         var ss: compat.sockaddr.storage = undefined;
         var len: compat.socklen_t = @sizeOf(compat.sockaddr.storage);
         compat.getsockname(self.sock, @ptrCast(&ss), &len) catch return io.LocalAddressError.SocketError;
         const sa: *const compat.sockaddr = @ptrCast(&ss);
         switch (sa.family) {
             compat.AF.INET, compat.AF.INET6 => return compat.Address.initPosix(@ptrCast(&ss)),
-            compat.AF.UNIX => {
-                // getsockname may omit the path's NUL; zero-fill so it stays terminated.
-                var un = std.mem.zeroes(compat.sockaddr.un);
-                const n = @min(@as(usize, len), @sizeOf(compat.sockaddr.un));
-                @memcpy(std.mem.asBytes(&un)[0..n], std.mem.asBytes(&ss)[0..n]);
-                return .{ .un = un };
-            },
             else => return io.LocalAddressError.SocketError,
         }
     }

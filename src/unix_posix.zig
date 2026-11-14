@@ -24,6 +24,14 @@
 //! fchmodat uses AT_SYMLINK_NOFOLLOW (on Linux before 6.6 through compat's
 //! /proc fallback).
 //!
+//! Recorded address: the kernel keeps the sockaddr exactly as bind received it,
+//! so an anchored bind on FreeBSD and Linux records the final component or the
+//! /proc/self/fd form, not the caller's path. `Listener.localAddress` returns the
+//! stored caller path rather than getsockname to keep its contract. A client's
+//! getpeername on those two platforms reports the anchored name: a peer-visible
+//! side effect of anchoring that cannot be removed without giving up the anchor.
+//! On the full-path targets getpeername reports the caller's path.
+//!
 //! Residual race: within the pinned directory the identity check and the
 //! unlink are still separate operations, and POSIX has no atomic
 //! compare-and-unlink. The socket's parent directory must therefore be
@@ -103,6 +111,11 @@ pub const ListenerState = struct {
     /// post-bind stat records it, so cleanup of a just-bound path needs no check.
     identity_known: bool = false,
     pid: compat.pid_t = 0,
+    /// The caller's validated path as a sockaddr_un, returned by `localAddress`.
+    /// Anchored bind records a different name in the kernel (the final component
+    /// on FreeBSD, the /proc/self/fd form on Linux), so getsockname cannot return
+    /// the path the caller gave. `family` is 0 for TCP, which uses getsockname.
+    local_un: compat.sockaddr.un = std.mem.zeroes(compat.sockaddr.un),
 
     fn path(self: *const ListenerState) []const u8 {
         return self.path_buf[0..self.path_len];
@@ -259,7 +272,7 @@ fn listenInner(
         error.AccessDenied, error.PermissionDenied => io.ListenError.AccessDenied,
         else => io.ListenError.SocketError,
     };
-    var state: ListenerState = .{ .dir_fd = dir_fd, .pid = std.c.getpid() };
+    var state: ListenerState = .{ .dir_fd = dir_fd, .pid = std.c.getpid(), .local_un = un };
     @memcpy(state.path_buf[0..split.base.len], split.base);
     // Owns dir_fd from here and removes the bound path on any later failure.
     errdefer state.deinit();
@@ -593,10 +606,28 @@ test "unix_posix: bind lands in the pinned parent across a swap before bind" {
     // successor now at a.
     try testing.expect(exists(b_sock));
     try testing.expect(!exists(a_sock));
+    // localAddress still reports the caller's path though bind was anchored.
+    const addr = try l.localAddress();
+    const want = try sockAddr(a_sock);
+    try testing.expectEqualSlices(u8, &want.path, &addr.un.path);
     l.close();
     // Cleanup removed it from the pinned directory and left the successor alone.
     try testing.expect(!exists(b_sock));
     try testing.expect(!exists(a_sock));
+}
+
+test "unix_posix: localAddress returns the caller's path, not the anchored name" {
+    // Anchored bind records the final component (FreeBSD) or the /proc/self/fd
+    // form (Linux) in the kernel; localAddress must still return the caller's
+    // path on every POSIX backend, not the name getsockname would report.
+    var p = try TestPath.init();
+    defer p.deinit();
+    var l = try Listener.openUnix(testing.allocator, p.get(), .{});
+    defer l.close();
+    const addr = try l.localAddress();
+    const want = try sockAddr(p.get());
+    try testing.expectEqual(compat.AF.UNIX, addr.un.family);
+    try testing.expectEqualSlices(u8, &want.path, &addr.un.path);
 }
 
 test "unix_posix: a failing post-bind identity stat still removes the bound path" {
