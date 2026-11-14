@@ -164,8 +164,14 @@ pub const EvPort = struct {
     /// thread. A failed post is stashed atomically and returned as
     /// error.PostFailed by the next non-empty wait. When the failed post is
     /// itself a wake, nothing wakes the blocked wait, so the error reaches the
-    /// consumer at the next naturally arriving completion.
+    /// consumer at the next naturally arriving completion. The completion
+    /// byte count is 32-bit, so a `bytes` value above `maxInt(u32)` is stashed
+    /// as PostFailed too, rather than trapping on the cast.
     pub fn post(self: *EvPort, key: *anyopaque, overlapped: ?*windows.OVERLAPPED, bytes: usize) void {
+        if (bytes > std.math.maxInt(u32)) {
+            self.post_failed.store(true, .release);
+            return;
+        }
         if (kernel32.PostQueuedCompletionStatus(self.iocp, @intCast(bytes), @intFromPtr(key), overlapped) == 0) {
             self.post_failed.store(true, .release);
         }
@@ -322,6 +328,27 @@ test "iocp: failed post is stashed and returned by the next wait" {
     try std.testing.expect(!port.post_failed.load(.acquire));
     port.wake();
     try std.testing.expectError(Error.PostFailed, port.wait(&events, 0));
+}
+
+test "iocp: post byte count above u32 is reported, not trapped" {
+    var port = try EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    var tag: u8 = 1;
+    var events: [1]Event = undefined;
+
+    // The largest count the 32-bit completion field holds still posts and
+    // harvests unchanged.
+    const max_u32 = std.math.maxInt(u32);
+    port.post(&tag, null, max_u32);
+    try std.testing.expectEqual(@as(usize, 1), try port.wait(&events, 1000));
+    try std.testing.expectEqual(@as(usize, max_u32), events[0].bytes);
+
+    // One past it must not trap on the @intCast: the post is refused and
+    // stashed, and the next wait reports PostFailed exactly once.
+    port.post(&tag, null, @as(usize, max_u32) + 1);
+    try std.testing.expect(port.post_failed.load(.acquire));
+    try std.testing.expectError(Error.PostFailed, port.wait(&events, 0));
+    try std.testing.expect(!port.post_failed.load(.acquire));
 }
 
 test "iocp: empty wait preserves raw posted completions" {
