@@ -13,21 +13,31 @@
 //! usable by a client before `opts.mode` is in place. The umask is not touched:
 //! it is process-wide, and changing it would race other threads creating files.
 //!
-//! Directory anchoring: the parent directory is opened once (O_PATH where the
-//! platform has it, else O_RDONLY) and every post-bind operation (fstatat,
-//! fchmodat, unlinkat) runs relative to that descriptor and the path's final
-//! component. This pins the directory inode, so a writer who renames or
-//! replaces the parent cannot redirect those operations to another directory.
-//! fchmodat uses AT_SYMLINK_NOFOLLOW (on Linux before 6.6 through compat's
-//! /proc fallback). The stale-path datagram probe resolves the full path, as
-//! connect(2) takes no directory descriptor.
+//! Directory anchoring: the parent directory is opened once (O_PATH on Linux
+//! and FreeBSD, O_SEARCH on NetBSD, else O_RDONLY) and bind, the stale-path
+//! probe, and every post-bind operation (fstatat, fchmodat, unlinkat) target
+//! that descriptor and the path's final component. This pins the directory
+//! inode, so a writer who renames or replaces the parent cannot redirect those
+//! operations to another directory. Bind and the probe are anchored where the
+//! platform allows it: FreeBSD bindat/connectat with a relative sun_path, Linux
+//! bind/connect through /proc/self/fd/<dir_fd>/<base>. fchmodat uses
+//! AT_SYMLINK_NOFOLLOW (on Linux before 6.6 through compat's /proc fallback).
 //!
 //! Residual race: within the pinned directory the identity check and the
 //! unlink are still separate operations, and POSIX has no atomic
 //! compare-and-unlink. The socket's parent directory must therefore be
 //! writable only by trusted users: an untrusted writer in that directory could
-//! still replace the entry between the check and the unlink. `opts.mode` takes
-//! permission bits only (0o777); anything else is error.SocketError.
+//! still replace the entry between the check and the unlink.
+//!
+//! On macOS, NetBSD and OpenBSD no anchored bind exists, so bind and the probe
+//! resolve the full path: a parent swap between the anchor open and bind can
+//! still create the socket in, or probe, another directory. The same window
+//! opens on Linux when /proc is unavailable or the anchored path would not fit
+//! sun_path and the full path is used instead. Anchored bind on FreeBSD and
+//! Linux closes it. The O_RDONLY anchor on macOS and OpenBSD also needs read
+//! permission on the parent, where a full-path bind needed only search.
+//! `opts.mode` takes permission bits only (0o777); anything else is
+//! error.SocketError.
 //!
 //! Stale paths (`unlink_stale`): when bind reports EADDRINUSE, the path is
 //! classified before anything is removed:
@@ -87,6 +97,9 @@ pub const ListenerState = struct {
     dir_fd: compat.fd_t = -1,
     dev: Dev = 0,
     ino: Ino = 0,
+    /// Whether dev/ino hold the bound file's identity. False until the
+    /// post-bind stat records it, so cleanup of a just-bound path needs no check.
+    identity_known: bool = false,
     pid: compat.pid_t = 0,
 
     fn path(self: *const ListenerState) []const u8 {
@@ -102,11 +115,13 @@ pub const ListenerState = struct {
             }
         }
         if (self.path_len == 0) return;
+        // path_len != 0 implies a live dir_fd: the anchor is opened before bind
+        // and closed only by the defer above, so unlinkat never sees a bad fd.
         defer self.path_len = 0;
         if (std.c.getpid() != self.pid) return;
         // Identity not yet recorded: bind just created the file under the
         // trusted-parent precondition, so remove it without an identity check.
-        if (self.dev == 0 and self.ino == 0) {
+        if (!self.identity_known) {
             compat.unlinkat(self.dir_fd, self.path(), 0) catch {};
             return;
         }
@@ -152,8 +167,58 @@ fn splitPath(path: []const u8) struct { parent: []const u8, base: []const u8 } {
     return .{ .parent = ".", .base = path };
 }
 
+/// A bind/connect target for the Unix listener. `fd` is the pinned directory
+/// for FreeBSD bindat/connectat (with a relative `un.path`), or AT.FDCWD when
+/// `un` carries an absolute path: the Linux /proc anchor or the full-path
+/// fallback.
+const AnchoredAddr = struct {
+    un: compat.sockaddr.un,
+    fd: compat.fd_t,
+};
+
+/// Whether the Linux /proc/self/fd anchor is usable. Checked once per listen so
+/// the stale-path probe never mistakes a missing /proc for a missing socket.
+fn procAnchorAvailable() bool {
+    if (comptime builtin.os.tag != .linux) return false;
+    _ = compat.fstatat(compat.AT.FDCWD, "/proc/self/fd", 0) catch return false;
+    return true;
+}
+
+/// Anchor the bind/connect address to the pinned directory where the platform
+/// allows it: FreeBSD binds the relative final component through bindat; Linux
+/// binds through /proc/self/fd/<dir_fd>/<base> when that fits sun_path. Other
+/// targets, an over-long anchored path, or a missing /proc fall back to the
+/// validated full path, leaving the open-to-bind window open (see module doc).
+fn anchoredAddr(
+    dir_fd: compat.fd_t,
+    base: []const u8,
+    full: *const compat.sockaddr.un,
+    proc_ok: bool,
+) AnchoredAddr {
+    if (base.len != 0) {
+        if (comptime builtin.os.tag == .freebsd) {
+            if (sockAddr(base)) |un| return .{ .un = un, .fd = dir_fd } else |_| {}
+        }
+        if (comptime builtin.os.tag == .linux) {
+            if (proc_ok) {
+                var buf: [sun_path_len]u8 = undefined;
+                if (std.fmt.bufPrint(&buf, "/proc/self/fd/{d}/{s}", .{ dir_fd, base })) |p| {
+                    if (sockAddr(p)) |un| return .{ .un = un, .fd = compat.AT.FDCWD } else |_| {}
+                } else |_| {}
+            }
+        }
+    }
+    return .{ .un = full.*, .fd = compat.AT.FDCWD };
+}
+
 /// The post-bind identity stat, injectable so a test can force its failure.
 const StatFn = fn (compat.fd_t, []const u8, u32) compat.FStatAtError!compat.FileStat;
+
+/// Called after the parent directory is pinned and before bind. Production
+/// passes a no-op; a test injects a parent swap to exercise the bind anchor.
+const AfterAnchorFn = fn (ctx: ?*anyopaque) void;
+
+fn noopAfterAnchor(_: ?*anyopaque) void {}
 
 /// Open a Unix stream listener at `path` with `opts`.
 ///
@@ -161,10 +226,17 @@ const StatFn = fn (compat.fd_t, []const u8, u32) compat.FStatAtError!compat.File
 /// module documentation for path validation, stale-path handling, directory
 /// anchoring, and the ownership checks used during cleanup.
 pub fn listen(alloc: std.mem.Allocator, path: []const u8, opts: io.UnixOptions) io.ListenError!Listener {
-    return listenInner(alloc, path, opts, compat.fstatat);
+    return listenInner(alloc, path, opts, compat.fstatat, noopAfterAnchor, null);
 }
 
-fn listenInner(alloc: std.mem.Allocator, path: []const u8, opts: io.UnixOptions, comptime statFn: StatFn) io.ListenError!Listener {
+fn listenInner(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    opts: io.UnixOptions,
+    comptime statFn: StatFn,
+    comptime afterAnchor: AfterAnchorFn,
+    hook_ctx: ?*anyopaque,
+) io.ListenError!Listener {
     _ = alloc;
     if (opts.mode & ~@as(u16, 0o777) != 0) return io.ListenError.SocketError;
     const un = sockAddr(path) catch |err| return switch (err) {
@@ -190,7 +262,10 @@ fn listenInner(alloc: std.mem.Allocator, path: []const u8, opts: io.UnixOptions,
     // Owns dir_fd from here and removes the bound path on any later failure.
     errdefer state.deinit();
 
-    try bindPath(s, &un, dir_fd, split.base, opts.unlink_stale);
+    // Anchor bind and the probe to the pinned directory, not the full path.
+    const addr = anchoredAddr(dir_fd, split.base, &un, procAnchorAvailable());
+    afterAnchor(hook_ctx);
+    try bindPath(&addr, s, dir_fd, split.base, opts.unlink_stale);
 
     // bind created the file: arm removal before the fallible identity stat.
     state.path_len = split.base.len;
@@ -202,6 +277,7 @@ fn listenInner(alloc: std.mem.Allocator, path: []const u8, opts: io.UnixOptions,
     }
     state.dev = st.dev;
     state.ino = st.ino;
+    state.identity_known = true;
 
     // Not listening yet: every connect is refused until listen below.
     compat.fchmodat(dir_fd, split.base, @intCast(opts.mode), compat.AT.SYMLINK_NOFOLLOW) catch |err| return switch (err) {
@@ -217,15 +293,21 @@ fn listenInner(alloc: std.mem.Allocator, path: []const u8, opts: io.UnixOptions,
 }
 
 /// bind, replacing a stale socket file at most once.
-fn bindPath(s: compat.fd_t, un: *const compat.sockaddr.un, dir_fd: compat.fd_t, base: []const u8, unlink_stale: bool) io.ListenError!void {
+fn bindPath(
+    addr: *const AnchoredAddr,
+    s: compat.fd_t,
+    dir_fd: compat.fd_t,
+    base: []const u8,
+    unlink_stale: bool,
+) io.ListenError!void {
     var retried = false;
     while (true) {
-        switch (std.posix.errno(std.c.bind(s, sockPtr(un), addr_len))) {
+        switch (std.posix.errno(compat.bindUnixAt(addr.fd, s, sockPtr(&addr.un), addr_len))) {
             .SUCCESS => return,
             .ADDRINUSE => {
                 if (!unlink_stale or retried) return io.ListenError.AddressInUse;
                 retried = true;
-                try removeStale(un, dir_fd, base);
+                try removeStale(addr, dir_fd, base);
             },
             .ACCES, .PERM => return io.ListenError.AccessDenied,
             .NAMETOOLONG => return io.ListenError.NameTooLong,
@@ -236,13 +318,13 @@ fn bindPath(s: compat.fd_t, un: *const compat.sockaddr.un, dir_fd: compat.fd_t, 
 
 /// Unlink the file at `base` in `dir_fd` if it is a stale socket; return so the
 /// caller retries bind. A live socket is error.AddressInUse, anything else
-/// error.PathNotASocket; neither is touched. The stat and unlink are relative
-/// to the pinned directory; the datagram probe resolves the full path.
-fn removeStale(un: *const compat.sockaddr.un, dir_fd: compat.fd_t, base: []const u8) io.ListenError!void {
+/// error.PathNotASocket; neither is touched. The stat, datagram probe and unlink
+/// all target the pinned directory.
+fn removeStale(addr: *const AnchoredAddr, dir_fd: compat.fd_t, base: []const u8) io.ListenError!void {
     const before = try lstat(dir_fd, base) orelse return; // gone since bind: retry
     if (!compat.S.ISSOCK(before.mode)) return io.ListenError.PathNotASocket;
 
-    switch (try probe(un)) {
+    switch (try probe(addr)) {
         .live => return io.ListenError.AddressInUse,
         .gone => return,
         .stale => {},
@@ -271,15 +353,16 @@ fn lstat(dir_fd: compat.fd_t, base: []const u8) io.ListenError!?compat.FileStat 
 
 const Probe = enum { live, stale, gone };
 
-/// Datagram connect to the socket file at `un`: ECONNREFUSED means no
-/// socket is attached to it. See the module comment for why not a stream.
-fn probe(un: *const compat.sockaddr.un) io.ListenError!Probe {
+/// Datagram connect to the socket file at the anchored address: ECONNREFUSED
+/// means no socket is attached to it. See the module comment for why not a
+/// stream.
+fn probe(addr: *const AnchoredAddr) io.ListenError!Probe {
     const p = compat.socket(compat.AF.UNIX, compat.SOCK.DGRAM | compat.SOCK.NONBLOCK | compat.SOCK.CLOEXEC, 0) catch |err| return switch (err) {
         error.AccessDenied => io.ListenError.AccessDenied,
         else => io.ListenError.SocketError,
     };
     defer compat.close(p);
-    return switch (std.posix.errno(std.c.connect(p, sockPtr(un), addr_len))) {
+    return switch (std.posix.errno(compat.connectUnixAt(addr.fd, p, sockPtr(&addr.un), addr_len))) {
         .CONNREFUSED => .stale,
         .NOENT => .gone,
         // A datagram socket accepted it, a socket of another type is bound,
@@ -472,6 +555,48 @@ test "unix_posix: close unlinks in the pinned directory after a parent swap" {
     compat.unlink(a_sock) catch {};
 }
 
+/// Renames the pinned parent away and puts a successor directory at the
+/// original name, in the window between the anchor open and bind.
+const SwapFixture = struct {
+    a: [:0]const u8,
+    b: [:0]const u8,
+
+    fn swap(ctx: ?*anyopaque) void {
+        const self: *SwapFixture = @ptrCast(@alignCast(ctx.?));
+        std.debug.assert(std.c.rename(self.a.ptr, self.b.ptr) == 0);
+        std.debug.assert(std.c.mkdir(self.a.ptr, 0o755) == 0);
+    }
+};
+
+test "unix_posix: bind lands in the pinned parent across a swap before bind" {
+    // Only FreeBSD (bindat) and Linux (/proc/self/fd) anchor bind itself. The
+    // other targets keep the full-path bind, so the swap would move the socket
+    // to the successor; that open-to-bind window is documented, not tested here.
+    if (comptime builtin.os.tag != .freebsd and builtin.os.tag != .linux) return error.SkipZigTest;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var a_buf: [96]u8 = undefined;
+    var b_buf: [96]u8 = undefined;
+    var as_buf: [96]u8 = undefined;
+    var bs_buf: [96]u8 = undefined;
+    const a = try pathZ(&a_buf, test_tmp_root ++ "{s}/a", .{tmp.sub_path});
+    const b = try pathZ(&b_buf, test_tmp_root ++ "{s}/b", .{tmp.sub_path});
+    const a_sock = try pathZ(&as_buf, "{s}/s", .{a});
+    const b_sock = try pathZ(&bs_buf, "{s}/s", .{b});
+    try testing.expectEqual(@as(c_int, 0), std.c.mkdir(a.ptr, 0o755));
+
+    var fixture = SwapFixture{ .a = a, .b = b };
+    var l = try listenInner(testing.allocator, a_sock, .{}, compat.fstatat, SwapFixture.swap, &fixture);
+    // The socket was created in the pinned directory (renamed to b), not in the
+    // successor now at a.
+    try testing.expect(exists(b_sock));
+    try testing.expect(!exists(a_sock));
+    l.close();
+    // Cleanup removed it from the pinned directory and left the successor alone.
+    try testing.expect(!exists(b_sock));
+    try testing.expect(!exists(a_sock));
+}
+
 test "unix_posix: a failing post-bind identity stat still removes the bound path" {
     // Force the post-bind stat to fail; the cleanup guard armed before it must
     // remove the just-bound path rather than leak it.
@@ -482,7 +607,7 @@ test "unix_posix: a failing post-bind identity stat still removes the bound path
             return error.Unexpected;
         }
     }.stat;
-    try testing.expectError(error.SocketError, listenInner(testing.allocator, p.get(), .{}, failing));
+    try testing.expectError(error.SocketError, listenInner(testing.allocator, p.get(), .{}, failing, noopAfterAnchor, null));
     try testing.expect(!exists(p.get()));
 }
 
@@ -496,7 +621,7 @@ test "unix_posix: a post-bind non-socket replacement is refused and kept" {
             return .{ .dev = 1, .ino = 1, .mode = compat.S.IFREG | 0o600 };
         }
     }.stat;
-    try testing.expectError(error.SocketError, listenInner(testing.allocator, p.get(), .{}, replaced));
+    try testing.expectError(error.SocketError, listenInner(testing.allocator, p.get(), .{}, replaced, noopAfterAnchor, null));
     try testing.expect(exists(p.get()));
 }
 

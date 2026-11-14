@@ -13,6 +13,7 @@ const native_os = builtin.os.tag;
 const is_windows = native_os == .windows;
 const is_darwin = native_os.isDarwin();
 const is_linux = native_os == .linux;
+const is_freebsd = native_os == .freebsd;
 const has_new_signal_type = builtin.zig_version.minor >= 16;
 
 /// Returns an empty `std.EnumSet(E)` on every supported toolchain.
@@ -1292,6 +1293,37 @@ pub fn connect(sock: socket_t, addr: *const sockaddr, len: socklen_t) ConnectErr
     }
 }
 
+// FreeBSD bindat(2)/connectat(2) bind or connect a relative sockaddr against a
+// directory descriptor. std.c does not declare them; they are referenced only
+// on FreeBSD, so other libc's lack of these symbols never reaches the linker.
+const freebsd_at = if (is_freebsd) struct {
+    extern "c" fn bindat(dirfd: c_int, sock: c_int, addr: *const sockaddr, len: socklen_t) c_int;
+    extern "c" fn connectat(dirfd: c_int, sock: c_int, addr: *const sockaddr, len: socklen_t) c_int;
+} else struct {};
+
+/// Raw bind of a Unix address optionally anchored to `dirfd`. FreeBSD uses
+/// bindat when `dirfd` is a real descriptor; every other case uses bind, and
+/// the address then carries an absolute path. Returns the libc result so the
+/// caller inspects errno itself: the stale-path probe needs EPROTOTYPE, which
+/// the error-set `connect` wrapper treats as unreachable.
+pub fn bindUnixAt(dirfd: fd_t, sock: socket_t, addr: *const sockaddr, len: socklen_t) c_int {
+    if (comptime is_windows) @compileError("bindUnixAt is POSIX-only");
+    if (comptime is_freebsd) {
+        if (dirfd != AT.FDCWD) return freebsd_at.bindat(dirfd, sock, addr, len);
+    }
+    return std.c.bind(sock, addr, len);
+}
+
+/// Raw connect of a Unix address optionally anchored to `dirfd`, mirroring
+/// `bindUnixAt`. Returns the libc result for direct errno inspection.
+pub fn connectUnixAt(dirfd: fd_t, sock: socket_t, addr: *const sockaddr, len: socklen_t) c_int {
+    if (comptime is_windows) @compileError("connectUnixAt is POSIX-only");
+    if (comptime is_freebsd) {
+        if (dirfd != AT.FDCWD) return freebsd_at.connectat(dirfd, sock, addr, len);
+    }
+    return std.c.connect(sock, addr, len);
+}
+
 /// Reads a socket option into `opt`.
 pub fn getsockopt(sock: socket_t, level: i32, option: u32, opt: []u8) GetSockOptError!void {
     if (comptime is_windows) {
@@ -1577,13 +1609,18 @@ pub fn openZ(path: [*:0]const u8, flags: O, permissions: mode_t) OpenError!fd_t 
 }
 
 /// Opens a directory descriptor for anchoring `*at` operations against a
-/// parent-directory swap. Uses O_PATH where the platform has it (Linux,
-/// FreeBSD) so no read permission on the directory is required; O_RDONLY
-/// elsewhere. The descriptor is close-on-exec and never used for read/write.
+/// parent-directory swap. Prefers O_PATH (Linux, FreeBSD), which needs no read
+/// permission on the directory; then O_SEARCH (NetBSD), which needs only search
+/// permission; then O_RDONLY (macOS, OpenBSD), which requires read permission on
+/// the parent. The descriptor is close-on-exec and never used for read/write.
 pub fn openDirAnchor(path: []const u8) OpenError!fd_t {
     if (comptime is_windows) @compileError("openDirAnchor is POSIX-only");
     var flags: O = .{ .DIRECTORY = true, .CLOEXEC = true };
-    if (comptime @hasField(O, "PATH")) flags.PATH = true;
+    if (comptime @hasField(O, "PATH")) {
+        flags.PATH = true;
+    } else if (comptime @hasField(O, "SEARCH")) {
+        flags.SEARCH = true;
+    }
     return open(path, flags, 0);
 }
 
