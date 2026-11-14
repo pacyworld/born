@@ -41,7 +41,7 @@ pub const Event = types.Event;
 pub const Signal = types.Signal;
 pub const TimerMode = types.TimerMode;
 
-pub const InitError = error{InitFailed};
+pub const InitError = types.InitError;
 /// Failure to associate a handle with an I/O completion port.
 pub const AssociateError = error{AssociateFailed};
 /// AssociateFailed is a stashed monitorRead failure, PostFailed a stashed
@@ -93,7 +93,7 @@ pub const EvPort = struct {
     /// Create an I/O completion port and initialize its helper state with `alloc`.
     pub fn init(alloc: std.mem.Allocator) InitError!EvPort {
         const port = kernel32.CreateIoCompletionPort(windows.INVALID_HANDLE_VALUE, null, 0, 0) orelse
-            return InitError.InitFailed;
+            return InitError.SystemResources;
         return .{
             .iocp = port,
             .timers = timer_iocp.State.init(alloc),

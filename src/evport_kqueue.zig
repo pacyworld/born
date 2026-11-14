@@ -91,8 +91,9 @@ pub const Event = types.Event;
 pub const Signal = types.Signal;
 pub const TimerMode = types.TimerMode;
 
-/// OutOfMemory: the wake-pipe registration could not be staged during init.
-pub const InitError = error{ KqueueFailed, PipeFailed, OutOfMemory };
+/// SystemResources: kqueue, the EVFILT_USER add, or the wake pipe was
+/// refused. OutOfMemory: the wake-pipe registration could not be staged.
+pub const InitError = types.InitError;
 /// A stashed allocation failure is reported as OutOfMemory; kernel
 /// rejections of staged changes arrive as Event.err instead.
 pub const WaitError = error{ WaitFailed, OutOfMemory };
@@ -143,15 +144,15 @@ pub const EvPort = struct {
     /// The wake registration is part of init: if it fails, init fails with
     /// everything released instead of returning a port without a wake source.
     pub fn init(alloc: std.mem.Allocator) InitError!EvPort {
-        const kq = compat.kqueue() catch return InitError.KqueueFailed;
+        const kq = compat.kqueue() catch return InitError.SystemResources;
         errdefer compat.close(kq);
 
         var fds = [2]c_int{ -1, -1 };
         if (have_user) {
             var kev = change(wake_ident, EVFILT_USER, EV_ADD | EV_CLEAR, &wake_sentinel);
-            kevent1(kq, &kev) catch return InitError.KqueueFailed;
+            kevent1(kq, &kev) catch return InitError.SystemResources;
         } else {
-            fds = compat.pipe2(PIPE2_FLAGS) catch return InitError.PipeFailed;
+            fds = compat.pipe2(PIPE2_FLAGS) catch return InitError.SystemResources;
         }
         errdefer if (!have_user) {
             compat.close(fds[0]);

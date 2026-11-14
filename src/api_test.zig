@@ -22,6 +22,7 @@ test "reactor has exact non-generic handle and event API" {
         try std.testing.expect(@TypeOf(Port.wakeKey) == fn () *anyopaque);
     }
     try std.testing.expect(@TypeOf(Port.init) == fn (std.mem.Allocator) backend.InitError!Port);
+    try std.testing.expect(backend.InitError == @import("types.zig").InitError);
     try std.testing.expect(@TypeOf(Port.deinit) == fn (*Port) void);
     inline for (.{ "monitorRead", "wantWrite" }) |name| {
         try std.testing.expect(@TypeOf(@field(Port, name)) == fn (*Port, Handle, ?*anyopaque) void);

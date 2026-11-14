@@ -49,6 +49,15 @@ pub const TimerMode = enum {
     repeat,
 };
 
+/// `EvPort.init`, the same on every backend.
+pub const InitError = error{
+    /// The kernel refused the port or its wake source (epoll set, eventfd,
+    /// kqueue, `EVFILT_USER` knote, wake pipe, completion port).
+    SystemResources,
+    /// Port bookkeeping allocation failed.
+    OutOfMemory,
+};
+
 /// `EvPort.addTimer`, the same on every backend.
 pub const TimerError = error{
     /// Timers are not available on this backend or target.
