@@ -36,8 +36,10 @@
 //!     re-inserted at `deadline + fired * period_ns`, the first slot of its
 //!     original phase after `now_ns`, so it never drifts. The period count
 //!     and next deadline saturate at `maxInt(u64)` (`fired` at `maxInt(u32)`),
-//!     so expiration at the clock's upper bound never traps. Entries that do
-//!     not fit in `out` stay due and are returned by the next call.
+//!     so expiration at the clock's upper bound never traps. A deadline
+//!     saturated at `maxInt(u64)` stays due there: every `expire` at that
+//!     bound fires it again with `fired = 1`. Entries that do not fit in
+//!     `out` stay due and are returned by the next call.
 //!   - Equal deadlines expire in the order they were added or re-armed.
 //!   - `next()` is what a backend arms its single kernel timer to (timerfd
 //!     with CLOCK_MONOTONIC and TFD_TIMER_ABSTIME on epoll, a relative
