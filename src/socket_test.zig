@@ -451,6 +451,32 @@ test "plain socket cancellation before connect completion is absorbed" {
     try pair.drain();
 }
 
+test "plain socket connectDone on a never-started socket reports SocketError" {
+    // The handle check precedes completion state, matching POSIX: a stream
+    // that never opened reports SocketError, not ConnectFailed.
+    var client: PlainNb = .{};
+    defer client.deinit();
+    try std.testing.expectError(error.SocketError, client.connectDone());
+}
+
+test "plain socket connectDone after close reports SocketError" {
+    // A closed handle reports SocketError even with a connect still pending,
+    // matching POSIX's handle-first check rather than the pending state's
+    // ConnectFailed.
+    var pair: Pair = undefined;
+    try pair.init();
+    defer pair.deinit();
+    pair.close(&pair.client);
+    pair.client.deinit();
+    const address = try compat.Address.parseIp4("127.0.0.1", 0);
+    var server = try address.listen(.{ .force_nonblocking = true });
+    defer server.deinit();
+    try pair.client.startConnectInto(alloc, "127.0.0.1", server.listen_address.getPort(), &pair.port, &pair.client);
+    pair.close(&pair.client);
+    try std.testing.expectError(error.SocketError, pair.client.connectDone());
+    try pair.drain();
+}
+
 test "plain socket allocation failure releases startup state" {
     var port = try born.EvPort.init(alloc);
     defer port.deinit();

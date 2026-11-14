@@ -229,9 +229,11 @@ pub const PlainNb = struct {
     }
 
     /// Confirm the connect after its completion (or inline completion).
+    /// The handle is checked first, so a closed or never-started stream
+    /// reports `SocketError` like POSIX, regardless of its connect state.
     pub fn connectDone(self: *PlainNb) io.ConnectDoneError!void {
-        if (self.connect_err != null or !self.connect_done or self.connect_pending) return error.ConnectFailed;
         if (self.sock == ws2.INVALID_SOCKET) return error.SocketError;
+        if (self.connect_err != null or !self.connect_done or self.connect_pending) return error.ConnectFailed;
         try self.postConnectSetup();
     }
 
