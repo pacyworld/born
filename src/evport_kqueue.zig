@@ -20,6 +20,8 @@
 //! OpenBSD use a nonblocking pipe instead: wake writes one byte and wait drains
 //! the pipe to one event. A refused wake write or drain, or a wake pipe
 //! at EOF, is reported by the next non-empty wait on both wake channels.
+//! On NetBSD the EOF knote re-fires under EV_CLEAR, so a dead pipe keeps
+//! reporting WaitFailed on every later non-empty wait, not only the first.
 //! EVFILT_SIGNAL is not a wake channel.
 //!
 //! Closing a descriptor removes its live filters. At the end-of-batch reap
@@ -99,7 +101,8 @@ pub const TimerMode = types.TimerMode;
 pub const InitError = types.InitError;
 /// A stashed allocation failure is reported as OutOfMemory; kernel
 /// rejections of staged changes arrive as Event.err instead.
-pub const WaitError = error{ WaitFailed, OutOfMemory };
+/// InvalidArgument is wait()'s rejection of a negative timeout_ms.
+pub const WaitError = error{ InvalidArgument, WaitFailed, OutOfMemory };
 pub const TimerError = types.TimerError;
 pub const SignalError = types.SignalError;
 /// Errors returned by process-watch operations.
@@ -361,12 +364,18 @@ pub const EvPort = struct {
 
     /// Submit every staged change before blocking, harvesting records as they
     /// arrive. Earlier records are returned first; the next wait continues
-    /// with any remaining changes. `timeout_ms` must be null or nonnegative.
-    /// null blocks until an event, zero harvests without blocking, and
-    /// positive values wait that many milliseconds. A stashed allocation or
-    /// wake failure is reported here once, ahead of the syscall. An empty wait
-    /// neither consumes nor reports it.
+    /// with any remaining changes. `timeout_ms` must be null or nonnegative;
+    /// a negative value returns error.InvalidArgument before the empty-slice
+    /// shortcut or any syscall. null blocks until an event, zero harvests
+    /// without blocking, and positive values wait that many milliseconds.
+    /// A stashed allocation or wake failure is reported here ahead of the
+    /// syscall; an empty wait neither consumes nor reports it. A dead NetBSD
+    /// wake pipe re-reports WaitFailed on every non-empty wait: its EOF knote
+    /// re-fires under EV_CLEAR.
     pub fn wait(self: *EvPort, events: []Event, timeout_ms: ?i32) WaitError!usize {
+        if (timeout_ms) |t| {
+            if (t < 0) return WaitError.InvalidArgument;
+        }
         if (events.len == 0) return 0;
         if (self.pending_error) |err| {
             self.pending_error = null;
@@ -495,6 +504,10 @@ pub const EvPort = struct {
         return std.math.cast(u32, data) orelse std.math.maxInt(u32);
     }
 
+    /// Drains the wake pipe to one coalesced event. A refused read, or a
+    /// zero-byte read (EOF: the write end closed), marks the channel dead
+    /// through wake_failed. On NetBSD the EOF knote re-fires under EV_CLEAR,
+    /// so every later wait drains and re-marks it.
     fn drainWake(self: *EvPort) void {
         var tmp: [64]u8 = undefined;
         while (true) {
@@ -981,7 +994,9 @@ test "kqueue: a pipe wake at EOF drains without spinning" {
     evp.wake_w = -1;
     try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));
     try std.testing.expect(events[0].wake);
-    // EOF means the wake channel is dead: the next wait reports it once.
+    // EOF means the wake channel is dead: the next wait reports WaitFailed.
+    // On NetBSD the EOF knote re-fires, so later waits report it again; only
+    // the first is asserted here.
     try std.testing.expectError(Error.WaitFailed, evp.wait(&events, 0));
 }
 

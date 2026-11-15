@@ -55,7 +55,8 @@ pub const InitError = types.InitError;
 /// SourceFailed is an internal source (timerfd, signalfd, the process set)
 /// that could not be harvested or re-armed. WaitFailed also covers a wake
 /// source whose write or drain the kernel refused, or that reached EOF.
-pub const WaitError = error{ WaitFailed, RegisterFailed, SourceFailed, OutOfMemory };
+/// InvalidArgument is wait()'s rejection of a negative timeout_ms.
+pub const WaitError = error{ InvalidArgument, WaitFailed, RegisterFailed, SourceFailed, OutOfMemory };
 pub const TimerError = types.TimerError;
 pub const SignalError = types.SignalError;
 /// Errors returned by process-watch operations.
@@ -424,8 +425,10 @@ pub const EvPort = struct {
     // ------------------------------------------------------------ wait ----
 
     /// Harvest events in one epoll_wait call. `timeout_ms` must be null or
-    /// nonnegative. null blocks until an event, zero harvests without blocking,
-    /// and positive values wait that many milliseconds. A stashed registration
+    /// nonnegative; a negative value returns error.InvalidArgument before the
+    /// empty-slice shortcut or any syscall. null blocks until an event, zero
+    /// harvests without blocking, and positive values wait that many
+    /// milliseconds. A stashed registration
     /// or wake failure is reported here once, ahead of the syscall. An empty
     /// wait neither consumes nor reports it. Pseudo registrations for unpollable
     /// descriptors are always ready: while any exist the syscall never blocks,
@@ -433,6 +436,9 @@ pub const EvPort = struct {
     /// goes to its kind's harvest, which may emit several events or none, so
     /// wait can return zero before its timeout.
     pub fn wait(self: *EvPort, events: []Event, timeout_ms: ?i32) WaitError!usize {
+        if (timeout_ms) |t| {
+            if (t < 0) return WaitError.InvalidArgument;
+        }
         if (events.len == 0) return 0;
         if (self.pending_error) |err| {
             self.pending_error = null;

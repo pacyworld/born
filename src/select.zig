@@ -11,7 +11,7 @@ const builtin = @import("builtin");
 /// Native notification mechanism behind the event port.
 pub const Backend = enum { kqueue, epoll, iocp };
 
-/// Backend for this build; the supported target set lives here.
+/// Backend for this build; the supported operating systems live here.
 pub const backend: Backend = switch (builtin.os.tag) {
     .freebsd, .netbsd, .openbsd, .macos => .kqueue,
     .linux => .epoll,
