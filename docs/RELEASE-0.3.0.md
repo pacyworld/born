@@ -15,9 +15,9 @@
   baseline (every slot delegated, no loop thread) is the default and the supported
   configuration in 0.3.0.
 - `capabilities.time = .born_evented` is opt-in and **experimental** in 0.3.0. It
-  currently misses its written benchmark target; the remaining work is tracked in
-  #101 (P5.2b). It is **not recommended for production** until #101 meets that
-  target.
+  currently misses its written benchmark target. #101 (P5.2b) must be closed with
+  measured numbers or explicitly accepted before the tag; the route is **not
+  recommended for production** until its target is met.
 - A Born capability route that is not implemented is rejected at construction
   (`CapabilityUnsupported`), never silently delegated.
 
@@ -27,9 +27,17 @@
 2. mcp-bridge#35 repins onto the tag.
 3. sonya-core moves both pins in one commit.
 
+## Scope gated before the tag
+
+Per the owner go-ahead, v0.3.0 ships the born.io P5 increments and is tagged only
+once they are merged and tested: P5.3 (Unix streams), P5.4 (process family) and
+P5.5 (proof consumers on all three CI kernels), with #101 (P5.2b time-route
+performance) closed with measured numbers or explicitly accepted, tri-kernel
+born-io CI green on Zig 0.16.0 and 0.17.1, and the #23 release-checklist audit at
+the cut commit. The final shipped surface is recorded against #23.
+
 ## Post-0.3.0 (not in this tag)
 
-- #101: P5.2b time-route performance to the written target.
 - #96-#99: process / spawn work (cwd, process groups, macOS and Windows child
   process waits).
-- P5.3 network family (design stage; continues independently of the tag).
+- P5.3b: the full server path via additive core listener options (Option A).
