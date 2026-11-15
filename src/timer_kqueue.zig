@@ -58,7 +58,8 @@ const ENOENT = @intFromEnum(compat.E.NOENT);
 const NOTE_MSECONDS: @FieldType(Kevent, "fflags") = switch (builtin.os.tag) {
     .freebsd => 0x2,
     .netbsd, .openbsd => 0,
-    else => if (builtin.os.tag.isDarwin()) 0 else @compileError("born: unknown EVFILT_TIMER millisecond unit"),
+    .macos => 0,
+    else => @compileError("born: unknown EVFILT_TIMER millisecond unit"),
 };
 
 /// Per-port timer bookkeeping, a field of EvPort (`timers`).

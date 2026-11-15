@@ -348,7 +348,7 @@ test "raw Stream and Server carry blocking TCP traffic" {
 
 test "kqueue returns a native descriptor on kqueue targets" {
     switch (native_os) {
-        .freebsd, .netbsd, .openbsd, .macos, .ios, .tvos, .watchos, .visionos, .driverkit => {},
+        .freebsd, .netbsd, .openbsd, .macos => {},
         else => return error.SkipZigTest,
     }
     const fd = try compat.kqueue();

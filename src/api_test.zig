@@ -2,12 +2,8 @@ const std = @import("std");
 const builtin = @import("builtin");
 const compat = @import("compat");
 const born = @import("root.zig");
-const backend = switch (builtin.os.tag) {
-    .freebsd, .macos, .netbsd, .openbsd => @import("evport_kqueue.zig"),
-    .linux => @import("evport_epoll.zig"),
-    .windows => @import("evport_iocp.zig"),
-    else => @compileError("Unsupported platform"),
-};
+const select = @import("select.zig");
+const backend = select.impl;
 
 test "reactor has exact non-generic handle and event API" {
     const Port = backend.EvPort;
@@ -68,6 +64,15 @@ test "reactor has exact non-generic handle and event API" {
     try std.testing.expect(event.overlapped == null);
     try std.testing.expectEqual(@as(usize, 0), event.err_no);
     try std.testing.expectEqual(@as(usize, 0), event.bytes);
+}
+
+test "public API resolves through the shared backend selector" {
+    try std.testing.expect(backend == select.impl);
+    try std.testing.expect(born.EvPort == select.impl.EvPort);
+    try std.testing.expectEqualStrings(@tagName(select.backend), born.backend_name);
+    const socket = @import("socket.zig");
+    try std.testing.expect(socket.PlainNb == select.socket_impl.PlainNb);
+    try std.testing.expect(socket.Listener == select.listener_impl.Listener);
 }
 
 test "public overlapped type executes post and absorbCompletion" {

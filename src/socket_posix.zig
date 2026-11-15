@@ -19,8 +19,9 @@ const NbWrite = io.NbWrite;
 const MSG_NOSIGNAL: u32 = switch (builtin.os.tag) {
     .freebsd => 0x00020000,
     .linux => 0x00004000,
-    .macos, .ios, .tvos, .watchos, .visionos, .driverkit => 0,
-    else => compat.MSG.NOSIGNAL,
+    .macos => 0,
+    .netbsd, .openbsd => compat.MSG.NOSIGNAL,
+    else => @compileError("born: unknown MSG_NOSIGNAL for this target"),
 };
 
 /// Plaintext stream socket (TCP and Unix where supported) for readiness I/O.
