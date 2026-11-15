@@ -46,8 +46,8 @@ pub const InitError = types.InitError;
 pub const AssociateError = error{AssociateFailed};
 /// AssociateFailed is a stashed monitorRead failure, PostFailed a stashed
 /// post()/wake() failure, OutOfMemory an internal harvest that could not
-/// allocate.
-pub const WaitError = error{ WaitFailed, AssociateFailed, PostFailed, OutOfMemory };
+/// allocate. InvalidArgument is wait()'s rejection of a negative timeout_ms.
+pub const WaitError = error{ InvalidArgument, WaitFailed, AssociateFailed, PostFailed, OutOfMemory };
 pub const TimerError = types.TimerError;
 pub const SignalError = types.SignalError;
 /// Errors returned by process-watch operations.
@@ -226,12 +226,17 @@ pub const EvPort = struct {
     }
 
     /// Harvest one batch of completions in one GetQueuedCompletionStatusEx
-    /// call. `timeout_ms` must be null or nonnegative. null blocks until a
+    /// call. `timeout_ms` must be null or nonnegative; a negative value
+    /// returns error.InvalidArgument before the empty-slice shortcut or any
+    /// syscall. null blocks until a
     /// completion, zero harvests without blocking, and positive values wait
     /// that many milliseconds. Internal posts go to their kind's harvest,
     /// which may emit several events or none, so wait can return zero before
     /// its timeout.
     pub fn wait(self: *EvPort, events: []Event, timeout_ms: ?i32) WaitError!usize {
+        if (timeout_ms) |t| {
+            if (t < 0) return WaitError.InvalidArgument;
+        }
         if (events.len == 0) return 0;
         if (self.pending_error) |err| {
             self.pending_error = null;
@@ -241,7 +246,7 @@ pub const EvPort = struct {
         var entries: [64]CompletionEntry = undefined;
         const cap = @min(events.len, entries.len);
         var removed: u32 = 0;
-        const ms: u32 = if (timeout_ms) |t| @intCast(@max(t, 0)) else windows.INFINITE;
+        const ms: u32 = if (timeout_ms) |t| @intCast(t) else windows.INFINITE;
         const ok = kernel32.GetQueuedCompletionStatusEx(self.iocp, @ptrCast(&entries), @intCast(cap), &removed, ms, 0);
         if (ok == 0) {
             const err = kernel32.GetLastError();

@@ -28,6 +28,8 @@
 //!   kqueue bounds each submission to the eventlist capacity, as documented
 //!   in docs/kqueue.md. `EvPort.init` itself fails when its wake source
 //!   cannot be registered, releasing everything it allocated.
+//! - wait() rejects a negative `timeout_ms` with `error.InvalidArgument` on
+//!   every backend, before the empty-slice shortcut or any syscall.
 //! - Regular files are portable readiness sources. kqueue reports them ready
 //!   natively, and epoll emulates that with always-ready pseudo registrations.
 //! - Process exits from `EvPort.watchProcess` arrive as `Event.exited` and

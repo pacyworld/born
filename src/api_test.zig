@@ -36,9 +36,9 @@ test "reactor has exact non-generic handle and event API" {
     try std.testing.expect(@TypeOf(backend.blockSignals) == fn ([]const types.Signal) types.SignalError!void);
     try std.testing.expect(@TypeOf(Port.watchProcess) == fn (*Port, Handle, ?*anyopaque) types.ProcessError!void);
     try std.testing.expect(@TypeOf(Port.unwatchProcess) == fn (*Port, Handle) void);
-    // wait() reports only loop failures; primitive refusals stay with the
-    // call that caused them.
-    inline for (.{ "Unsupported", "InvalidArgument", "SignalInUse", "SignalNotBlocked", "BadHandle" }) |name| {
+    // wait() reports loop failures and rejects its own negative timeout;
+    // primitive refusals stay with the call that caused them.
+    inline for (.{ "Unsupported", "SignalInUse", "SignalNotBlocked", "BadHandle" }) |name| {
         for (compat.errorSetNames(backend.WaitError)) |error_name| {
             try std.testing.expect(!std.mem.eql(u8, error_name, name));
         }
@@ -73,6 +73,24 @@ test "public API resolves through the shared backend selector" {
     const socket = @import("socket.zig");
     try std.testing.expect(socket.PlainNb == select.socket_impl.PlainNb);
     try std.testing.expect(socket.Listener == select.listener_impl.Listener);
+}
+
+test "wait rejects negative timeouts identically on every backend" {
+    var port = try backend.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    var empty: [0]backend.Event = .{};
+    var events: [4]backend.Event = undefined;
+    // Validation precedes the empty-slice shortcut and any syscall.
+    try std.testing.expectError(backend.WaitError.InvalidArgument, port.wait(&empty, -1));
+    try std.testing.expectError(backend.WaitError.InvalidArgument, port.wait(&events, -1));
+    try std.testing.expectError(backend.WaitError.InvalidArgument, port.wait(&events, std.math.minInt(i32)));
+    // A queued wake survives the rejection; a valid wait still harvests it.
+    port.wake();
+    try std.testing.expectError(backend.WaitError.InvalidArgument, port.wait(&events, -1));
+    const n = try port.wait(&events, 1000);
+    try std.testing.expectEqual(@as(usize, 1), n);
+    try std.testing.expect(events[0].wake);
+    try std.testing.expectEqual(@as(usize, 0), try port.wait(&events, 0));
 }
 
 test "public overlapped type executes post and absorbCompletion" {
