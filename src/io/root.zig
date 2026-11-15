@@ -57,8 +57,12 @@ pub const loopError = shim.loopError;
 
 /// Latency breakdown snapshot of completed Born-route sleeps.
 pub const TimeStats = shim.TimeStats;
-/// Snapshot of the time route's latency breakdown accumulators.
+/// Snapshot of the time route's latency breakdown accumulators. Reports
+/// zeros when the `time_stats` build option is off (the default).
 pub const timeStats = shim.timeStats;
+/// Comptime gate for the latency-breakdown instrument (`time_stats` build
+/// option): off by default, enabled in the test and bench builds.
+pub const time_stats_enabled = shim.time_stats_enabled;
 
 /// The complete explicit Threaded-delegation baseline vtable. To check that an
 /// interface uses it, compare slot contents (`std.meta.eql`), not the address:

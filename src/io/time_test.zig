@@ -392,6 +392,20 @@ test "wakes fire only on empty-to-non-empty queue transitions" {
     const interface = try initTimeIo(&port);
     defer born_io.deinit(interface);
 
+    if (!born_io.time_stats_enabled) {
+        // Default config: the sleep path performs no shared writes, and the
+        // snapshot reports the documented zeros.
+        try Io.sleep(interface, .fromMilliseconds(5), .awake);
+        const z = born_io.timeStats(interface);
+        try expectEqual(@as(u64, 0), z.ops);
+        try expectEqual(@as(u64, 0), z.wakes);
+        try expectEqual(@as(u64, 0), z.submit_wake_ns);
+        try expectEqual(@as(u64, 0), z.queue_arm_ns);
+        try expectEqual(@as(u64, 0), z.timer_span_ns);
+        try expectEqual(@as(u64, 0), z.futex_return_ns);
+        return;
+    }
+
     // Sequential sleeps: the queue is empty at every submit, so each one
     // wakes exactly once.
     const before = born_io.timeStats(interface).wakes;
