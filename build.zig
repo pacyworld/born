@@ -66,6 +66,8 @@ pub fn build(b: *std.Build) void {
         linkPlatform(io_mod, target);
         const io_tests = b.addTest(.{ .name = "born-io-tests", .root_module = io_mod });
         test_step.dependOn(&b.addRunArtifact(io_tests).step);
+        const install_io_tests = b.addInstallArtifact(io_tests, .{});
+        b.step("test-io-bin", "Install the selected target's born.io test executable without running it").dependOn(&install_io_tests.step);
 
         // On request only: the time-route benchmark (P5.2), installed as
         // zig-out/bin/born-time-bench. Driver and acceptance: bench/time.sh.
