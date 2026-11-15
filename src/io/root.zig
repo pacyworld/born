@@ -10,10 +10,11 @@
 //! Threaded, and an unimplemented route is rejected at construction rather
 //! than silently falling back.
 //!
-//! The foundation baseline delegates every vtable slot to Threaded through
-//! forwarding thunks. It establishes the composition and the compatibility
-//! gate; it is not evidence that any operation runs on Born's reactor. Born
-//! evented routes are enabled per family in later increments.
+//! The all-Threaded baseline delegates every vtable slot to Threaded through
+//! forwarding thunks. With `capabilities.time = .born_evented` the time family
+//! (`sleep`, monotonic `now`) runs on Born's reactor through the Scale model
+//! machinery; every other slot keeps delegating. Later increments enable the
+//! remaining families.
 //!
 //! Removal is `git rm -r src/io` plus the conditional export lines in
 //! `build.zig`; nothing in the core depends on this module.
@@ -41,10 +42,12 @@ pub const InitError = shim.InitError;
 pub const Shim = shim.Shim;
 
 /// Builds a `std.Io` over Born's event port. Release the returned interface
-/// with `deinit`. The foundation baseline rejects any Born capability route at
-/// construction.
+/// with `deinit`. The time route (`capabilities.time = .born_evented`) is
+/// serviced by Born's reactor; Born routes for the other families are still
+/// rejected at construction.
 pub const io = shim.io;
-/// Releases the composite created by `io`, joining the Threaded pool first.
+/// Releases the composite created by `io`, joining the Threaded pool and the
+/// time route's loop thread.
 pub const deinit = shim.deinit;
 
 /// The complete explicit Threaded-delegation baseline vtable. To check that an
@@ -52,10 +55,15 @@ pub const deinit = shim.deinit;
 /// comptime-known constants have no guaranteed unique runtime address.
 pub const baseline_vtable = shim.baseline_vtable;
 
+/// The time-route vtable: the baseline with `sleep` and monotonic `now`
+/// serviced by Born's reactor. Compare slot contents, not the address.
+pub const time_vtable = shim.time_vtable;
+
 test {
     _ = @import("assert.zig");
     _ = @import("shim.zig");
     _ = @import("shim_test.zig");
+    _ = @import("time_test.zig");
 }
 
 test "module exposes the pinned interface shape" {

@@ -28,15 +28,20 @@ test "io rejects an unimplemented Born route at construction" {
     var port = try born.EvPort.init(std.testing.allocator);
     defer port.deinit();
 
-    // No silent fallback: a Born route that the baseline does not implement is
-    // a construction error, not a delegation to Threaded.
-    try std.testing.expectError(error.CapabilityUnsupported, born_io.io(&port, .{
-        .allocator = std.testing.allocator,
-        .capabilities = .{ .time = .born_evented },
-    }));
+    // No silent fallback: a Born route that is not implemented is a
+    // construction error, not a delegation to Threaded. The time route is
+    // implemented (P5.2) and exercised in time_test.zig.
     try std.testing.expectError(error.CapabilityUnsupported, born_io.io(&port, .{
         .allocator = std.testing.allocator,
         .capabilities = .{ .network = .born_evented },
+    }));
+    try std.testing.expectError(error.CapabilityUnsupported, born_io.io(&port, .{
+        .allocator = std.testing.allocator,
+        .capabilities = .{ .file = .born_evented },
+    }));
+    try std.testing.expectError(error.CapabilityUnsupported, born_io.io(&port, .{
+        .allocator = std.testing.allocator,
+        .capabilities = .{ .process = .born_evented },
     }));
 }
 
