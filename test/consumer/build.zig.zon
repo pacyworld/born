@@ -1,0 +1,10 @@
+.{
+    .name = .born_consumer,
+    .version = "0.0.0",
+    .fingerprint = 0xeaef63f63b16929c,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .born = .{ .path = "../.." },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}
