@@ -33,16 +33,20 @@
 //!   cancel's `EV_DELETE` can fail to stage under memory pressure), so this
 //!   check is the structural use-after-free guard, not an optimization.
 //! - Completion return: the submitter blocks on a cancelable Threaded futex
-//!   wait on the node's state word. The loop publishes the terminal state with
-//!   a release store and signals the futex, under the queue mutex, then frees
-//!   the slot. Cancellation composes: Threaded's cancel interrupts the
-//!   submitter's futex wait; the submitter sets `cancel_requested` and pushes
-//!   the slot index on a dedicated cancel list (links live in the slot table,
-//!   never in caller storage), waking the loop only on an empty-to-non-empty
-//!   transition. The loop drains that list each cycle and disarms only the
-//!   canceled nodes; it never scans the armed population. The submitter drains
-//!   uncancelably until retirement before returning, so the loop never touches
-//!   stack storage after the call unwinds.
+//!   wait on the node's state word. The loop publishes the terminal state
+//!   with a release store and frees the slot under the queue mutex (atomic
+//!   with the cancel path's occupancy check), then signals the futex outside
+//!   the mutex. The wake is address-keyed and never reads the word, so it is
+//!   safe even if the submitter has already returned and reused the frame;
+//!   the store precedes the wake, so no wakeup is lost. Cancellation
+//!   composes: Threaded's cancel interrupts the submitter's futex wait; the
+//!   submitter sets `cancel_requested` and pushes the slot index on a
+//!   dedicated cancel list (links live in the slot table, never in caller
+//!   storage), waking the loop only on an empty-to-non-empty transition.
+//!   The loop drains that list each cycle and disarms only the canceled
+//!   nodes; it never scans the armed population. The submitter drains
+//!   uncancelably until retirement before returning, so the loop never
+//!   touches stack storage after the call unwinds.
 //! - Failure visibility: `sleep`'s declared set is `error{Canceled}` only, so
 //!   route-level refusals (port wait failures, timer-arm refusals, slot-table
 //!   growth failures) are latched in the composite and exposed by
@@ -389,6 +393,8 @@ pub const Shim = struct {
                     self.port.cancelTimer(i);
                     slot.armed = false;
                     self.retireLocked(op, i, true);
+                    // Cancel drain is the cold path: wake under the mutex.
+                    self.threaded_io.vtable.futexWake(self.threaded_io.userdata, &op.state.raw, 1);
                 }
             }
             idx = next;
@@ -440,21 +446,28 @@ pub const Shim = struct {
         }
     }
 
-    /// Publish the terminal state, wake the submitter's futex wait, and free
-    /// the slot. Takes the queue mutex: retirement must be atomic with the
-    /// cancel path's occupancy check.
+    /// Publish the terminal state and free the slot under the queue mutex
+    /// (retirement must be atomic with the cancel path's occupancy check),
+    /// then wake the submitter's futex wait outside the mutex. The wake is
+    /// an address-keyed kernel operation that never reads the word, so it
+    /// is safe after the submitter observes the terminal state and returns:
+    /// the store precedes the wake (no lost wakeup), and a wake that lands
+    /// on a reused stack frame is a spurious wake the completion retry loop
+    /// already tolerates. Keeping the wake syscall out of the critical
+    /// section is what keeps 64 submitters from serializing on it.
     fn retire(self: *Shim, op: *SleepOp, canceled: bool) void {
         self.queue.mutex.lockUncancelable(self.threaded_io);
         self.retireLocked(op, op.slot_index, canceled);
         self.queue.mutex.unlock(self.threaded_io);
+        self.threaded_io.vtable.futexWake(self.threaded_io.userdata, &op.state.raw, 1);
     }
 
-    /// Queue mutex held. After the terminal store the submitter may return
-    /// and reuse its frame: this is the last touch of the node.
+    /// Queue mutex held: terminal store plus slot free, no wake. After the
+    /// terminal store the submitter may return and reuse its frame: no
+    /// field of the node is read or written past this point.
     fn retireLocked(self: *Shim, op: *SleepOp, index: u32, canceled: bool) void {
         op.outcome_canceled = canceled;
         op.state.store(1, .release);
-        self.threaded_io.vtable.futexWake(self.threaded_io.userdata, &op.state.raw, 1);
         const slot = &self.slots[index];
         slot.op = null;
         slot.armed = false;
