@@ -53,7 +53,8 @@ pub const TimerMode = types.TimerMode;
 pub const InitError = types.InitError;
 /// RegisterFailed and OutOfMemory are stashed registration failures;
 /// SourceFailed is an internal source (timerfd, signalfd, the process set)
-/// that could not be harvested or re-armed.
+/// that could not be harvested or re-armed. WaitFailed also covers a wake
+/// source whose write or drain the kernel refused, or that reached EOF.
 pub const WaitError = error{ WaitFailed, RegisterFailed, SourceFailed, OutOfMemory };
 pub const TimerError = types.TimerError;
 pub const SignalError = types.SignalError;
@@ -120,6 +121,10 @@ pub const EvPort = struct {
     /// epoll_ctl or an allocation failure is returned by the next non-empty
     /// wait() instead of being dropped on the floor.
     pending_error: ?WaitError = null,
+    /// Set by a wake() whose eventfd write the kernel refused, or by a
+    /// wake drain that failed or hit EOF; the next non-empty wait()
+    /// reports it as WaitFailed. Atomic because wake() runs on any thread.
+    wake_failed: std.atomic.Value(bool) = .init(false),
     /// Live pseudo registrations: wait() must not block while any exist.
     pseudo_count: usize = 0,
     /// Internal source fd per kind, -1 when absent. The fd is owned by the
@@ -226,10 +231,16 @@ pub const EvPort = struct {
         if (kv.value.pseudo) self.pseudo_count -= 1;
     }
 
-    /// Wake a wait() blocked in another thread.
+    /// Wake a wait() blocked in another thread. INTR is retried inside
+    /// compat.write. A saturated counter (WouldBlock) is benign: a wakeup is
+    /// already pending. Any other refusal is reported by the next non-empty
+    /// wait().
     pub fn wake(self: *EvPort) void {
         const one: u64 = 1;
-        _ = compat.write(self.wake_fd, std.mem.asBytes(&one)) catch {};
+        _ = compat.write(self.wake_fd, std.mem.asBytes(&one)) catch |err| switch (err) {
+            error.WouldBlock => {},
+            else => self.wake_failed.store(true, .release),
+        };
     }
 
     /// Arm a timer. `id` is caller-chosen and unique per port; re-adding a
@@ -415,8 +426,8 @@ pub const EvPort = struct {
     /// Harvest events in one epoll_wait call. `timeout_ms` must be null or
     /// nonnegative. null blocks until an event, zero harvests without blocking,
     /// and positive values wait that many milliseconds. A stashed registration
-    /// failure is reported here once, ahead of the syscall. An empty wait
-    /// neither consumes nor reports it. Pseudo registrations for unpollable
+    /// or wake failure is reported here once, ahead of the syscall. An empty
+    /// wait neither consumes nor reports it. Pseudo registrations for unpollable
     /// descriptors are always ready: while any exist the syscall never blocks,
     /// and they fill whatever space the kernel left. A ready internal source
     /// goes to its kind's harvest, which may emit several events or none, so
@@ -427,6 +438,7 @@ pub const EvPort = struct {
             self.pending_error = null;
             return err;
         }
+        if (self.wake_failed.swap(false, .acquire)) return WaitError.WaitFailed;
         var ebuf: [64]linux.epoll_event = undefined;
         const cap = @min(events.len, ebuf.len);
         const timeout: i32 = if (self.pseudo_count == 0) timeout_ms orelse -1 else 0;
@@ -490,7 +502,20 @@ pub const EvPort = struct {
     fn drainWake(self: *EvPort) void {
         var tmp: [8]u8 = undefined;
         while (true) {
-            _ = compat.read(self.wake_fd, &tmp) catch break;
+            const n = compat.read(self.wake_fd, &tmp) catch |err| switch (err) {
+                error.WouldBlock => break,
+                else => {
+                    self.wake_failed.store(true, .release);
+                    break;
+                },
+            };
+            // A zero-byte read is EOF: the wake source is dead. Stop
+            // instead of spinning and report the dead channel. eventfd
+            // never returns 0; the check keeps both drains uniform.
+            if (n == 0) {
+                self.wake_failed.store(true, .release);
+                break;
+            }
         }
     }
 };
@@ -590,6 +615,69 @@ test "epoll: wake posts a single coalesced event" {
     const n = try evp.wait(&events, 1000);
     try std.testing.expectEqual(@as(usize, 1), n);
     try std.testing.expect(events[0].wake);
+    try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
+}
+
+test "epoll: wakes from another thread before the first wait are not lost" {
+    var evp = try EvPort.init(std.testing.allocator);
+    defer evp.deinit();
+    const Waker = struct {
+        fn run(p: *EvPort) void {
+            for (0..100) |_| p.wake();
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Waker.run, .{&evp});
+    t.join();
+    var events: [8]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));
+    try std.testing.expect(events[0].wake);
+    try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
+}
+
+test "epoll: a refused wake write is reported by the next wait, once" {
+    var evp = try EvPort.init(std.testing.allocator);
+    defer evp.deinit();
+    // Break the wake source: a write to the closed descriptor fails EBADF.
+    compat.close(evp.wake_fd);
+    evp.wake_fd = -1;
+    evp.wake();
+    var events: [4]Event = undefined;
+    try std.testing.expectError(Error.WaitFailed, evp.wait(&events, 0));
+    try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
+}
+
+test "epoll: wake with a saturated eventfd counter stays benign" {
+    var evp = try EvPort.init(std.testing.allocator);
+    defer evp.deinit();
+    // eventfd refuses a write that would overflow the counter (EAGAIN);
+    // a wakeup is already pending, so wake() must not stash an error.
+    const max: u64 = 0xfffffffffffffffe;
+    _ = try compat.write(evp.wake_fd, std.mem.asBytes(&max));
+    evp.wake();
+    var events: [4]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 0));
+    try std.testing.expect(events[0].wake);
+    // The drain reset the counter; a later wake works normally.
+    evp.wake();
+    try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));
+    try std.testing.expect(events[0].wake);
+}
+
+test "epoll: a failed wake drain is reported by the next wait" {
+    var evp = try EvPort.init(std.testing.allocator);
+    defer evp.deinit();
+    evp.wake();
+    // A dup keeps the registration alive while the monitored number turns
+    // invalid: epoll still reports readiness, but the drain read fails EBADF.
+    const saved = try compat.dup(evp.wake_fd);
+    defer compat.close(saved);
+    compat.close(evp.wake_fd);
+    evp.wake_fd = -1;
+    var events: [4]Event = undefined;
+    try std.testing.expectEqual(@as(usize, 1), try evp.wait(&events, 1000));
+    try std.testing.expect(events[0].wake);
+    try std.testing.expectError(Error.WaitFailed, evp.wait(&events, 0));
+    // Reported once; no new edge means no further wake event.
     try std.testing.expectEqual(@as(usize, 0), try evp.wait(&events, 0));
 }
 
