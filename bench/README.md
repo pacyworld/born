@@ -56,3 +56,27 @@ sh bench/run.sh BIN storm 5 --threads 16     # accept storm
 REPLY=4194304 sh bench/run.sh BIN bulk 5 --threads 4  # short writes
 sh bench/run.sh BIN wake  5
 ```
+
+## Time-route benchmark (P5.2)
+
+`zig build bench-time` (Zig >= 0.16) installs `zig-out/bin/born-time-bench`.
+The step is not part of `test`, `test-bin` or `check-targets`. It measures the
+born.io time route (`capabilities.time = .born_evented`) against the
+all-Threaded baseline:
+
+```
+zig016 build bench-time -Doptimize=ReleaseSafe
+sh bench/time.sh zig-out/bin/born-time-bench 3
+```
+
+- Sequential phase: `--seq` sleeps (default 200) of `--sleep-ms` (default 1)
+  on the calling thread; reports p50/p99/max/mean per-sleep latency.
+- Concurrent phase: `--threads` blocking threads (default 64), one sleep in
+  flight per thread for `--seconds` (default 5); reports completed sleeps per
+  second and p50/p99 per-sleep latency. On the Born route every sleep is a
+  cross-thread submission through the shim's loop thread.
+- The measurement clock is Born's monotonic clock (`born.nowNs`,
+  CLOCK_MONOTONIC / QPC) on both routes, independent of the route under test.
+- `bench/time.sh BIN [REPS]` runs the quiet-host guard first (quiet.sh on
+  FreeBSD, a loadavg check on Linux) and refuses a busy host; it then runs
+  both routes per repetition. Report the spread over repetitions.

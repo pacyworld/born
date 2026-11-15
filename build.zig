@@ -66,6 +66,21 @@ pub fn build(b: *std.Build) void {
         linkPlatform(io_mod, target);
         const io_tests = b.addTest(.{ .name = "born-io-tests", .root_module = io_mod });
         test_step.dependOn(&b.addRunArtifact(io_tests).step);
+
+        // On request only: the time-route benchmark (P5.2), installed as
+        // zig-out/bin/born-time-bench. Driver and acceptance: bench/time.sh.
+        const time_bench_mod = b.createModule(.{
+            .root_source_file = b.path("bench/time.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "born", .module = mod },
+                .{ .name = "born.io", .module = io_mod },
+                .{ .name = "compat", .module = compat_mod },
+            },
+        });
+        const time_bench_exe = b.addExecutable(.{ .name = "born-time-bench", .root_module = time_bench_mod });
+        b.step("bench-time", "Build the born-time-bench time-route benchmark (bench/time.sh)").dependOn(&b.addInstallArtifact(time_bench_exe, .{}).step);
     }
 
     const docs_obj = b.addObject(.{
