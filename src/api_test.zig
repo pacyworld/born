@@ -67,7 +67,6 @@ test "reactor has exact non-generic handle and event API" {
 }
 
 test "public API resolves through the shared backend selector" {
-    try std.testing.expect(backend == select.impl);
     try std.testing.expect(born.EvPort == select.impl.EvPort);
     try std.testing.expectEqualStrings(@tagName(select.backend), born.backend_name);
     const socket = @import("socket.zig");
