@@ -2,8 +2,9 @@
 
 ## Supported surface
 
-- Timers, signals, and TCP / Unix listeners on kqueue, epoll and IOCP (the 0.3.0
-  workstream, #24). The README runtime-evidence table records a run on each
+- Timers, signals and TCP listeners on kqueue, epoll and IOCP, plus Unix domain
+  stream listeners on kqueue and epoll (Windows reports `Unsupported`): the 0.3.0
+  workstream, #24. The README runtime-evidence table records a run on each
   backend's own OS for every claimed primitive.
 - Windows: `born.windows.SOCKET` and `born.windows.INVALID_SOCKET` exported as the
   type and sentinel of `socket.PlainNb.sock` (#94), alongside `born.windows.OVERLAPPED`.
