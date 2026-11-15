@@ -20,17 +20,34 @@
 //!   of `EvPort.wait` and the sole mutator of port state. After `io()` returns,
 //!   the caller must not drive the port itself.
 //! - Cross-thread submission: a blocking `sleep` stack-allocates one operation
-//!   node (`SleepOp`), enqueues it on the shim's mutex-protected intrusive
-//!   queue, and calls `wake()`, the only cross-thread port call. The loop drains
-//!   the queue inside its wait cycle and arms timers on its own thread.
+//!   node (`SleepOp`), takes a slot in the loop-owned slot table, enqueues the
+//!   node on the shim's mutex-protected intrusive queue, and calls `wake()`
+//!   only when the queue went from empty to non-empty. `wake()` is the only
+//!   cross-thread port call. The loop swaps the whole queue out under the
+//!   mutex and arms timers on its own thread.
+//! - Timer identity: the timer id is the slot index and the port's `udata`
+//!   encodes (generation, index). The slot table is loop-owned storage; the
+//!   port never holds a pointer into caller stack. On fire the loop decodes
+//!   the identity, drops the event if the slot is free or the generation does
+//!   not match, and only then touches the node. Stale fires are normal (a
+//!   cancel's `EV_DELETE` can fail to stage under memory pressure), so this
+//!   check is the structural use-after-free guard, not an optimization.
 //! - Completion return: the submitter blocks on a cancelable Threaded futex
 //!   wait on the node's state word. The loop publishes the terminal state with
-//!   a release store and signals the futex. Cancellation composes: Threaded's
-//!   cancel interrupts the submitter's futex wait, the submitter requests the
-//!   disarm and wakes the loop, and the loop runs `cancelTimer` and retires
-//!   the node on that wake. The submitter drains uncancelably until retirement
-//!   before returning, so the loop never touches stack storage after the call
-//!   unwinds.
+//!   a release store and signals the futex, under the queue mutex, then frees
+//!   the slot. Cancellation composes: Threaded's cancel interrupts the
+//!   submitter's futex wait; the submitter sets `cancel_requested` and pushes
+//!   the slot index on a dedicated cancel list (links live in the slot table,
+//!   never in caller storage), waking the loop only on an empty-to-non-empty
+//!   transition. The loop drains that list each cycle and disarms only the
+//!   canceled nodes; it never scans the armed population. The submitter drains
+//!   uncancelably until retirement before returning, so the loop never touches
+//!   stack storage after the call unwinds.
+//! - Failure visibility: `sleep`'s declared set is `error{Canceled}` only, so
+//!   route-level refusals (port wait failures, timer-arm refusals, slot-table
+//!   growth failures) are latched in the composite and exposed by
+//!   `loopError(io)`. After `wait_fail_limit` consecutive wait failures the
+//!   loop retires everything and exits; later submits are rejected.
 //! - Deployment is thread-per-core: one port and one instance per core.
 //!
 //! ## Time route: per-slot overload and failure mapping
@@ -38,13 +55,15 @@
 //! The submission queue is bounded by caller-provided operation storage: every
 //! blocking call owns exactly one node, so the queue holds at most one node per
 //! concurrent caller. There is no shared ring to fill; a queue-full condition
-//! cannot occur and no slot returns a queue-full error.
+//! cannot occur and no slot returns a queue-full error. The slot table grows
+//! on demand under the queue mutex; a growth refusal is a resource failure,
+//! not overload, and maps like a timer-arm refusal below.
 //!
 //! | slot | declared error set | queue-full error | other failures |
 //! |---|---|---|---|
-//! | `sleep` | `error{Canceled}` | none: cannot occur (caller-owned nodes) | cancel request, shim stop, or timer-arm refusal (`born.TimerError`) -> `Canceled`, the set's only member; std.Io's sleep contract admits no resource error, so kernel timer exhaustion is not distinguishable from cancellation |
+//! | `sleep` | `error{Canceled}` | none: cannot occur (caller-owned nodes) | cancel request, shim stop, timer-arm refusal (`born.TimerError`), or slot-table growth refusal -> `Canceled`, the set's only member; std.Io's sleep contract admits no resource error, so the cause is latched and readable via `loopError(io)` |
 //! | `now` | infallible | n/a: direct clock read, no submission | clock refusal -> `Timestamp.zero`, matching Threaded |
-//! | `clockResolution` | `error{ClockUnavailable, Unexpected}` | n/a: stays Threaded | Threaded's mapping |
+//! | `clockResolution` | `error{ClockUnavailable, Unexpected}` | n/a: stays Threaded | Threaded's mapping; see the clock note below |
 //! | `cancel` | `void` | n/a: forwards to Threaded; the Born-side disarm rides the sleeping call's own node | none |
 //!
 //! `Canceled` from `sleep` therefore always means the operation was interrupted
@@ -53,12 +72,16 @@
 //! explicitly delegated to Threaded: Born's timers measure the monotonic timer
 //! clock only. On macOS `.awake` reads Born's CLOCK_MONOTONIC rather than
 //! Threaded's CLOCK_UPTIME_RAW so `now` and sleep deadlines share one clock.
+//! `clockResolution(.awake)` stays on Threaded, so on macOS and Windows it
+//! reports the resolution of Threaded's awake clock (CLOCK_UPTIME_RAW and the
+//! Windows interrupt-time clock respectively), not of the Born timer clock
+//! (CLOCK_MONOTONIC, QPC) that `now(.awake)` reads. Born timers have
+//! millisecond granularity: a sleep shorter than 1 ms costs at least 1 ms.
 
 const std = @import("std");
 const builtin = @import("builtin");
 const born = @import("born");
 const Io = std.Io;
-const assert = std.debug.assert;
 
 const is_017 = builtin.zig_version.minor >= 17;
 
@@ -104,6 +127,10 @@ pub const InitOptions = struct {
 pub const InitError = error{
     OutOfMemory,
     CapabilityUnsupported,
+    /// The time route's loop thread could not be spawned
+    /// (`std.Thread.SpawnError`: thread quota, system resources, memory).
+    /// Distinct from `OutOfMemory`, which reports composite/pool allocation.
+    LoopSpawnFailed,
 };
 
 /// Caller-owned operation node for the time route: one per blocking `sleep`
@@ -114,19 +141,17 @@ pub const InitError = error{
 /// thread owns it from dequeue until it publishes the terminal `state`; the
 /// submitter owns it again after observing the terminal state. The loop never
 /// touches a node after retirement, which is what makes stack storage safe.
+/// The port's timer identity refers to the loop-owned slot table, never to
+/// this node.
 pub const SleepOp = struct {
     /// Submission-queue link: submitter writes before enqueue, loop reads
     /// after dequeue.
     next: ?*SleepOp = null,
-    /// Armed-list links, loop-thread only.
-    live_next: ?*SleepOp = null,
-    live_prev: ?*SleepOp = null,
+    /// Slot-table index assigned at submit under the queue mutex; read by the
+    /// loop after dequeue and by the submitter on the cancel path.
+    slot_index: u32 = 0,
     /// Born monotonic deadline in nanoseconds; loop-thread only after enqueue.
     deadline_ns: u64 = 0,
-    /// Timer id assigned by the loop; loop-thread only.
-    timer_id: u32 = 0,
-    /// True while the timer is armed; loop-thread only.
-    armed: bool = false,
     /// Set by the loop before the terminal store: the operation ended without
     /// sleeping out its deadline (cancel request, shim stop, arm refusal).
     outcome_canceled: bool = false,
@@ -137,17 +162,67 @@ pub const SleepOp = struct {
     /// cancellation, then waits for retirement. The loop checks it at dequeue
     /// and at timer fire.
     cancel_requested: std.atomic.Value(bool) = .init(false),
+    /// Phase timestamps for the latency breakdown (`timeStats`), written by
+    /// the loop before the terminal store: `t_arm_ns` at first arm,
+    /// `t_fire_ns` at each fire. The submitter's own phase timestamps are
+    /// locals, never written here after enqueue (the loop owns the node from
+    /// dequeue, so a late submitter write would race the loop's arm).
+    t_arm_ns: u64 = 0,
+    t_fire_ns: u64 = 0,
 };
+
+/// Loop-owned timer slot. The timer id is the slot index; the port's `udata`
+/// carries (generation, index) so a stale fire is dropped without touching
+/// caller storage. `op`, `generation`, `next_free` and `cancel_next` are
+/// protected by the queue mutex; `armed` is loop-thread only.
+pub const Slot = struct {
+    /// Occupant: set under the mutex at submit, cleared under the mutex at
+    /// retirement. While occupied, only the loop thread retires it.
+    op: ?*SleepOp = null,
+    /// Bumped under the mutex each time the slot is handed to a new node.
+    generation: u32 = 0,
+    /// True while the occupant's timer is armed. Loop-thread only.
+    armed: bool = false,
+    /// Free-list link (queue mutex).
+    next_free: ?u32 = null,
+    /// Cancel-list link (queue mutex); meaningful only while occupied.
+    cancel_next: ?u32 = null,
+};
+
+/// Initial slot-table capacity, preallocated at construction for the time
+/// route so the steady-state sleep path performs no shim allocation. Growth
+/// doubles under the queue mutex.
+const slots_initial: usize = 64;
+
+/// Encode a slot identity as the port's opaque timer `udata`.
+pub fn slotUdata(index: u32, generation: u32) ?*anyopaque {
+    comptime {
+        if (@bitSizeOf(usize) < 64) @compileError("born.io time route needs a 64-bit usize");
+    }
+    const encoded: u64 = (@as(u64, generation) << 32) | index;
+    return @ptrFromInt(@as(usize, @intCast(encoded)));
+}
+
+/// Decode a timer `udata` produced by `slotUdata`.
+pub fn decodeSlotUdata(udata: ?*anyopaque) struct { index: u32, generation: u32 } {
+    const encoded: u64 = @intCast(@intFromPtr(udata.?));
+    return .{ .index = @truncate(encoded), .generation = @truncate(encoded >> 32) };
+}
 
 /// Consecutive `wait` failures with no successful wait between them before
 /// the loop retires everything and exits. One-shot stashed failures (a refused
 /// wake trigger, a transient allocation failure) are retried; a persistently
-/// broken port must not spin the loop.
+/// broken port must not spin the loop. The first failure is latched and
+/// readable via `loopError`.
 const wait_fail_limit: u32 = 8;
 
 fn shimFrom(userdata: ?*anyopaque) *Shim {
     return @ptrCast(@alignCast(userdata.?));
 }
+
+/// Result of a successful submission: the assigned slot and whether the
+/// queue went from empty to non-empty (the only case that needs a wake).
+const SubmitResult = struct { index: u32, was_empty: bool };
 
 /// The composite carried by the single `Io.userdata` pointer.
 pub const Shim = struct {
@@ -163,90 +238,172 @@ pub const Shim = struct {
     /// Set by `deinit`; the loop retires every pending operation and exits.
     stopping: std.atomic.Value(bool) = .init(false),
     /// Submission queue: intrusive FIFO of caller-owned `SleepOp` nodes. The
-    /// mutex critical sections are O(1) (push, or swap out the whole list);
-    /// the loop never holds it across `wait`. Locking is uncancelable: a
-    /// canceled holder must not strand the list. `dead` is set by the loop on
-    /// exit, after which submissions are rejected at the slot.
+    /// mutex critical sections are O(1) per node (push, or swap out the whole
+    /// list); the loop never holds it across `wait`. Locking is uncancelable:
+    /// a canceled holder must not strand the list. `dead` is set by the loop
+    /// on exit, after which submissions are rejected at the slot. The same
+    /// mutex protects the slot table's occupancy, generation, free list and
+    /// cancel list.
     queue: struct {
         mutex: Io.Mutex = .init,
         head: ?*SleepOp = null,
         tail: ?*SleepOp = null,
         dead: bool = false,
     } = .{},
-    /// Loop-thread-only state: timer id assignment and the armed-op list.
-    next_timer_id: u32 = 1,
-    id_wrapped: bool = false,
-    live: ?*SleepOp = null,
-    live_count: usize = 0,
+    /// Loop-owned slot table: timer identity and lifetime. Grows under the
+    /// queue mutex; freed at deinit after the loop joins.
+    slots: []Slot = &.{},
+    free_head: ?u32 = null,
+    /// Cancel requests: slot indices linked through `Slot.cancel_next`,
+    /// pushed by submitters under the queue mutex, drained by the loop.
+    cancel_head: ?u32 = null,
+    /// First route-level failure (wait refusal, timer-arm refusal, slot
+    /// growth refusal), as `@intFromError`; 0 = none. First writer wins.
+    loop_error: std.atomic.Value(u16) = .init(0),
+    /// Latency breakdown accumulators (nanoseconds, monotonic), fed by the
+    /// submitter after each completed sleep; read via `timeStats`.
+    stats: struct {
+        ops: std.atomic.Value(u64) = .init(0),
+        wakes: std.atomic.Value(u64) = .init(0),
+        submit_wake: std.atomic.Value(u64) = .init(0),
+        queue_arm: std.atomic.Value(u64) = .init(0),
+        timer_span: std.atomic.Value(u64) = .init(0),
+        futex_return: std.atomic.Value(u64) = .init(0),
+    } = .{},
 
-    /// Enqueue a caller-owned node. Returns false only after the loop has
-    /// exited (`queue.dead`); the caller then reports `error.Canceled` at the
-    /// slot.
-    fn submit(self: *Shim, op: *SleepOp) bool {
-        self.queue.mutex.lockUncancelable(self.threaded_io);
-        defer self.queue.mutex.unlock(self.threaded_io);
-        if (self.queue.dead) return false;
-        op.next = null;
-        if (self.queue.tail) |tail| tail.next = op else self.queue.head = op;
-        self.queue.tail = op;
-        return true;
+    /// Latch the first route-level failure; later failures do not overwrite.
+    fn latch(self: *Shim, err: anyerror) void {
+        const code: u16 = @intFromError(err);
+        _ = self.loop_error.cmpxchgStrong(0, code, .acq_rel, .monotonic);
     }
 
-    /// The loop thread: sole driver of the port. Drains submissions, blocks
-    /// in `wait` until a timer fires or a wake arrives, and retires everything
-    /// on stop or persistent port failure.
+    /// The latched failure, if any. Internal form used by `loopError`.
+    fn latchedError(self: *const Shim) ?anyerror {
+        const code = self.loop_error.load(.acquire);
+        if (code == 0) return null;
+        return @errorFromInt(code);
+    }
+
+    /// Take a free slot, growing the table if needed. Queue mutex held.
+    fn allocSlotLocked(self: *Shim) error{OutOfMemory}!u32 {
+        if (self.free_head) |i| {
+            self.free_head = self.slots[i].next_free;
+            return i;
+        }
+        const old_len = self.slots.len;
+        const new_len = if (old_len == 0) slots_initial else old_len * 2;
+        const grown = self.allocator.realloc(self.slots, new_len) catch return error.OutOfMemory;
+        self.slots = grown;
+        // Thread the new slots onto the free list, last first, so allocation
+        // hands out ascending indices.
+        var i = new_len;
+        while (i > old_len) {
+            i -= 1;
+            grown[i] = .{ .next_free = self.free_head };
+            self.free_head = @intCast(i);
+        }
+        const head = self.free_head.?;
+        self.free_head = grown[head].next_free;
+        return head;
+    }
+
+    /// Enqueue a caller-owned node into a fresh slot. Returns null after the
+    /// loop has exited (`queue.dead`) or on a slot-table growth refusal; the
+    /// caller then reports `error.Canceled` at the slot.
+    fn submit(self: *Shim, op: *SleepOp) ?SubmitResult {
+        self.queue.mutex.lockUncancelable(self.threaded_io);
+        defer self.queue.mutex.unlock(self.threaded_io);
+        if (self.queue.dead) return null;
+        const index = self.allocSlotLocked() catch {
+            self.latch(error.OutOfMemory);
+            return null;
+        };
+        const slot = &self.slots[index];
+        slot.op = op;
+        slot.generation +%= 1;
+        slot.cancel_next = null;
+        op.slot_index = index;
+        op.next = null;
+        const was_empty = self.queue.head == null;
+        if (self.queue.tail) |tail| tail.next = op else self.queue.head = op;
+        self.queue.tail = op;
+        return .{ .index = index, .was_empty = was_empty };
+    }
+
+    /// Push the node's slot on the cancel list, unless the loop already
+    /// retired it (occupancy is checked under the mutex, and retirement frees
+    /// under the same mutex, so the check cannot race). Returns whether the
+    /// cancel list went from empty to non-empty.
+    fn requestCancel(self: *Shim, op: *SleepOp) bool {
+        self.queue.mutex.lockUncancelable(self.threaded_io);
+        defer self.queue.mutex.unlock(self.threaded_io);
+        const slot = &self.slots[op.slot_index];
+        if (slot.op != op) return false;
+        const was_empty = self.cancel_head == null;
+        slot.cancel_next = self.cancel_head;
+        self.cancel_head = op.slot_index;
+        return was_empty;
+    }
+
+    /// The loop thread: sole driver of the port. Each cycle drains the cancel
+    /// list and swaps out the submission queue under the mutex, arms the
+    /// swapped nodes, then blocks in `wait` until a timer fires or a wake
+    /// arrives. Retires everything on stop or persistent port failure.
     fn loopMain(self: *Shim) void {
         var events: [64]born.Event = undefined;
         var fail_streak: u32 = 0;
         while (!self.stopping.load(.acquire)) {
-            self.drainSubmissions();
-            const n = self.port.wait(&events, null) catch {
+            const batch = self.drainLocked();
+            self.armBatch(batch);
+            const n = self.port.wait(&events, null) catch |err| {
+                self.latch(err);
                 fail_streak += 1;
                 if (fail_streak >= wait_fail_limit) break;
-                // A refused wake is stashed and reported here; the cancel
-                // request it carried still needs its disarm scan.
-                self.retireCanceled();
+                // The next cycle drains the cancel list again, so requests
+                // carried by a refused wake are still serviced.
                 continue;
             };
             fail_streak = 0;
-            var woke = false;
             for (events[0..n]) |ev| {
-                if (ev.timer) self.timerFired(@ptrCast(@alignCast(ev.udata.?)));
-                if (ev.wake) woke = true;
+                if (ev.timer) self.timerFired(ev.udata);
             }
-            // A submitter requests cancellation of an armed operation by
-            // setting cancel_requested and then waking the loop; the scan
-            // runs on wake events, not on every timer fire.
-            if (woke) self.retireCanceled();
         }
         self.retireAll();
     }
 
-    /// Disarm and retire armed operations whose submitter requested
-    /// cancellation. Loop-thread only; runs on wake events and stashed wake
-    /// failures.
-    fn retireCanceled(self: *Shim) void {
-        var node = self.live;
-        while (node) |op| {
-            const next = op.live_next;
-            if (op.cancel_requested.load(.acquire)) {
-                self.liveRemove(op);
-                if (op.armed) self.port.cancelTimer(op.timer_id);
-                op.armed = false;
-                self.retire(op, true);
-            }
-            node = next;
-        }
-    }
-
-    /// Swap the whole submission list out under the mutex, then arm or retire
-    /// each node on the loop thread.
-    fn drainSubmissions(self: *Shim) void {
+    /// One critical section: drain the cancel list, then swap out the whole
+    /// submission list. Cancel entries for queued (not yet armed) nodes are
+    /// left to `armOrRetire`'s `cancel_requested` check; entries for freed
+    /// slots are stale and dropped. Links live in the slot table, so walking
+    /// them never touches caller storage.
+    fn drainLocked(self: *Shim) ?*SleepOp {
         self.queue.mutex.lockUncancelable(self.threaded_io);
+        var idx = self.cancel_head;
+        self.cancel_head = null;
+        while (idx) |i| {
+            const slot = &self.slots[i];
+            const next = slot.cancel_next;
+            slot.cancel_next = null;
+            if (slot.op) |op| {
+                if (slot.armed) {
+                    self.port.cancelTimer(i);
+                    slot.armed = false;
+                    self.retireLocked(op, i, true);
+                }
+            }
+            idx = next;
+        }
         const head = self.queue.head;
         self.queue.head = null;
         self.queue.tail = null;
         self.queue.mutex.unlock(self.threaded_io);
+        return head;
+    }
+
+    /// Arm or retire each swapped-out node on the loop thread, outside the
+    /// mutex. The slot occupancy was established at submit, so no other
+    /// thread can retire these nodes while the loop owns them.
+    fn armBatch(self: *Shim, head: ?*SleepOp) void {
         var node = head;
         while (node) |op| {
             const next = op.next;
@@ -265,6 +422,9 @@ pub const Shim = struct {
         const head = self.queue.head;
         self.queue.head = null;
         self.queue.tail = null;
+        // Cancel entries refer to slots retired by the scan below; their
+        // links are reset when a slot is next allocated.
+        self.cancel_head = null;
         self.queue.mutex.unlock(self.threaded_io);
         var node = head;
         while (node) |op| {
@@ -272,19 +432,34 @@ pub const Shim = struct {
             self.retire(op, true);
             node = next;
         }
-        while (self.live) |op| {
-            self.live = op.live_next;
-            if (op.armed) self.port.cancelTimer(op.timer_id);
-            self.retire(op, true);
+        for (self.slots, 0..) |*slot, i| {
+            if (slot.op) |op| {
+                if (slot.armed) self.port.cancelTimer(@intCast(i));
+                self.retire(op, true);
+            }
         }
-        self.live_count = 0;
     }
 
-    /// Publish the terminal state and wake the submitter's futex wait.
+    /// Publish the terminal state, wake the submitter's futex wait, and free
+    /// the slot. Takes the queue mutex: retirement must be atomic with the
+    /// cancel path's occupancy check.
     fn retire(self: *Shim, op: *SleepOp, canceled: bool) void {
+        self.queue.mutex.lockUncancelable(self.threaded_io);
+        self.retireLocked(op, op.slot_index, canceled);
+        self.queue.mutex.unlock(self.threaded_io);
+    }
+
+    /// Queue mutex held. After the terminal store the submitter may return
+    /// and reuse its frame: this is the last touch of the node.
+    fn retireLocked(self: *Shim, op: *SleepOp, index: u32, canceled: bool) void {
         op.outcome_canceled = canceled;
         op.state.store(1, .release);
         self.threaded_io.vtable.futexWake(self.threaded_io.userdata, &op.state.raw, 1);
+        const slot = &self.slots[index];
+        slot.op = null;
+        slot.armed = false;
+        slot.next_free = self.free_head;
+        self.free_head = index;
     }
 
     fn armOrRetire(self: *Shim, op: *SleepOp) void {
@@ -297,64 +472,45 @@ pub const Shim = struct {
     /// Arm a one-shot timer for the remaining time. Born timers have
     /// millisecond granularity: round up so a sleep never returns early, and
     /// clamp to the u32 ms ceiling; `timerFired` re-arms the remainder for
-    /// longer sleeps. An arm refusal retires the operation as canceled:
-    /// `error{Canceled}` is the only error `sleep`'s declared set admits
-    /// (module overload table).
+    /// longer sleeps. An arm refusal retires the operation as canceled and
+    /// latches the cause: `error{Canceled}` is the only error `sleep`'s
+    /// declared set admits (module overload table). Loop-thread only.
     fn arm(self: *Shim, op: *SleepOp, remaining_ns: u64) void {
-        const id = self.pickTimerId();
-        self.port.addTimer(id, op, ceilMs(remaining_ns), .once) catch return self.retire(op, true);
-        op.timer_id = id;
-        op.armed = true;
-        op.live_prev = null;
-        op.live_next = self.live;
-        if (self.live) |head| head.live_prev = op;
-        self.live = op;
-        self.live_count += 1;
+        const index = op.slot_index;
+        const slot = &self.slots[index];
+        self.port.addTimer(index, slotUdata(index, slot.generation), ceilMs(remaining_ns), .once) catch |err| {
+            self.latch(err);
+            return self.retire(op, true);
+        };
+        slot.armed = true;
+        if (op.t_arm_ns == 0) op.t_arm_ns = born.nowNs() catch 0;
     }
 
-    fn timerFired(self: *Shim, op: *SleepOp) void {
+    /// Handle one timer fire. The identity refers to the loop-owned slot
+    /// table: drop the event if the index is out of range, the slot is free,
+    /// or the generation does not match, and only then touch the node. While
+    /// a slot is occupied only this thread retires it, and allocation writes
+    /// are happens-before via the queue dequeue, so the validation reads need
+    /// no mutex. Loop-thread only.
+    fn timerFired(self: *Shim, udata: ?*anyopaque) void {
+        const id = decodeSlotUdata(udata);
+        if (id.index >= self.slots.len) return;
+        const slot = &self.slots[id.index];
+        const op = slot.op orelse return;
+        if (slot.generation != id.generation) return;
         // A `.once` timer is retired by the port when it fires.
-        op.armed = false;
-        self.liveRemove(op);
+        slot.armed = false;
+        op.t_fire_ns = born.nowNs() catch 0;
         if (op.cancel_requested.load(.acquire)) return self.retire(op, true);
-        const now_ns = born.nowNs() catch return self.retire(op, false);
-        if (now_ns >= op.deadline_ns) return self.retire(op, false);
-        self.arm(op, op.deadline_ns - now_ns);
-    }
-
-    fn liveRemove(self: *Shim, op: *SleepOp) void {
-        if (op.live_prev) |prev| prev.live_next = op.live_next else self.live = op.live_next;
-        if (op.live_next) |next| next.live_prev = op.live_prev;
-        self.live_count -= 1;
-    }
-
-    /// Assign a timer id unique among armed operations. Ids increment; before
-    /// the first u32 wrap every issued id is distinct by construction. After
-    /// a wrap, skip ids still armed (a re-added live id would replace another
-    /// operation's timer). The probe loop is bounded by the armed count: the
-    /// u32 space cannot be exhausted by live operations. Loop-thread only.
-    pub fn pickTimerId(self: *Shim) u32 {
-        const id = self.next_timer_id;
-        self.next_timer_id +%= 1;
-        if (self.next_timer_id == 0) self.id_wrapped = true;
-        if (self.id_wrapped) {
-            var candidate = id;
-            var probes: usize = 0;
-            while (self.isLive(candidate)) : (candidate +%= 1) {
-                probes += 1;
-                assert(probes <= self.live_count);
-            }
-            return candidate;
-        }
-        return id;
-    }
-
-    fn isLive(self: *const Shim, id: u32) bool {
-        var node = self.live;
-        while (node) |op| : (node = op.live_next) {
-            if (op.timer_id == id) return true;
-        }
-        return false;
+        const now_ns = op.t_fire_ns;
+        if (now_ns == 0 or now_ns >= op.deadline_ns) return self.retire(op, false);
+        // Re-arm the remainder under the same identity; the slot stays
+        // occupied, so the generation is unchanged.
+        self.port.addTimer(id.index, udata, ceilMs(op.deadline_ns - now_ns), .once) catch |err| {
+            self.latch(err);
+            return self.retire(op, true);
+        };
+        slot.armed = true;
     }
 };
 
@@ -391,7 +547,15 @@ pub fn io(port: *born.EvPort, opts: InitOptions) InitError!Io {
     shim.threaded_io = shim.threaded.io();
     errdefer shim.threaded.deinit();
     if (caps.time == .born_evented) {
-        shim.loop = std.Thread.spawn(.{}, Shim.loopMain, .{shim}) catch return error.OutOfMemory;
+        // Preallocate the slot table so the steady-state sleep path performs
+        // no shim allocation; growth beyond capacity is on demand.
+        shim.slots = opts.allocator.alloc(Slot, slots_initial) catch return error.OutOfMemory;
+        errdefer opts.allocator.free(shim.slots);
+        for (shim.slots, 0..) |*slot, i| {
+            slot.* = .{ .next_free = if (i + 1 < shim.slots.len) @intCast(i + 1) else null };
+        }
+        shim.free_head = 0;
+        shim.loop = std.Thread.spawn(.{}, Shim.loopMain, .{shim}) catch return error.LoopSpawnFailed;
     }
     return .{
         .userdata = shim,
@@ -400,19 +564,66 @@ pub fn io(port: *born.EvPort, opts: InitOptions) InitError!Io {
 }
 
 /// Releases the composite created by `io`. As with `Io.Threaded`, every task
-/// must have been awaited or canceled first. Joins the Threaded pool, then
-/// stops the time route's loop thread (retiring any operation still pending
-/// as canceled) before freeing the composite.
+/// must have been awaited or canceled first. Stops and joins the time route's
+/// loop thread first (retiring any operation still pending as canceled): the
+/// loop calls into Threaded until it exits. Then joins the Threaded pool and
+/// frees the composite.
 pub fn deinit(interface: Io) void {
     const shim = shimFrom(interface.userdata);
     const allocator = shim.allocator;
-    shim.threaded.deinit();
     if (shim.loop) |loop| {
         shim.stopping.store(true, .release);
         shim.port.wake();
         loop.join();
     }
+    shim.threaded.deinit();
+    allocator.free(shim.slots);
     allocator.destroy(shim);
+}
+
+/// The first route-level failure latched by the time route: a port `wait`
+/// refusal, a timer-arm refusal (`born.TimerError`), or a slot-table growth
+/// refusal. `sleep` surfaces these as `error.Canceled` (its declared set
+/// admits no resource error); this accessor exposes the cause so an
+/// application can tell a failed or dead time route from ordinary
+/// cancellation. Returns null while no failure has occurred. The loop exits
+/// after `wait_fail_limit` consecutive wait failures; once it has, every
+/// later `sleep` returns `Canceled` immediately. The baseline route never
+/// latches and always returns null.
+pub fn loopError(interface: Io) ?anyerror {
+    return shimFrom(interface.userdata).latchedError();
+}
+
+/// Latency breakdown of completed Born-route sleeps, accumulated since
+/// construction (monotonic nanosecond sums over `ops` operations). Phases:
+/// `submit_wake_ns` is the submitter side (enqueue plus the conditional
+/// wake); `queue_arm_ns` spans enqueue to first arm and INCLUDES
+/// `submit_wake_ns`, so the loop-side handoff (queue wait, drain, arm) is
+/// their difference; `timer_span_ns` is armed time including the requested
+/// sleep (kernel slack is the span minus the request); `futex_return_ns` is
+/// the completion handoff back to the submitter. `wakes` counts port wake
+/// calls, which fire only on empty-to-non-empty queue transitions. Canceled
+/// sleeps are not counted. The baseline route reports zeros.
+pub const TimeStats = struct {
+    ops: u64,
+    wakes: u64,
+    submit_wake_ns: u64,
+    queue_arm_ns: u64,
+    timer_span_ns: u64,
+    futex_return_ns: u64,
+};
+
+/// Snapshot of the time route's latency breakdown accumulators.
+pub fn timeStats(interface: Io) TimeStats {
+    const s = &shimFrom(interface.userdata).stats;
+    return .{
+        .ops = s.ops.load(.monotonic),
+        .wakes = s.wakes.load(.monotonic),
+        .submit_wake_ns = s.submit_wake.load(.monotonic),
+        .queue_arm_ns = s.queue_arm.load(.monotonic),
+        .timer_span_ns = s.timer_span.load(.monotonic),
+        .futex_return_ns = s.futex_return.load(.monotonic),
+    };
 }
 
 /// Forwarding thunks shared by both pinned interfaces (identical signatures).
@@ -1143,9 +1354,10 @@ const time_route = struct {
     /// semantics); a `Clock` other than `.awake` is explicitly delegated to
     /// Threaded because Born's timers measure the monotonic timer clock only.
     /// The submission node is caller-owned stack storage: the queue cannot
-    /// overflow (module overload table). Completion returns through a
-    /// cancelable Threaded futex wait; cancellation disarms the Born timer
-    /// through the loop and drains until the node is retired.
+    /// overflow (module overload table). The timer identity is a loop-owned
+    /// slot, so a stale fire never touches this frame. Completion returns
+    /// through a cancelable Threaded futex wait; cancellation pushes the slot
+    /// on the loop's cancel list and drains until the node is retired.
     fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
         const self = shimFrom(userdata);
         const clock: Io.Clock = switch (timeout) {
@@ -1159,6 +1371,7 @@ const time_route = struct {
         // Threaded's sleepPosix gives a clock_nanosleep refusal; callers can
         // probe clockResolution first.
         const now_ns = born.nowNs() catch return;
+        const t0 = now_ns;
         const deadline_ns: u64 = switch (timeout) {
             .none => unreachable,
             .duration => |d| blk: {
@@ -1173,8 +1386,16 @@ const time_route = struct {
         };
 
         var op: SleepOp = .{ .deadline_ns = deadline_ns };
-        if (!self.submit(&op)) return error.Canceled;
-        self.port.wake();
+        const submitted = self.submit(&op) orelse return error.Canceled;
+        if (submitted.was_empty) {
+            _ = self.stats.wakes.fetchAdd(1, .monotonic);
+            self.port.wake();
+        }
+        // Submitter-side phase timestamps are locals: the loop owns the node
+        // from dequeue, so writing them into the node after enqueue would
+        // race the loop's arm. t0 (captured before submit) is the enqueue
+        // timestamp; the loop can only arm after dequeue, so t_arm >= t0.
+        const t_wake_done = born.nowNs() catch 0;
 
         // Completion wait: the same retry shape Threaded's await uses. A
         // spurious wake re-checks the state word; a pending cancel surfaces
@@ -1186,7 +1407,10 @@ const time_route = struct {
                     // loop retires the node: it must never touch this stack
                     // storage after we return.
                     op.cancel_requested.store(true, .release);
-                    self.port.wake();
+                    if (self.requestCancel(&op)) {
+                        _ = self.stats.wakes.fetchAdd(1, .monotonic);
+                        self.port.wake();
+                    }
                     while (op.state.load(.acquire) == 0) {
                         self.threaded_io.vtable.futexWaitUncancelable(self.threaded_io.userdata, &op.state.raw, 0);
                     }
@@ -1196,6 +1420,18 @@ const time_route = struct {
             if (op.state.load(.acquire) != 0) break;
         }
         if (op.outcome_canceled) return error.Canceled;
+        // Latency breakdown: only completed sleeps with a recorded arm/fire
+        // pair contribute. Every delta is non-negative by capture order: t0
+        // precedes enqueue, arm follows dequeue, fire follows arm, and the
+        // terminal store (observed above) follows the fire timestamp.
+        const t_done = born.nowNs() catch 0;
+        if (op.t_fire_ns != 0 and op.t_arm_ns != 0 and t_wake_done != 0 and t_done != 0) {
+            _ = self.stats.ops.fetchAdd(1, .monotonic);
+            _ = self.stats.submit_wake.fetchAdd(t_wake_done - t0, .monotonic);
+            _ = self.stats.queue_arm.fetchAdd(op.t_arm_ns - t0, .monotonic);
+            _ = self.stats.timer_span.fetchAdd(op.t_fire_ns - op.t_arm_ns, .monotonic);
+            _ = self.stats.futex_return.fetchAdd(t_done - op.t_fire_ns, .monotonic);
+        }
     }
 
     /// Monotonic `now` reads Born's timer clock so timestamps and sleep
@@ -1219,3 +1455,111 @@ pub const time_vtable: Io.VTable = blk: {
     v.now = time_route.now;
     break :blk v;
 };
+
+test "slot identity round-trips through udata" {
+    const id = decodeSlotUdata(slotUdata(123, 456));
+    try std.testing.expectEqual(@as(u32, 123), id.index);
+    try std.testing.expectEqual(@as(u32, 456), id.generation);
+    const max = decodeSlotUdata(slotUdata(std.math.maxInt(u32), std.math.maxInt(u32)));
+    try std.testing.expectEqual(std.math.maxInt(u32), max.index);
+    try std.testing.expectEqual(std.math.maxInt(u32), max.generation);
+}
+
+test "stale timer fires drop without touching the node" {
+    // The use-after-free guard: a fire whose generation predates the current
+    // occupant, whose slot was freed, or whose index is out of range must be
+    // dropped before any access to the caller's node. The drop paths never
+    // reach Threaded, so an otherwise-undefined composite is safe here.
+    var state: Shim = undefined;
+    var slot: Slot = .{};
+    var op: SleepOp = .{};
+    state.slots = @as([*]Slot, @ptrCast(&slot))[0..1];
+
+    slot.op = &op;
+    slot.generation = 7;
+    slot.armed = true;
+    // Stale generation: the slot was freed and re-armed for another node.
+    state.timerFired(slotUdata(0, 6));
+    try std.testing.expectEqual(@as(u32, 0), op.state.load(.monotonic));
+    try std.testing.expectEqual(&op, slot.op.?);
+    try std.testing.expect(slot.armed);
+    // Freed slot: retirement already published the terminal state.
+    slot.op = null;
+    state.timerFired(slotUdata(0, 7));
+    try std.testing.expectEqual(@as(u32, 0), op.state.load(.monotonic));
+    // Out-of-range index.
+    state.timerFired(slotUdata(99, 7));
+    try std.testing.expectEqual(@as(u32, 0), op.state.load(.monotonic));
+}
+
+test "failure latch keeps the first route-level error" {
+    var state: Shim = undefined;
+    state.loop_error = .init(0);
+    try std.testing.expectEqual(@as(?anyerror, null), state.latchedError());
+    state.latch(error.WaitFailed);
+    state.latch(error.OutOfMemory);
+    try std.testing.expectEqual(@as(?anyerror, error.WaitFailed), state.latchedError());
+}
+
+/// Minimal composite for queue-mechanism unit tests: a real Threaded for
+/// the uncancelable mutex, no loop thread, and no port call on these paths.
+fn testShim(state: *Shim) void {
+    state.* = .{
+        .port = undefined,
+        .allocator = std.testing.allocator,
+        .capabilities = .{},
+        .threaded = Io.Threaded.init(std.testing.allocator, .{}),
+        .threaded_io = undefined,
+    };
+    state.threaded_io = state.threaded.io();
+}
+
+test "submit reports only the empty-to-non-empty transition" {
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    state.slots = try std.testing.allocator.alloc(Slot, 2);
+    defer std.testing.allocator.free(state.slots);
+    state.slots[0] = .{ .next_free = 1 };
+    state.slots[1] = .{};
+    state.free_head = 0;
+
+    var a: SleepOp = .{};
+    var b: SleepOp = .{};
+    const ra = state.submit(&a) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(ra.was_empty);
+    const rb = state.submit(&b) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!rb.was_empty);
+    try std.testing.expectEqual(&a, state.queue.head.?);
+    try std.testing.expectEqual(&b, state.queue.tail.?);
+    try std.testing.expectEqual(&b, a.next.?);
+    try std.testing.expectEqual(@as(?*SleepOp, null), b.next);
+    try std.testing.expectEqual(@as(u32, 0), a.slot_index);
+    try std.testing.expectEqual(@as(u32, 1), b.slot_index);
+    try std.testing.expectEqual(@as(u32, 1), state.slots[0].generation);
+}
+
+test "cancel request skips a retired slot" {
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    state.slots = try std.testing.allocator.alloc(Slot, 1);
+    defer std.testing.allocator.free(state.slots);
+    state.slots[0] = .{};
+
+    var op: SleepOp = .{};
+    op.slot_index = 0;
+    state.slots[0].op = &op;
+    // Occupied: the request pushes and reports the transition.
+    try std.testing.expect(state.requestCancel(&op));
+    try std.testing.expectEqual(@as(?u32, 0), state.cancel_head);
+    // Drain the list as the loop would.
+    state.cancel_head = null;
+    state.slots[0].cancel_next = null;
+    // Retired (retireLocked frees the slot under the same mutex): the
+    // occupancy check must refuse the push, so a reused slot is never
+    // canceled on behalf of the previous occupant.
+    state.slots[0].op = null;
+    try std.testing.expect(!state.requestCancel(&op));
+    try std.testing.expectEqual(@as(?u32, null), state.cancel_head);
+}

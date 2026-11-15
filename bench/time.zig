@@ -7,9 +7,13 @@
 //!
 //! Measures the routed time family against the all-Threaded baseline:
 //! sequential sleep latency and concurrent sleep throughput, each with
-//! per-operation latency percentiles. The measurement clock is Born's
-//! monotonic clock (CLOCK_MONOTONIC / QPC) on both routes, independent of
-//! the route under test. Accept results only on a quiet host.
+//! per-operation latency percentiles. With `--route both` it also checks
+//! the written target (bench/README.md): at 64 sleepers Born must reach
+//! >= 95% of Threaded's ops/s with p99 no worse, and prints the Born
+//! route's per-sleep latency breakdown from `born_io.timeStats`. The
+//! measurement clock is Born's monotonic clock (CLOCK_MONOTONIC / QPC) on
+//! both routes, independent of the route under test. Accept results only
+//! on a quiet host.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -107,7 +111,10 @@ fn stats(samples: []u64) Stats {
     };
 }
 
-fn runRoute(alloc: std.mem.Allocator, route: Route, o: Options) !void {
+/// Concurrent-phase result, used for the written target check.
+const RouteResult = struct { ops_per_sec: f64, p99_us: f64 };
+
+fn runRoute(alloc: std.mem.Allocator, route: Route, o: Options) !RouteResult {
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
     const interface = try born_io.io(&port, .{
@@ -137,6 +144,9 @@ fn runRoute(alloc: std.mem.Allocator, route: Route, o: Options) !void {
     // Concurrent throughput: raw blocking threads, one sleep in flight per
     // thread, until the phase deadline. On the Born route every sleep is a
     // cross-thread submission through the shim's loop thread.
+    // Stats snapshot: isolate the concurrent phase from the sequential
+    // sleeps above (the accumulators span the instance's lifetime).
+    const stats_before = born_io.timeStats(interface);
     const ctx = try alloc.create(Concurrent);
     defer alloc.destroy(ctx);
     ctx.* = .{
@@ -159,6 +169,34 @@ fn runRoute(alloc: std.mem.Allocator, route: Route, o: Options) !void {
     out("route={s} concurrent threads={d} seconds={d} sleep_ms={d} requests={d} ops_per_sec={d:.0} p50_us={d:.1} p99_us={d:.1}\n", .{
         name, o.threads, o.seconds, o.sleep_ms, requests, ops_per_sec, conc.p50, conc.p99,
     });
+    if (route == .born) {
+        const s = born_io.timeStats(interface);
+        const ops = s.ops - stats_before.ops;
+        if (ops > 0) {
+            // Per-sleep means in microseconds. queue_arm includes
+            // submit_wake; loop_handoff is their difference. kernel_slack
+            // is the armed span minus the request (negative when the
+            // handoff consumed part of the requested sleep).
+            const n = @as(f64, @floatFromInt(ops));
+            const us = 1000.0;
+            const submit_wake = @as(f64, @floatFromInt(s.submit_wake_ns - stats_before.submit_wake_ns)) / n / us;
+            const queue_arm = @as(f64, @floatFromInt(s.queue_arm_ns - stats_before.queue_arm_ns)) / n / us;
+            const timer_span = @as(f64, @floatFromInt(s.timer_span_ns - stats_before.timer_span_ns)) / n / us;
+            const futex_return = @as(f64, @floatFromInt(s.futex_return_ns - stats_before.futex_return_ns)) / n / us;
+            const requested_us = @as(f64, @floatFromInt(o.sleep_ms)) * 1000.0;
+            out("route=born breakdown ops={d} wakes={d} submit_wake_us={d:.1} queue_arm_us={d:.1} loop_handoff_us={d:.1} timer_span_us={d:.1} kernel_slack_us={d:.1} futex_return_us={d:.1}\n", .{
+                ops,
+                s.wakes - stats_before.wakes,
+                submit_wake,
+                queue_arm,
+                queue_arm - submit_wake,
+                timer_span,
+                timer_span - requested_us,
+                futex_return,
+            });
+        }
+    }
+    return .{ .ops_per_sec = ops_per_sec, .p99_us = conc.p99 };
 }
 
 const Concurrent = struct {
@@ -190,11 +228,23 @@ pub fn main(init: std.process.Init.Minimal) !void {
         else => return err,
     };
     switch (o.route) {
-        .born => try runRoute(alloc, .born, o),
-        .threaded => try runRoute(alloc, .threaded, o),
+        .born => _ = try runRoute(alloc, .born, o),
+        .threaded => _ = try runRoute(alloc, .threaded, o),
         .both => {
-            try runRoute(alloc, .threaded, o);
-            try runRoute(alloc, .born, o);
+            const threaded = try runRoute(alloc, .threaded, o);
+            const born_result = try runRoute(alloc, .born, o);
+            // Written target (bench/README.md): at 64 sleepers Born reaches
+            // >= 95% of Threaded's concurrent ops/s with p99 no worse.
+            const ratio = born_result.ops_per_sec / threaded.ops_per_sec;
+            const met = ratio >= 0.95 and born_result.p99_us <= threaded.p99_us;
+            out("target threads={d} sleep_ms={d} ops_ratio={d:.3} (need >= 0.950) p99_born_us={d:.1} p99_threaded_us={d:.1} (need born <= threaded): {s}\n", .{
+                o.threads,
+                o.sleep_ms,
+                ratio,
+                born_result.p99_us,
+                threaded.p99_us,
+                if (met) "MET" else "UNMET",
+            });
         },
     }
 }

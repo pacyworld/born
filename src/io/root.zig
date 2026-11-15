@@ -46,9 +46,19 @@ pub const Shim = shim.Shim;
 /// serviced by Born's reactor; Born routes for the other families are still
 /// rejected at construction.
 pub const io = shim.io;
-/// Releases the composite created by `io`, joining the Threaded pool and the
-/// time route's loop thread.
+/// Releases the composite created by `io`. Stops and joins the time route's
+/// loop thread first, then joins the Threaded pool.
 pub const deinit = shim.deinit;
+
+/// The first route-level failure latched by the time route (wait refusal,
+/// timer-arm refusal, slot-table growth refusal), or null. `sleep` surfaces
+/// these as `Canceled`; this exposes the cause.
+pub const loopError = shim.loopError;
+
+/// Latency breakdown snapshot of completed Born-route sleeps.
+pub const TimeStats = shim.TimeStats;
+/// Snapshot of the time route's latency breakdown accumulators.
+pub const timeStats = shim.timeStats;
 
 /// The complete explicit Threaded-delegation baseline vtable. To check that an
 /// interface uses it, compare slot contents (`std.meta.eql`), not the address:

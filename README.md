@@ -472,12 +472,22 @@ The time family is the first enabled Born route
 (`capabilities.time = .born_evented`): `sleep` runs on Born's timers and
 monotonic `now` on Born's timer clock; every other slot delegates to
 Threaded. One loop thread per instance drives the port. A blocking sleep
-submits a caller-owned operation node through an intrusive queue and
-`wake()`; completion returns through a Threaded futex so cancellation
-composes with Threaded's cancel machinery. The queue is bounded by caller
-storage (one node per blocking call), so queue-full cannot occur: `sleep`'s
-only error is `Canceled`, meaning the sleep was interrupted (task
-cancellation, shim stop, or kernel timer exhaustion), never overload. The
+submits a caller-owned operation node through an intrusive queue into a
+loop-owned slot table; the timer identity is the slot index plus a
+generation, so a stale timer fire is dropped without touching caller
+storage. The queue wakes the loop only on empty-to-non-empty transitions,
+and cancellation rides a dedicated cancel list, so neither path scans the
+armed population. Completion returns through a Threaded futex so
+cancellation composes with Threaded's cancel machinery. The queue is
+bounded by caller storage (one node per blocking call), so queue-full
+cannot occur: `sleep`'s only error is `Canceled`, meaning the sleep was
+interrupted (task cancellation, shim stop, or kernel timer exhaustion),
+never overload. Route-level refusals (port wait failures, timer-arm
+refusals, slot-table growth failures) are latched and readable via
+`born_io.loopError(io)`. Born timers are millisecond-granular: a sleep
+shorter than 1 ms costs at least 1 ms. `clockResolution(.awake)` stays on
+Threaded, so on macOS and Windows it reports the resolution of Threaded's
+awake clock, not of the Born timer clock that `now(.awake)` reads. The
 per-slot failure mapping and the Scale model machinery are documented in
 `src/io/shim.zig`.
 
@@ -489,6 +499,9 @@ exe.root_module.addImport("born.io", born.module("born.io"));
 ```
 
 ```zig
+const born = @import("born");
+const born_io = @import("born.io");
+
 var port = try born.EvPort.init(allocator);
 defer port.deinit();
 const io = try born_io.io(&port, .{

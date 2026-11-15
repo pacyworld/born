@@ -2,11 +2,11 @@
 //!
 //! These exercise the Scale model machinery and the Born evented time family:
 //! sleep on Born's timers, monotonic now on Born's clock, cross-thread
-//! submission from Threaded workers, cancellation through the loop's
-//! cancelTimer path, and the caller-owned submission queue bound. The
-//! delegation tests prove the remaining slots still run on Threaded while the
-//! loop thread is live. Runtime evidence requires running these on each
-//! kernel; a cross-build is not evidence.
+//! submission from Threaded workers, cancellation through the loop's cancel
+//! list, the loop-owned slot table's stale-fire guard, and the caller-owned
+//! submission queue bound. The delegation tests prove the remaining slots
+//! still run on Threaded while the loop thread is live. Runtime evidence
+//! requires running these on each kernel; a cross-build is not evidence.
 
 const std = @import("std");
 const born = @import("born");
@@ -265,8 +265,9 @@ const Counting = struct {
 };
 
 test "time route sleep performs no shim allocations" {
-    // Submission is an intrusive push of caller-owned storage; the sleep path
-    // must not allocate. The port's own timer bookkeeping uses the port's
+    // Submission is an intrusive push of caller-owned storage into the slot
+    // table preallocated at construction; the steady-state sleep path must
+    // not allocate. The port's own timer bookkeeping uses the port's
     // allocator, not the shim's.
     var counting: Counting = .{ .child = std.testing.allocator };
     var port = try born.EvPort.init(std.testing.allocator);
@@ -360,32 +361,112 @@ test "ceilMs rounds up, clamps, and saturates" {
     );
 }
 
-test "pickTimerId skips live ids after a wrap" {
-    var state: shim.Shim = undefined;
-    state.next_timer_id = 5;
-    state.id_wrapped = true;
-    state.live = null;
-    state.live_count = 0;
+test "cancel list retires only the canceled sleeper" {
+    // One cancel among eight armed sleepers must disarm exactly that node:
+    // the dedicated cancel list replaces the scan of the whole armed
+    // population, and the other seven keep sleeping.
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const interface = try initTimeIo(&port);
+    defer born_io.deinit(interface);
 
-    var a: shim.SleepOp = .{ .timer_id = 5 };
-    var b: shim.SleepOp = .{ .timer_id = 7 };
-    a.live_next = &b;
-    b.live_prev = &a;
-    state.live = &a;
-    state.live_count = 2;
+    var done: std.atomic.Value(u32) = .init(0);
+    var group: Io.Group = .init;
+    for (0..7) |_| try group.concurrent(interface, longSleeperCounted, .{ interface, &done });
+    var future = try Io.concurrent(interface, longSleeperCounted, .{ interface, &done });
+    // Let every worker submit and arm its timer.
+    try Io.sleep(interface, .fromMilliseconds(50), .awake);
 
-    // 5 is armed: skip to 6.
-    try expectEqual(@as(u32, 6), state.pickTimerId());
-    // Arm 6 as the loop would, then the next candidate skips 6 and 7.
-    var c: shim.SleepOp = .{ .timer_id = 6 };
-    c.live_next = state.live;
-    state.live.?.live_prev = &c;
-    state.live = &c;
-    state.live_count = 3;
-    try expectEqual(@as(u32, 8), state.pickTimerId());
+    const t0 = try born.nowNs();
+    try expectError(error.Canceled, future.cancel(interface));
+    try expect(try elapsedNs(t0) < 2 * s);
+    // The other seven are still armed: none was retired by the cancel.
+    try expectEqual(@as(u32, 0), done.load(.acquire));
+    group.cancel(interface);
+    try expectEqual(@as(u32, 0), done.load(.acquire));
+}
 
-    // Before the first wrap, ids are unique by construction: no scan.
-    state.id_wrapped = false;
-    state.next_timer_id = 5;
-    try expectEqual(@as(u32, 5), state.pickTimerId());
+test "wakes fire only on empty-to-non-empty queue transitions" {
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const interface = try initTimeIo(&port);
+    defer born_io.deinit(interface);
+
+    // Sequential sleeps: the queue is empty at every submit, so each one
+    // wakes exactly once.
+    const before = born_io.timeStats(interface).wakes;
+    for (0..3) |_| try Io.sleep(interface, .fromMilliseconds(5), .awake);
+    try expectEqual(before + 3, born_io.timeStats(interface).wakes);
+
+    // 64 concurrent submits: pushes onto a non-empty queue are covered by
+    // the pending drain, so the wake count cannot exceed the submit count.
+    const start = born_io.timeStats(interface).wakes;
+    var done: std.atomic.Value(u32) = .init(0);
+    var group: Io.Group = .init;
+    for (0..64) |_| try group.concurrent(interface, sleeper, .{ interface, &done });
+    try group.await(interface);
+    const wakes = born_io.timeStats(interface).wakes - start;
+    try expectEqual(@as(u32, 64), done.load(.acquire));
+    try expect(wakes >= 1 and wakes <= 64);
+}
+
+test "loop death latches the wait failure and rejects later sleeps" {
+    // kqueue only: closing the port's descriptor behind the shim makes every
+    // wait fail; after wait_fail_limit consecutive failures the loop retires
+    // everything and exits. The latch must expose the cause that sleep's
+    // error set cannot carry.
+    if (!@hasField(born.EvPort, "kq")) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const interface = try initTimeIo(&port);
+    defer born_io.deinit(interface);
+
+    try expectEqual(@as(?anyerror, null), born_io.loopError(interface));
+    _ = std.c.close(port.kq);
+    port.kq = -1;
+
+    const t0 = try born.nowNs();
+    try expectError(error.Canceled, Io.sleep(interface, .fromSeconds(10), .awake));
+    try expect(try elapsedNs(t0) < 2 * s);
+    try expect(born_io.loopError(interface) != null);
+    // The queue is dead: later submits are rejected at the slot.
+    try expectError(error.Canceled, Io.sleep(interface, .fromMilliseconds(5), .awake));
+}
+
+test "deinit stops the loop before Threaded and retires pending sleepers" {
+    // Shutdown order regression: the loop calls into Threaded (mutex,
+    // futexWake) until it exits, so it must be stopped and joined first.
+    // retireAll cancels the pending 10 s sleeper, so deinit returns promptly
+    // instead of waiting out the timer or touching a deinit'd Threaded. The
+    // sleeper is a raw thread (no Threaded future to await): sleep composes
+    // from any thread, as the no-workers test proves.
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const interface = try initTimeIo(&port);
+
+    var outcome: std.atomic.Value(u32) = .init(0);
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(io: Io, out: *std.atomic.Value(u32)) void {
+            Io.sleep(io, .fromSeconds(10), .awake) catch {
+                out.store(1, .release);
+                return;
+            };
+            out.store(2, .release);
+        }
+    }.run, .{ interface, &outcome });
+    // Let the sleeper submit and arm its timer.
+    try Io.sleep(interface, .fromMilliseconds(50), .awake);
+    const t0 = try born.nowNs();
+    born_io.deinit(interface);
+    try expect(try elapsedNs(t0) < 2 * s);
+    thread.join();
+    try expectEqual(@as(u32, 1), outcome.load(.acquire));
+}
+
+test "InitError distinguishes loop spawn failure" {
+    comptime {
+        // The member must exist: a spawn failure is not an OutOfMemory.
+        const e: born_io.InitError = error.LoopSpawnFailed;
+        if (e != error.LoopSpawnFailed) @compileError("unreachable");
+    }
 }

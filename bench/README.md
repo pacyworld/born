@@ -65,7 +65,7 @@ born.io time route (`capabilities.time = .born_evented`) against the
 all-Threaded baseline:
 
 ```
-zig016 build bench-time -Doptimize=ReleaseSafe
+zig build bench-time -Doptimize=ReleaseSafe
 sh bench/time.sh zig-out/bin/born-time-bench 3
 ```
 
@@ -80,3 +80,24 @@ sh bench/time.sh zig-out/bin/born-time-bench 3
 - `bench/time.sh BIN [REPS]` runs the quiet-host guard first (quiet.sh on
   FreeBSD, a loadavg check on Linux) and refuses a busy host; it then runs
   both routes per repetition. Report the spread over repetitions.
+
+### Written target (P5.2)
+
+On the 64-sleeper concurrent phase (the defaults: `--threads 64
+--sleep-ms 1 --seconds 5`), the Born route must reach at least 95% of
+Threaded's completed sleeps per second, and its p99 per-sleep latency must
+be no worse than Threaded's. `--route both` prints the verdict line
+(`target ... MET|UNMET`) and, for the Born route, a per-sleep latency
+breakdown from `born_io.timeStats` (means over the concurrent phase):
+
+- `submit_wake_us`: submitter side, enqueue plus the conditional wake.
+- `queue_arm_us`: enqueue to first arm; includes `submit_wake_us`.
+  `loop_handoff_us` is their difference (queue wait, drain, arm).
+- `timer_span_us`: armed time including the requested sleep;
+  `kernel_slack_us` is the span minus the request (negative when the
+  handoff consumed part of the requested sleep).
+- `futex_return_us`: completion handoff back to the submitter.
+
+If the target is unmet at an increment, the pull request reports the
+numbers and the breakdown and names the increment that meets it; no
+open-ended deferral.
