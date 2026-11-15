@@ -112,6 +112,15 @@ test "public overlapped type executes post and absorbCompletion" {
     try std.testing.expectEqual(@as(usize, 7), events[0].bytes);
 }
 
+test "public SOCKET type names PlainNb.sock on Windows" {
+    if (builtin.os.tag != .windows) return error.SkipZigTest;
+    try std.testing.expect(born.windows.SOCKET == @FieldType(born.socket.PlainNb, "sock"));
+    try std.testing.expect(@TypeOf(born.windows.INVALID_SOCKET) == born.windows.SOCKET);
+    var stream: born.socket.PlainNb = .{};
+    try std.testing.expect(stream.sock == born.windows.INVALID_SOCKET);
+    try std.testing.expect(stream.handle() == @as(born.Handle, @ptrCast(born.windows.INVALID_SOCKET)));
+}
+
 test "reactor interest methods execute with native handles" {
     var port = try backend.EvPort.init(std.testing.allocator);
     defer port.deinit();

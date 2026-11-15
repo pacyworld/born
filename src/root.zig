@@ -76,11 +76,17 @@ pub const Error = impl.Error;
 /// epoll (signalfd), a no-op on kqueue and Windows. Call it in `main`
 /// before spawning threads.
 pub const blockSignals = impl.blockSignals;
-/// Native Windows completion types exposed through the public API.
+/// Native Windows types exposed through the public API.
 pub const windows = struct {
     /// Caller-owned overlapped operation storage. It must remain stable until
     /// every completion has been absorbed.
     pub const OVERLAPPED = @import("compat").windows.OVERLAPPED;
+    /// Native Winsock socket handle: the type of `socket.PlainNb.sock` on
+    /// Windows. A consumer that passes the socket to its own ws2_32 externs
+    /// declares them with this type or casts at the boundary.
+    pub const SOCKET = @import("compat").windows.ws2_32.SOCKET;
+    /// Invalid-socket sentinel for `SOCKET`.
+    pub const INVALID_SOCKET = @import("compat").windows.ws2_32.INVALID_SOCKET;
 };
 /// Portable plaintext stream and listener companions.
 pub const socket = @import("socket.zig");
