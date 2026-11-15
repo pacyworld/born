@@ -42,6 +42,17 @@
   - On Zig >= 0.16, `zig build test-io-bin` with the same target/prefix flags
     installs `born-io-tests` (the shim suite) the same way. CI cross-builds
     and runs it on Linux and Windows alongside the core executable.
+- Examples (`examples/`) are reference programs for downstream ports:
+  - `<toolchain> build examples --summary all` installs `born-echo-server`
+    and `born-echo-per-core` for the selected target.
+  - `<toolchain> build example-smoke -Doptimize=Debug --summary all` (and
+    ReleaseSafe) runs the example integration suite on the selected backend.
+  - `zig build example-smoke-bin -Dtarget=<triple> -Doptimize=ReleaseSafe
+    --prefix zig-out/<os>` installs `born-example-smoke` without running it;
+    run it on its actual OS. CI cross-builds and runs it on Linux and Windows.
+  - `check-targets` also compiles `examples/check.zig` per triple
+    (`born-examples-<triple>`), which forces both `main` bodies, the shared
+    engine, and the smoke test bodies. Compile-only, like the core steps.
 
 ## born.io compatibility shim
 
@@ -59,8 +70,9 @@
   `std.Io`; CI builds it on 0.16.0 and 0.17.1 to prove a consumer is unaffected.
   The CI fmt job also runs a visible grep gate.
 - On Zig >= 0.16, `build test` also runs `born-io-tests`, and `check-targets`
-  adds a `born-io-<triple>` semantic compile per target (14 steps total;
-  0.15.2 keeps 7). These are compile-only, like the core cross-target steps.
+  adds a `born-io-<triple>` semantic compile per target. Counting the core and
+  examples steps, `check-targets` is 21 compile steps on Zig >= 0.16 and 14 on
+  0.15.2 (which has no shim). These are compile-only, like the core steps.
 - The foundation baseline forwards every vtable slot to `Io.Threaded` through
   explicit thunks. It is composition and compatibility evidence only, not
   evidence that any operation runs on Born's reactor. A requested Born
@@ -95,9 +107,9 @@ tarball, verified against a pinned SHA-256 and cached under
 | Job | Runner role (`runs-on`) | What it does |
 |---|---|---|
 | `fmt` | FreeBSD (`FreeBSD`) | The single Zig 0.15.2 `zig fmt --check .` gate plus README/AGENTS version-and-target presence (three versions, seven target names); `build.zig` carries the real target-table row guard. No fmt matrix |
-| `build` | FreeBSD (`FreeBSD`) | Matrix `zig: [0.15.2, 0.16.0, 0.17.1]`, `max-parallel: 1`; native Debug and ReleaseSafe tests (kqueue); `check-targets`; API docs; cross-builds both `born-tests` executables in Debug and ReleaseSafe and uploads each with its sha256; on Zig >= 0.16 also cross-builds and uploads both `born-io-tests` executables |
-| `linux-runtime` | Linux (`ubuntu-24.04`) | Matrix `zig × optimize`; runs the Linux executable in a `node:24-bookworm` container on the runner's kernel (epoll); on Zig >= 0.16 also runs `born-io-tests` |
-| `windows-runtime` | Windows (`windows-2022`) | Matrix `zig × optimize`; runs `born-tests.exe` on the host (IOCP); on Zig >= 0.16 also runs `born-io-tests.exe` |
+| `build` | FreeBSD (`FreeBSD`) | Matrix `zig: [0.15.2, 0.16.0, 0.17.1]`, `max-parallel: 1`; native Debug and ReleaseSafe tests (kqueue); `check-targets`; API docs; native `example-smoke`; cross-builds both `born-tests` executables in Debug and ReleaseSafe and uploads each with its sha256; cross-builds and uploads `born-example-smoke` on every toolchain; on Zig >= 0.16 also cross-builds and uploads both `born-io-tests` executables |
+| `linux-runtime` | Linux (`ubuntu-24.04`) | Matrix `zig × optimize`; runs the Linux executable in a `node:24-bookworm` container on the runner's kernel (epoll); runs `born-example-smoke`; on Zig >= 0.16 also runs `born-io-tests` |
+| `windows-runtime` | Windows (`windows-2022`) | Matrix `zig × optimize`; runs `born-tests.exe` on the host (IOCP); runs `born-example-smoke.exe`; on Zig >= 0.16 also runs `born-io-tests.exe` |
 
 - The runtime jobs need no Zig. Each checks the executable's sha256
   against the build, prints the host kernel or OS version and the commit,

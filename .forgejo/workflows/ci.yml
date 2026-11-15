@@ -177,6 +177,17 @@ jobs:
         run: |
           "$ZIG" build check-targets --summary all
 
+      - name: Example smoke (native Debug + ReleaseSafe)
+        run: |
+          set -eu
+          for opt in Debug ReleaseSafe; do
+            if "$ZIG" build example-smoke -Doptimize="$opt" --summary all > "example-smoke-$opt.log" 2>&1; then rc=0; else rc=$?; fi
+            cat "example-smoke-$opt.log"
+            [ "$rc" -eq 0 ] || exit "$rc"
+            summary=$(grep -E 'Build Summary:.*succeeded' "example-smoke-$opt.log") || { echo "born-example-smoke printed no passing build summary"; exit 1; }
+            echo "runtime evidence (x86_64-freebsd, kqueue, examples, zig ${{ matrix.zig }}, $opt): $summary"
+          done
+
       - name: Generate API documentation
         run: |
           "$ZIG" build docs --summary all
@@ -207,6 +218,12 @@ jobs:
             ( cd "zig-out/linux-$opt/bin" && sha256sum born-tests | tee born-tests.sha256 )
             "$ZIG" build test-bin -Dtarget=x86_64-windows-gnu -Doptimize="$opt" --prefix "zig-out/windows-$opt" --summary all
             ( cd "zig-out/windows-$opt/bin" && sha256sum born-tests.exe | tee born-tests.exe.sha256 )
+            # The examples exist on every toolchain; their smoke suite runs
+            # on Linux and Windows alongside the core executable.
+            "$ZIG" build example-smoke-bin -Dtarget=x86_64-linux-gnu -Doptimize="$opt" --prefix "zig-out/linux-$opt" --summary all
+            ( cd "zig-out/linux-$opt/bin" && sha256sum born-example-smoke | tee born-example-smoke.sha256 )
+            "$ZIG" build example-smoke-bin -Dtarget=x86_64-windows-gnu -Doptimize="$opt" --prefix "zig-out/windows-$opt" --summary all
+            ( cd "zig-out/windows-$opt/bin" && sha256sum born-example-smoke.exe | tee born-example-smoke.exe.sha256 )
           done
           # born.io exists only on Zig >= 0.16; cross-build its tests too so
           # the Linux and Windows runtime jobs cover the shim, not just the
@@ -265,6 +282,46 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+      - name: Upload Linux example smoke executable (Debug)
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: born-example-smoke-${{ matrix.zig }}-x86_64-linux-gnu-Debug
+          path: |
+            zig-out/linux-Debug/bin/born-example-smoke
+            zig-out/linux-Debug/bin/born-example-smoke.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Linux example smoke executable (ReleaseSafe)
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: born-example-smoke-${{ matrix.zig }}-x86_64-linux-gnu-ReleaseSafe
+          path: |
+            zig-out/linux-ReleaseSafe/bin/born-example-smoke
+            zig-out/linux-ReleaseSafe/bin/born-example-smoke.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Windows example smoke executable (Debug)
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: born-example-smoke-${{ matrix.zig }}-x86_64-windows-gnu-Debug
+          path: |
+            zig-out/windows-Debug/bin/born-example-smoke.exe
+            zig-out/windows-Debug/bin/born-example-smoke.exe.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Windows example smoke executable (ReleaseSafe)
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: born-example-smoke-${{ matrix.zig }}-x86_64-windows-gnu-ReleaseSafe
+          path: |
+            zig-out/windows-ReleaseSafe/bin/born-example-smoke.exe
+            zig-out/windows-ReleaseSafe/bin/born-example-smoke.exe.sha256
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Upload Linux born.io test executable (Debug)
         if: matrix.zig != '0.15.2'
         uses: https://code.forgejo.org/forgejo/upload-artifact@v4
@@ -311,8 +368,9 @@ jobs:
 
   # Linux runner (Ubuntu 24.04): epoll runtime tests, one leg per toolchain and
   # optimize mode. The job container shares the runner's kernel, so the
-  # syscalls under test are real Linux ones. No Zig is needed here. On
-  # Zig >= 0.16 the born.io test executable runs too.
+  # syscalls under test are real Linux ones. No Zig is needed here. The example
+  # smoke executable runs on every toolchain; on Zig >= 0.16 the born.io test
+  # executable runs too.
   linux-runtime:
     name: Linux runtime (zig ${{ matrix.zig }}, ${{ matrix.optimize }})
     runs-on: ubuntu-24.04
@@ -347,6 +405,21 @@ jobs:
           summary=$(grep -E '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$' born-tests.log) || { echo "born-tests printed no passing summary line"; exit 1; }
           echo "runtime evidence (x86_64-linux-gnu, epoll, zig ${{ matrix.zig }}, ${{ matrix.optimize }}): $summary"
 
+      - name: Download Linux example smoke executable
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: born-example-smoke-${{ matrix.zig }}-x86_64-linux-gnu-${{ matrix.optimize }}
+          path: born-example-smoke
+
+      - name: Run born-example-smoke
+        run: |
+          cd born-example-smoke
+          sha256sum -c born-example-smoke.sha256
+          chmod +x born-example-smoke
+          ./born-example-smoke 2>&1 | tee born-example-smoke.log
+          summary=$(grep -E '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$' born-example-smoke.log) || { echo "born-example-smoke printed no passing summary line"; exit 1; }
+          echo "runtime evidence (x86_64-linux-gnu, epoll, examples, zig ${{ matrix.zig }}, ${{ matrix.optimize }}): $summary"
+
       - name: Download Linux born.io test executable
         if: matrix.zig != '0.15.2'
         uses: https://code.forgejo.org/forgejo/download-artifact@v4
@@ -365,8 +438,9 @@ jobs:
           echo "runtime evidence (x86_64-linux-gnu, epoll, born.io, zig ${{ matrix.zig }}, ${{ matrix.optimize }}): $summary"
 
   # Windows runner (Windows Server 2022, host mode): IOCP runtime tests, one leg
-  # per toolchain and optimize mode. No Zig is needed here. On Zig >= 0.16 the
-  # born.io test executable runs too.
+  # per toolchain and optimize mode. No Zig is needed here. The example smoke
+  # executable runs on every toolchain; on Zig >= 0.16 the born.io test
+  # executable runs too.
   windows-runtime:
     name: Windows runtime (zig ${{ matrix.zig }}, ${{ matrix.optimize }})
     runs-on: windows-2022
@@ -409,6 +483,28 @@ jobs:
           $summary = Select-String -Path born-tests.log -Pattern '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$'
           if (-not $summary) { throw "born-tests.exe printed no passing summary line" }
           "runtime evidence (x86_64-windows-gnu, IOCP, zig ${{ matrix.zig }}, ${{ matrix.optimize }}): $($summary.Line)"
+
+      - name: Download Windows example smoke executable
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: born-example-smoke-${{ matrix.zig }}-x86_64-windows-gnu-${{ matrix.optimize }}
+          path: born-example-smoke
+
+      - name: Run born-example-smoke.exe
+        run: |
+          cd born-example-smoke
+          $expected = (Get-Content born-example-smoke.exe.sha256 -Raw).Split(' ')[0].Trim().ToUpperInvariant()
+          $actual = (Get-FileHash born-example-smoke.exe -Algorithm SHA256).Hash
+          if ($actual -ne $expected) { throw "born-example-smoke.exe sha256 $actual does not match the build ($expected)" }
+          "born-example-smoke.exe: OK ($actual)"
+          # cmd redirection keeps the test runner's stderr out of PowerShell's error stream.
+          cmd /c "born-example-smoke.exe > born-example-smoke.log 2>&1"
+          $rc = $LASTEXITCODE
+          Get-Content born-example-smoke.log
+          if ($rc -ne 0) { throw "born-example-smoke.exe exited with $rc" }
+          $summary = Select-String -Path born-example-smoke.log -Pattern '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$'
+          if (-not $summary) { throw "born-example-smoke.exe printed no passing summary line" }
+          "runtime evidence (x86_64-windows-gnu, IOCP, examples, zig ${{ matrix.zig }}, ${{ matrix.optimize }}): $($summary.Line)"
 
       - name: Download Windows born.io test executable
         if: matrix.zig != '0.15.2'

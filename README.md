@@ -562,6 +562,9 @@ zig build docs            # API documentation in zig-out/docs/index.html
 zig build test-bin -Dtarget=x86_64-windows-gnu --prefix zig-out/windows
 zig build test-bin -Dtarget=x86_64-linux-gnu --prefix zig-out/linux
 zig build test-io-bin -Dtarget=x86_64-linux-gnu --prefix zig-out/linux   # born.io, Zig >= 0.16
+zig build examples            # install born-echo-server and born-echo-per-core
+zig build example-smoke       # example integration tests on the selected target
+zig build example-smoke-bin -Dtarget=x86_64-linux-gnu --prefix zig-out/linux
 ```
 
 Born supports Zig 0.15.2, 0.16.0, and 0.17.1. `src/compat.zig` owns native ABI
@@ -592,6 +595,45 @@ the kqueue benchmark on a quiet FreeBSD CI runner and fails on a syscall or
 latency regression against `bench/thresholds.txt` (#31). macOS Apple Silicon
 stays a manual host; the target-coverage list in `AGENTS.md` says which
 targets run in CI, on manual hosts, or compile-only.
+
+## Examples
+
+`examples/` holds two reference programs for downstream ports. Both import
+only the public `born` module and the shared echo engine (`examples/echo.zig`),
+so they compile on all seven supported triples and show the contracts above
+in a complete program rather than a fragment.
+
+- **`born-echo-server`** (`examples/echo_server.zig`): a single-threaded TCP
+  echo server on one event port. A TCP listener accepts into a fixed table of
+  stable stream slots; an idle-timeout sweep timer closes silent connections;
+  SIGTERM or Ctrl+C closes the listener and drains established connections
+  until they finish or a drain deadline fires. Usage: `born-echo-server [port]`
+  (default 7000, binds 127.0.0.1). On Windows the signal watch maps to console
+  control events and needs a console.
+- **`born-echo-per-core`** (`examples/thread_per_core.zig`): the thread-per-core
+  variant. N worker threads each own one event port and one `.balanced`
+  listener on the same TCP port; the kernel spreads connections across them
+  (`SO_REUSEPORT_LB` on FreeBSD, `SO_REUSEPORT` on Linux). The main thread
+  watches SIGTERM/Ctrl+C and shuts workers down with cross-thread `wake()`.
+  Usage: `born-echo-per-core [port] [threads]` (default port 7001, one thread
+  per CPU, clamped to 1..64). `.balanced` needs kernel load balancing, so this
+  program runs on FreeBSD and Linux; elsewhere it reports Unsupported and
+  exits cleanly. It still compiles on every target.
+
+The engine demonstrates the rules that matter for a port: accepted streams
+live in stable heap slots and a Windows slot is not reused until its close
+completions are absorbed; reads drain to EAGAIN (or a posted receive) and a
+full echo buffer resumes reading after the pending write drains, so no edge
+is stranded; write interest is armed only on `want_write`; listener exhaustion
+and a full table pause with `unmonitorRead` and resume by re-registering and
+draining at once; timers measure deadlines, never drive I/O.
+
+`zig build example-smoke` runs an integration suite (`examples/smoke.zig`)
+through the engine with real sockets on the selected backend: echo round trip,
+idle-timeout close, large-payload partial writes and backpressure, cross-thread
+wake shutdown, SIGTERM drain (POSIX), and balanced-listener spread
+(FreeBSD/Linux). CI runs it on FreeBSD, Linux and Windows alongside the core
+suite, so the examples carry runtime evidence, not just cross-compilation.
 
 ## Provenance
 

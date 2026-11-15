@@ -12,6 +12,13 @@ pub const supported_targets = [_][]const u8{
     "x86_64-openbsd",
 };
 
+/// Reference programs for downstream ports. `examples` installs them for
+/// the selected target; check-targets compiles them for every triple.
+const example_programs = [_]struct { file: []const u8, name: []const u8 }{
+    .{ .file = "examples/echo_server.zig", .name = "born-echo-server" },
+    .{ .file = "examples/thread_per_core.zig", .name = "born-echo-per-core" },
+};
+
 pub fn build(b: *std.Build) void {
     enforceIsolation(b);
 
@@ -147,6 +154,34 @@ pub fn build(b: *std.Build) void {
     const bench_exe = b.addExecutable(.{ .name = "born-bench", .root_module = bench_mod });
     b.step("bench", "Build the born-bench benchmark (bench/README.md)").dependOn(&b.addInstallArtifact(bench_exe, .{}).step);
 
+    // Reference programs for downstream ports (examples/). Each imports the
+    // public born module only, plus the shared echo engine beside it.
+    const examples_step = b.step("examples", "Build and install the example programs");
+    for (example_programs) |prog| {
+        const ex_mod = b.createModule(.{
+            .root_source_file = b.path(prog.file),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "born", .module = mod }},
+        });
+        const ex_exe = b.addExecutable(.{ .name = prog.name, .root_module = ex_mod });
+        examples_step.dependOn(&b.addInstallArtifact(ex_exe, .{}).step);
+    }
+
+    // Integration smoke for the examples: real sockets through the shared
+    // echo engine on the selected backend. Runs natively like the core suite.
+    const smoke_mod = b.createModule(.{
+        .root_source_file = b.path("examples/smoke.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{.{ .name = "born", .module = mod }},
+    });
+    const smoke_tests = b.addTest(.{ .name = "born-example-smoke", .root_module = smoke_mod });
+    const smoke_step = b.step("example-smoke", "Run the example integration smoke tests");
+    smoke_step.dependOn(&b.addRunArtifact(smoke_tests).step);
+    const install_smoke = b.addInstallArtifact(smoke_tests, .{});
+    b.step("example-smoke-bin", "Install the selected target's example smoke executable without running it").dependOn(&install_smoke.step);
+
     // Compile-only proof that every claimed platform still builds. No test
     // binary is emitted or run.
     const check = b.step("check-targets", "Cross-compile every supported platform");
@@ -171,6 +206,21 @@ pub fn build(b: *std.Build) void {
             .root_module = cross_mod,
         });
         check.dependOn(&cross.step);
+
+        // The examples are part of the claimed surface: prove the two main
+        // bodies, the shared engine, and the smoke tests semantically compile
+        // for every supported target too. Compile-only, like the core step.
+        const cross_examples_mod = b.createModule(.{
+            .root_source_file = b.path("examples/check.zig"),
+            .target = cross_target,
+            .optimize = optimize,
+            .imports = &.{.{ .name = "born", .module = cross_mod }},
+        });
+        const cross_examples = b.addTest(.{
+            .name = b.fmt("born-examples-{s}", .{triple}),
+            .root_module = cross_examples_mod,
+        });
+        check.dependOn(&cross_examples.step);
 
         // The shim is part of the claimed surface on Zig >= 0.16: prove it
         // semantically compiles for every supported target too.
