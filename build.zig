@@ -52,6 +52,17 @@ pub fn build(b: *std.Build) void {
     const install_tests = b.addInstallArtifact(tests, .{});
     b.step("test-bin", "Install the selected target's test executable without running it").dependOn(&install_tests.step);
 
+    // born.io build options, shared by the exported module and the
+    // cross-target gate. Comptime-dead on 0.15.2 (no std.Io), so the graph
+    // there is unchanged. Latency stats are a bench-time instrument: the
+    // exported module defaults to no shared writes on the sleep path
+    // (-Dtime-stats to enable); the test and bench builds always enable them.
+    const io_options_mod = if (builtin.zig_version.minor >= 16) blk: {
+        const io_options = b.addOptions();
+        io_options.addOption(bool, "time_stats", b.option(bool, "time-stats", "Enable born.io time-route latency stats (default off)") orelse false);
+        break :blk io_options.createModule();
+    } else undefined;
+
     // born.io: the std.Io compatibility shim over the event port, exported
     // only where std.Io exists (Zig >= 0.16). On 0.15.2 this block is
     // comptime-dead and the build graph is unchanged. The core never imports
@@ -61,11 +72,53 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/io/root.zig"),
             .target = target,
             .optimize = optimize,
-            .imports = &.{.{ .name = "born", .module = mod }},
+            .imports = &.{
+                .{ .name = "born", .module = mod },
+                .{ .name = "born_io_options", .module = io_options_mod },
+            },
         });
         linkPlatform(io_mod, target);
-        const io_tests = b.addTest(.{ .name = "born-io-tests", .root_module = io_mod });
+
+        const io_stats_options = b.addOptions();
+        io_stats_options.addOption(bool, "time_stats", true);
+        const io_test_mod = b.createModule(.{
+            .root_source_file = b.path("src/io/root.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "born", .module = mod },
+                .{ .name = "born_io_options", .module = io_stats_options.createModule() },
+            },
+        });
+        linkPlatform(io_test_mod, target);
+        const io_tests = b.addTest(.{ .name = "born-io-tests", .root_module = io_test_mod });
         test_step.dependOn(&b.addRunArtifact(io_tests).step);
+        const install_io_tests = b.addInstallArtifact(io_tests, .{});
+        b.step("test-io-bin", "Install the selected target's born.io test executable without running it").dependOn(&install_io_tests.step);
+
+        // Default-config runtime smoke: the same suite against the exported
+        // module (stats off unless -Dtime-stats). The stats-assertion test
+        // checks the zero contract when stats are off.
+        const io_default_tests = b.addTest(.{ .name = "born-io-tests-default", .root_module = io_mod });
+        const install_io_default = b.addInstallArtifact(io_default_tests, .{});
+        b.step("test-io-default-bin", "Install the default-config born.io test executable (stats off)").dependOn(&install_io_default.step);
+
+        // On request only: the time-route benchmark (P5.2), installed as
+        // zig-out/bin/born-time-bench. Driver and acceptance: bench/time.sh.
+        // The bench reads the latency breakdown, so it uses the stats-on
+        // module regardless of -Dtime-stats.
+        const time_bench_mod = b.createModule(.{
+            .root_source_file = b.path("bench/time.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "born", .module = mod },
+                .{ .name = "born.io", .module = io_test_mod },
+                .{ .name = "compat", .module = compat_mod },
+            },
+        });
+        const time_bench_exe = b.addExecutable(.{ .name = "born-time-bench", .root_module = time_bench_mod });
+        b.step("bench-time", "Build the born-time-bench time-route benchmark (bench/time.sh)").dependOn(&b.addInstallArtifact(time_bench_exe, .{}).step);
     }
 
     const docs_obj = b.addObject(.{
@@ -126,7 +179,10 @@ pub fn build(b: *std.Build) void {
                 .root_source_file = b.path("src/io/root.zig"),
                 .target = cross_target,
                 .optimize = optimize,
-                .imports = &.{.{ .name = "born", .module = cross_mod }},
+                .imports = &.{
+                    .{ .name = "born", .module = cross_mod },
+                    .{ .name = "born_io_options", .module = io_options_mod },
+                },
             });
             linkPlatform(cross_io_mod, cross_target);
             const cross_io = b.addTest(.{

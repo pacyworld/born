@@ -39,6 +39,9 @@
   - Outputs: `zig-out/linux/bin/born-tests` and
     `zig-out/windows/bin/born-tests.exe`. Run each on its actual target OS;
     a successful cross-build is not runtime evidence.
+  - On Zig >= 0.16, `zig build test-io-bin` with the same target/prefix flags
+    installs `born-io-tests` (the shim suite) the same way. CI cross-builds
+    and runs it on Linux and Windows alongside the core executable.
 
 ## born.io compatibility shim
 
@@ -92,9 +95,9 @@ tarball, verified against a pinned SHA-256 and cached under
 | Job | Runner role (`runs-on`) | What it does |
 |---|---|---|
 | `fmt` | FreeBSD (`FreeBSD`) | The single Zig 0.15.2 `zig fmt --check .` gate plus README/AGENTS version-and-target presence (three versions, seven target names); `build.zig` carries the real target-table row guard. No fmt matrix |
-| `build` | FreeBSD (`FreeBSD`) | Matrix `zig: [0.15.2, 0.16.0, 0.17.1]`, `max-parallel: 1`; native Debug and ReleaseSafe tests (kqueue); `check-targets`; API docs; cross-builds both `born-tests` executables in Debug and ReleaseSafe and uploads each with its sha256 |
-| `linux-runtime` | Linux (`ubuntu-24.04`) | Matrix `zig × optimize`; runs the Linux executable in a `node:24-bookworm` container on the runner's kernel (epoll) |
-| `windows-runtime` | Windows (`windows-2022`) | Matrix `zig × optimize`; runs `born-tests.exe` on the host (IOCP) |
+| `build` | FreeBSD (`FreeBSD`) | Matrix `zig: [0.15.2, 0.16.0, 0.17.1]`, `max-parallel: 1`; native Debug and ReleaseSafe tests (kqueue); `check-targets`; API docs; cross-builds both `born-tests` executables in Debug and ReleaseSafe and uploads each with its sha256; on Zig >= 0.16 also cross-builds and uploads both `born-io-tests` executables |
+| `linux-runtime` | Linux (`ubuntu-24.04`) | Matrix `zig × optimize`; runs the Linux executable in a `node:24-bookworm` container on the runner's kernel (epoll); on Zig >= 0.16 also runs `born-io-tests` |
+| `windows-runtime` | Windows (`windows-2022`) | Matrix `zig × optimize`; runs `born-tests.exe` on the host (IOCP); on Zig >= 0.16 also runs `born-io-tests.exe` |
 
 - The runtime jobs need no Zig. Each checks the executable's sha256
   against the build, prints the host kernel or OS version and the commit,

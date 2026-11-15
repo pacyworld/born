@@ -51,10 +51,25 @@ OS per primitive, and lists real runs only.
 | kqueue, FreeBSD 15 (CI FreeBSD runner) | process descriptors (pdfork, EVFILT_PROCDESC) | [run 127, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/127/jobs/0): Debug and ReleaseSafe, 108 passed, 8 skipped, 0 failed | 2026-11-09 | [6f4f6ed](https://pacyworld.dev/pacyworld/born/commit/6f4f6ed776306c37e5beaa4cd238263cb980d1be) |
 | epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | process descriptors (pidfd, waitid) | [run 127, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/127/jobs/1): ReleaseSafe, 104 passed, 7 skipped, 0 failed | 2026-11-09 | [6f4f6ed](https://pacyworld.dev/pacyworld/born/commit/6f4f6ed776306c37e5beaa4cd238263cb980d1be) |
 | IOCP, Windows Server 2022 build 20348 (CI Windows runner) | process descriptors: unsupported contract | [run 134, Windows job](https://pacyworld.dev/pacyworld/born/actions/runs/134/jobs/2): ReleaseSafe, 74 passed, 25 skipped, 0 failed; Unsupported test passed | 2026-11-10 | [1aaf70e](https://pacyworld.dev/pacyworld/born/commit/1aaf70e9d5f61dc8bb4a92aee3f2ca4682057b4c) |
+| kqueue, FreeBSD 15 (CI FreeBSD runner) | born.io time route (sleep, now) | [run 272, FreeBSD job (zig 0.16.0)](https://pacyworld.dev/pacyworld/born/actions/runs/272/jobs/2) and [zig 0.17.1 job](https://pacyworld.dev/pacyworld/born/actions/runs/272/jobs/3): Debug and ReleaseSafe, 34 passed, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
+| epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | born.io time route (sleep, now) | [run 272, Linux job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/272/jobs/8): Debug and ReleaseSafe on 0.16.0 and 0.17.1, 33 passed, 1 skipped, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
+| IOCP, Windows Server 2022 build 20348 (CI Windows runner) | born.io time route (sleep, now) | [run 272, Windows job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/272/jobs/14): Debug and ReleaseSafe on 0.16.0 and 0.17.1, 33 passed, 1 skipped, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
+| kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io time route (sleep, now) | born-io-tests Debug and ReleaseSafe on Zig 0.16.0: 34 passed, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
+| kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io time route, default config (stats off) | born-io-tests-default Debug and ReleaseSafe on Zig 0.16.0: 34 passed, 0 failed each; the wake-count test asserts the zero contract | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
+| kqueue, macOS 26.1 arm64 (manual host) | born.io time route (sleep, now) | born-io-tests Debug and ReleaseSafe on Zig 0.16.0, ReleaseSafe on 0.17.1: 34 passed, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
+| kqueue, NetBSD 10.1 amd64 (manual host) | born.io time route (pipe wake) | born-io-tests Debug and ReleaseSafe on Zig 0.16.0: 34 passed, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
+| epoll, Linux 7.0 (Ubuntu 26.04 VM, manual host) | born.io time route (sleep, now) | born-io-tests Debug and ReleaseSafe on Zig 0.16.0: 33 passed, 1 skipped, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
+| epoll, Linux 7.0 (Ubuntu 26.04 VM, manual host) | born.io time route, default config (stats off) | born-io-tests-default ReleaseSafe on Zig 0.16.0: 33 passed, 1 skipped, 0 failed | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
+| IOCP, Windows 11 build 26100 (manual host) | born.io time route (sleep, now) | born-io-tests.exe Debug and ReleaseSafe on Zig 0.16.0 over OpenSSH: 33 passed, 1 skipped, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
 
 Commit 3ed3785 changes only the CI workflow; its library and tests are
 those of master d1017b8. Skips identify platform exclusions or primitives
-not implemented at the recorded commit.
+not implemented at the recorded commit. The born.io manual runs were built
+from the shim sources of 1a008de; the Linux and Windows runs skip the
+kqueue-only loop-death test. The default-config (stats off) runs use
+born-io-tests-default, the exported module built without -Dtime-stats. The
+commit adding these rows changes only this README; its library, tests and
+CI are those of 1a008de.
 
 ## Programming model
 
@@ -450,6 +465,63 @@ POSIX provides `Listener.openUnix(path, opts)` and
 - **Nothing fails silently:** every refusal reaches the caller as an error
   from the call, or from the next `wait()` for deferred registrations.
 
+## std.Io compatibility shim (born.io)
+
+On Zig >= 0.16, born also exports `born.io`: a `std.Io` interface composing
+Born's event port with upstream's `Io.Threaded` worker pool. Capability
+routing is explicit: each family is serviced either by Born's reactor or by
+Threaded, and a Born route that is not implemented is rejected at
+construction (`CapabilityUnsupported`), never silently delegated.
+
+The time family is the first enabled Born route
+(`capabilities.time = .born_evented`): `sleep` runs on Born's timers and
+monotonic `now` on Born's timer clock; every other slot delegates to
+Threaded. One loop thread per instance drives the port. A blocking sleep
+submits a caller-owned operation node through an intrusive queue into a
+loop-owned slot table; the timer identity is the slot index plus a
+generation, so a stale timer fire is dropped without touching caller
+storage. The queue wakes the loop only on empty-to-non-empty transitions,
+and cancellation rides a dedicated cancel list, so neither path scans the
+armed population. Completion returns through a Threaded futex so
+cancellation composes with Threaded's cancel machinery. The queue is
+bounded by caller storage (one node per blocking call), so queue-full
+cannot occur: `sleep`'s only error is `Canceled`, meaning the sleep was
+interrupted (task cancellation, shim stop, or kernel timer exhaustion),
+never overload. Route-level refusals (port wait failures, timer-arm
+refusals, slot-table growth failures) are latched and readable via
+`born_io.loopError(io)`. Born timers are millisecond-granular: a sleep
+shorter than 1 ms costs at least 1 ms. `clockResolution(.awake)` stays on
+Threaded, so on macOS and Windows it reports the resolution of Threaded's
+awake clock, not of the Born timer clock that `now(.awake)` reads. The
+per-slot failure mapping and the Scale model machinery are documented in
+`src/io/shim.zig`.
+
+```zig
+// build.zig (Zig >= 0.16)
+const born = b.dependency("born", .{ .target = target, .optimize = optimize });
+exe.root_module.addImport("born", born.module("born"));
+exe.root_module.addImport("born.io", born.module("born.io"));
+```
+
+```zig
+const born = @import("born");
+const born_io = @import("born.io");
+
+var port = try born.EvPort.init(allocator);
+defer port.deinit();
+const io = try born_io.io(&port, .{
+    .allocator = allocator,
+    .capabilities = .{ .time = .born_evented },
+});
+defer born_io.deinit(io);
+try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+```
+
+The all-Threaded baseline (every slot delegated, no loop thread) remains
+available and is the default. The shim is isolated: the core never imports
+it, and the build enforces that boundary on every toolchain. Removal is
+`git rm -r src/io` plus the conditional export lines in `build.zig`.
+
 ## Use
 
 Fetch the archive with `zig fetch` for its hash. Replace `master` with a full
@@ -478,6 +550,7 @@ zig build check-targets   # semantic compilation of test bodies for all seven tr
 zig build docs            # API documentation in zig-out/docs/index.html
 zig build test-bin -Dtarget=x86_64-windows-gnu --prefix zig-out/windows
 zig build test-bin -Dtarget=x86_64-linux-gnu --prefix zig-out/linux
+zig build test-io-bin -Dtarget=x86_64-linux-gnu --prefix zig-out/linux   # born.io, Zig >= 0.16
 ```
 
 Born supports Zig 0.15.2, 0.16.0, and 0.17.1. `src/compat.zig` owns native ABI
@@ -489,7 +562,8 @@ The module propagates its libc or Winsock/kernel32 linkage. Forgejo CI
 (`.forgejo/workflows/ci.yml`) runs a toolchain matrix over Zig 0.15.2, 0.16.0,
 and 0.17.1: each toolchain runs the FreeBSD Debug and ReleaseSafe suites
 (kqueue), compiles the seven-target test matrix, generates API documentation,
-and cross-builds the Linux and Windows test executables in both optimize modes.
+and cross-builds the Linux and Windows test executables in both optimize modes
+(on Zig >= 0.16 the `born.io` test executables too).
 The Linux (epoll, Ubuntu 24.04) and Windows (IOCP, Windows Server 2022) runtime
 jobs run those executables per toolchain and optimize mode, verifying each
 executable's SHA-256 against the build. A single Zig 0.15.2 `zig fmt --check`

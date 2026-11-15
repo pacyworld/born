@@ -97,6 +97,11 @@ pub const process = @import("process.zig");
 /// report what it is actually running on rather than what it assumes.
 pub const backend_name: []const u8 = @tagName(select.backend);
 
+/// Current time on the clock timers and deadlines are measured in, in
+/// nanoseconds: CLOCK_MONOTONIC on POSIX, QueryPerformanceCounter on Windows.
+/// Never wall time. error.Unsupported if the kernel refuses the clock.
+pub const nowNs = @import("timer_heap.zig").nowNs;
+
 test {
     // Supplement real calls with declaration analysis for the selected backend.
     std.testing.refAllDecls(impl);

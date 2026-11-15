@@ -56,3 +56,53 @@ sh bench/run.sh BIN storm 5 --threads 16     # accept storm
 REPLY=4194304 sh bench/run.sh BIN bulk 5 --threads 4  # short writes
 sh bench/run.sh BIN wake  5
 ```
+
+## Time-route benchmark (P5.2)
+
+`zig build bench-time` (Zig >= 0.16) installs `zig-out/bin/born-time-bench`.
+The step is not part of `test`, `test-bin` or `check-targets`. It measures the
+born.io time route (`capabilities.time = .born_evented`) against the
+all-Threaded baseline:
+
+```
+zig build bench-time -Doptimize=ReleaseSafe
+sh bench/time.sh zig-out/bin/born-time-bench 3
+```
+
+- Sequential phase: `--seq` sleeps (default 200) of `--sleep-ms` (default 1)
+  on the calling thread; reports p50/p99/max/mean per-sleep latency.
+- Concurrent phase: `--threads` blocking threads (default 64), one sleep in
+  flight per thread for `--seconds` (default 5); reports completed sleeps per
+  second and p50/p99 per-sleep latency. On the Born route every sleep is a
+  cross-thread submission through the shim's loop thread.
+- The measurement clock is Born's monotonic clock (`born.nowNs`,
+  CLOCK_MONOTONIC / QPC) on both routes, independent of the route under test.
+- `bench/time.sh BIN [REPS]` runs the quiet-host guard first (quiet.sh on
+  FreeBSD, a loadavg check on Linux) and refuses a busy host; it then runs
+  both routes per repetition. Report the spread over repetitions.
+
+### Written target (P5.2)
+
+On the 64-sleeper concurrent phase (the defaults: `--threads 64
+--sleep-ms 1 --seconds 5`), the Born route must reach at least 95% of
+Threaded's completed sleeps per second, and its p99 per-sleep latency must
+be no worse than Threaded's. `--route both` prints the verdict line
+(`target ... MET|UNMET`) and, for the Born route, a per-sleep latency
+breakdown from `born_io.timeStats` (means over the concurrent phase):
+
+- `submit_wake_us`: submitter side, enqueue plus the conditional wake.
+- `queue_arm_us`: enqueue to first arm; includes `submit_wake_us`.
+  `loop_handoff_us` is their difference (queue wait, drain, arm).
+- `timer_span_us`: armed time including the requested sleep;
+  `kernel_slack_us` is the span minus the request (negative when the
+  handoff consumed part of the requested sleep).
+- `futex_return_us`: completion handoff back to the submitter.
+
+`--instances N` spreads the sleepers round-robin over N port/instance
+pairs, the scale model's thread-per-core deployment shape (one loop per
+instance); ops/s and p99 aggregate over all sleepers, the breakdown sums
+the per-instance accumulators. The default is one instance.
+
+If the target is unmet at an increment, the pull request reports the
+numbers and the breakdown and names the increment that meets it; no
+open-ended deferral.
