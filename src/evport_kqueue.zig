@@ -55,8 +55,9 @@ pub const EVFILT_SIGNAL = std.c.EVFILT.SIGNAL;
 
 /// EVFILT_USER exists on FreeBSD and macOS only.
 const have_user = switch (builtin.os.tag) {
-    .freebsd, .macos, .ios, .tvos, .watchos, .visionos => true,
-    else => false,
+    .freebsd, .macos => true,
+    .netbsd, .openbsd => false,
+    else => @compileError("born: unsupported kqueue target"),
 };
 const EVFILT_USER = if (have_user) std.c.EVFILT.USER else 0;
 /// sys/event.h NOTE_TRIGGER, the same value on FreeBSD and macOS.

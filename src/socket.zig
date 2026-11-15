@@ -11,26 +11,10 @@
 //! AcceptEx slots and their address buffers live in a stable listener-owned
 //! allocation, independently of the listener value's address.
 
-const builtin = @import("builtin");
 const io = @import("io_types.zig");
-const is_windows = builtin.os.tag == .windows;
-const impl = switch (builtin.os.tag) {
-    .windows => @import("socket_windows.zig"),
-    .freebsd,
-    .netbsd,
-    .openbsd,
-    .dragonfly,
-    .linux,
-    .macos,
-    .ios,
-    .tvos,
-    .watchos,
-    .visionos,
-    .driverkit,
-    => @import("socket_posix.zig"),
-    else => @compileError("born: no plain socket backend for this OS"),
-};
-const listener = if (is_windows) @import("listener_windows.zig") else @import("listener_posix.zig");
+const select = @import("select.zig");
+const impl = select.socket_impl;
+const listener = select.listener_impl;
 
 /// Non-blocking read outcome.
 pub const NbRead = io.NbRead;

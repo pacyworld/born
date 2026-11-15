@@ -40,18 +40,11 @@
 //! Cross-compilation is not runtime verification.
 
 const std = @import("std");
-const builtin = @import("builtin");
+const select = @import("select.zig");
 
-/// Comptime backend selection. The `@import`s behind a comptime-known
-/// `builtin.os.tag` are never analyzed on other targets, so each platform
-/// compiles only its own backend.
-const impl = switch (builtin.os.tag) {
-    .freebsd, .netbsd, .openbsd, .dragonfly => @import("evport_kqueue.zig"),
-    .macos, .ios, .tvos, .watchos, .visionos, .driverkit => @import("evport_kqueue.zig"),
-    .linux => @import("evport_epoll.zig"),
-    .windows => @import("evport_iocp.zig"),
-    else => @compileError("born: no event port backend for this OS"),
-};
+/// Comptime backend selection; select.zig is the single point that maps
+/// supported targets to their backend modules.
+const impl = select.impl;
 
 /// Event port for the compile-time-selected native backend.
 pub const EvPort = impl.EvPort;
@@ -94,13 +87,7 @@ pub const process = @import("process.zig");
 
 /// Which backend this build selected. Useful in diagnostics so a program can
 /// report what it is actually running on rather than what it assumes.
-pub const backend_name: []const u8 = switch (builtin.os.tag) {
-    .freebsd, .netbsd, .openbsd, .dragonfly => "kqueue",
-    .macos, .ios, .tvos, .watchos, .visionos, .driverkit => "kqueue",
-    .linux => "epoll",
-    .windows => "iocp",
-    else => unreachable,
-};
+pub const backend_name: []const u8 = @tagName(select.backend);
 
 test {
     // Supplement real calls with declaration analysis for the selected backend.
