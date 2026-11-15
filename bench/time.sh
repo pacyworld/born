@@ -2,7 +2,7 @@
 # Time-route benchmark driver (P5.2): the routed Born time family vs the
 # all-Threaded baseline, under the #31 quiet-host guard. See bench/README.md.
 #
-#   bench/time.sh BIN [REPS]
+#   bench/time.sh BIN [REPS] [extra born-time-bench args...]
 #
 # Each repetition runs both routes in one process. Results are acceptable
 # only when the quiet guard passes; a busy host fails the guard instead of
@@ -11,6 +11,7 @@ set -eu
 
 bin=$1
 reps=${2:-3}
+shift 2 2>/dev/null || shift $#
 here=$(dirname "$0")
 
 case $(uname) in
@@ -36,6 +37,6 @@ esac
 rep=1
 while [ "$rep" -le "$reps" ]; do
     echo "== rep $rep"
-    "$bin" --route both
+    "$bin" --route both "$@"
     rep=$((rep + 1))
 done

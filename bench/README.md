@@ -98,6 +98,11 @@ breakdown from `born_io.timeStats` (means over the concurrent phase):
   handoff consumed part of the requested sleep).
 - `futex_return_us`: completion handoff back to the submitter.
 
+`--instances N` spreads the sleepers round-robin over N port/instance
+pairs, the scale model's thread-per-core deployment shape (one loop per
+instance); ops/s and p99 aggregate over all sleepers, the breakdown sums
+the per-instance accumulators. The default is one instance.
+
 If the target is unmet at an increment, the pull request reports the
 numbers and the breakdown and names the increment that meets it; no
 open-ended deferral.

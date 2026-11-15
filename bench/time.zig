@@ -4,16 +4,19 @@
 //!
 //!   born-time-bench [--route born|threaded|both] [--seconds S]
 //!                   [--threads N] [--sleep-ms M] [--seq N]
+//!                   [--instances N]
 //!
 //! Measures the routed time family against the all-Threaded baseline:
 //! sequential sleep latency and concurrent sleep throughput, each with
 //! per-operation latency percentiles. With `--route both` it also checks
 //! the written target (bench/README.md): at 64 sleepers Born must reach
 //! >= 95% of Threaded's ops/s with p99 no worse, and prints the Born
-//! route's per-sleep latency breakdown from `born_io.timeStats`. The
-//! measurement clock is Born's monotonic clock (CLOCK_MONOTONIC / QPC) on
-//! both routes, independent of the route under test. Accept results only
-//! on a quiet host.
+//! route's per-sleep latency breakdown from `born_io.timeStats`.
+//! `--instances N` spreads the sleepers over N port/instance pairs (the
+//! scale model's thread-per-core deployment shape); the default is one
+//! instance. The measurement clock is Born's monotonic clock
+//! (CLOCK_MONOTONIC / QPC) on both routes, independent of the route under
+//! test. Accept results only on a quiet host.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -52,6 +55,7 @@ const Options = struct {
     threads: u32 = 64,
     sleep_ms: u32 = 1,
     seq: u32 = 200,
+    instances: u32 = 1,
 };
 
 fn parseArgs(argv: anytype) !Options {
@@ -79,17 +83,23 @@ fn parseArgs(argv: anytype) !Options {
             i += 1;
             if (i >= argv.len) return usage();
             o.seq = try std.fmt.parseInt(u32, std.mem.sliceTo(argv[i], 0), 10);
+        } else if (std.mem.eql(u8, arg, "--instances")) {
+            i += 1;
+            if (i >= argv.len) return usage();
+            o.instances = try std.fmt.parseInt(u32, std.mem.sliceTo(argv[i], 0), 10);
         } else return usage();
     }
     if (o.seconds == 0 or o.threads == 0 or o.threads > threads_max or
-        o.sleep_ms == 0 or o.seq == 0 or o.seq > seq_max) return usage();
+        o.sleep_ms == 0 or o.seq == 0 or o.seq > seq_max or
+        o.instances == 0 or o.instances > o.threads) return usage();
     return o;
 }
 
 fn usage() error{Usage} {
     out(
         "usage: born-time-bench [--route born|threaded|both] [--seconds S]\n" ++
-            "                       [--threads N] [--sleep-ms M] [--seq N]\n",
+            "                       [--threads N] [--sleep-ms M] [--seq N]\n" ++
+            "                       [--instances N]\n",
         .{},
     );
     return error.Usage;
@@ -115,13 +125,24 @@ fn stats(samples: []u64) Stats {
 const RouteResult = struct { ops_per_sec: f64, p99_us: f64 };
 
 fn runRoute(alloc: std.mem.Allocator, route: Route, o: Options) !RouteResult {
-    var port = try born.EvPort.init(alloc);
-    defer port.deinit();
-    const interface = try born_io.io(&port, .{
-        .allocator = alloc,
-        .capabilities = if (route == .born) .{ .time = .born_evented } else .{},
-    });
-    defer born_io.deinit(interface);
+    // One port and one instance per scale-model shard; the default is a
+    // single instance. Sleepers are spread round-robin over the instances.
+    const ports = try alloc.alloc(born.EvPort, o.instances);
+    defer alloc.free(ports);
+    const interfaces = try alloc.alloc(Io, o.instances);
+    defer alloc.free(interfaces);
+    for (ports, 0..) |*port, i| {
+        port.* = try born.EvPort.init(alloc);
+        interfaces[i] = try born_io.io(port, .{
+            .allocator = alloc,
+            .capabilities = if (route == .born) .{ .time = .born_evented } else .{},
+        });
+    }
+    defer for (ports, 0..) |*port, i| {
+        born_io.deinit(interfaces[i]);
+        port.deinit();
+    };
+    const interface = interfaces[0];
     const name = @tagName(route);
     const dur: Io.Duration = .fromMilliseconds(o.sleep_ms);
 
@@ -143,14 +164,16 @@ fn runRoute(alloc: std.mem.Allocator, route: Route, o: Options) !RouteResult {
 
     // Concurrent throughput: raw blocking threads, one sleep in flight per
     // thread, until the phase deadline. On the Born route every sleep is a
-    // cross-thread submission through the shim's loop thread.
+    // cross-thread submission through its instance's loop thread.
     // Stats snapshot: isolate the concurrent phase from the sequential
-    // sleeps above (the accumulators span the instance's lifetime).
-    const stats_before = born_io.timeStats(interface);
+    // sleeps above (the accumulators span each instance's lifetime).
+    const stats_before = try alloc.alloc(born_io.TimeStats, o.instances);
+    defer alloc.free(stats_before);
+    for (interfaces, 0..) |io, i| stats_before[i] = born_io.timeStats(io);
     const ctx = try alloc.create(Concurrent);
     defer alloc.destroy(ctx);
     ctx.* = .{
-        .io = interface,
+        .ios = interfaces,
         .dur = dur,
         .end_ns = nowNs() + @as(u64, o.seconds) * std.time.ns_per_s,
         .samples = try alloc.alloc(u64, samples_max),
@@ -159,19 +182,32 @@ fn runRoute(alloc: std.mem.Allocator, route: Route, o: Options) !RouteResult {
     const threads = try alloc.alloc(std.Thread, o.threads);
     defer alloc.free(threads);
     const phase_start = nowNs();
-    for (threads) |*t| t.* = try std.Thread.spawn(.{}, concurrentWorker, .{ctx});
+    for (threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, concurrentWorker, .{ ctx, i });
     for (threads) |t| t.join();
     const elapsed_ns = nowNs() - phase_start;
     const requests = ctx.count.load(.monotonic);
     const taken = @min(ctx.sample_idx.load(.monotonic), ctx.samples.len);
     const conc = stats(ctx.samples[0..taken]);
     const ops_per_sec = @as(f64, @floatFromInt(requests)) * 1e9 / @as(f64, @floatFromInt(elapsed_ns));
-    out("route={s} concurrent threads={d} seconds={d} sleep_ms={d} requests={d} ops_per_sec={d:.0} p50_us={d:.1} p99_us={d:.1}\n", .{
-        name, o.threads, o.seconds, o.sleep_ms, requests, ops_per_sec, conc.p50, conc.p99,
+    out("route={s} concurrent threads={d} instances={d} seconds={d} sleep_ms={d} requests={d} ops_per_sec={d:.0} p50_us={d:.1} p99_us={d:.1}\n", .{
+        name, o.threads, o.instances, o.seconds, o.sleep_ms, requests, ops_per_sec, conc.p50, conc.p99,
     });
     if (route == .born) {
-        const s = born_io.timeStats(interface);
-        const ops = s.ops - stats_before.ops;
+        var ops: u64 = 0;
+        var wakes: u64 = 0;
+        var submit_wake_ns: u64 = 0;
+        var queue_arm_ns: u64 = 0;
+        var timer_span_ns: u64 = 0;
+        var futex_return_ns: u64 = 0;
+        for (interfaces, 0..) |io, i| {
+            const s = born_io.timeStats(io);
+            ops += s.ops - stats_before[i].ops;
+            wakes += s.wakes - stats_before[i].wakes;
+            submit_wake_ns += s.submit_wake_ns - stats_before[i].submit_wake_ns;
+            queue_arm_ns += s.queue_arm_ns - stats_before[i].queue_arm_ns;
+            timer_span_ns += s.timer_span_ns - stats_before[i].timer_span_ns;
+            futex_return_ns += s.futex_return_ns - stats_before[i].futex_return_ns;
+        }
         if (ops > 0) {
             // Per-sleep means in microseconds. queue_arm includes
             // submit_wake; loop_handoff is their difference. kernel_slack
@@ -179,14 +215,14 @@ fn runRoute(alloc: std.mem.Allocator, route: Route, o: Options) !RouteResult {
             // handoff consumed part of the requested sleep).
             const n = @as(f64, @floatFromInt(ops));
             const us = 1000.0;
-            const submit_wake = @as(f64, @floatFromInt(s.submit_wake_ns - stats_before.submit_wake_ns)) / n / us;
-            const queue_arm = @as(f64, @floatFromInt(s.queue_arm_ns - stats_before.queue_arm_ns)) / n / us;
-            const timer_span = @as(f64, @floatFromInt(s.timer_span_ns - stats_before.timer_span_ns)) / n / us;
-            const futex_return = @as(f64, @floatFromInt(s.futex_return_ns - stats_before.futex_return_ns)) / n / us;
+            const submit_wake = @as(f64, @floatFromInt(submit_wake_ns)) / n / us;
+            const queue_arm = @as(f64, @floatFromInt(queue_arm_ns)) / n / us;
+            const timer_span = @as(f64, @floatFromInt(timer_span_ns)) / n / us;
+            const futex_return = @as(f64, @floatFromInt(futex_return_ns)) / n / us;
             const requested_us = @as(f64, @floatFromInt(o.sleep_ms)) * 1000.0;
             out("route=born breakdown ops={d} wakes={d} submit_wake_us={d:.1} queue_arm_us={d:.1} loop_handoff_us={d:.1} timer_span_us={d:.1} kernel_slack_us={d:.1} futex_return_us={d:.1}\n", .{
                 ops,
-                s.wakes - stats_before.wakes,
+                wakes,
                 submit_wake,
                 queue_arm,
                 queue_arm - submit_wake,
@@ -200,7 +236,7 @@ fn runRoute(alloc: std.mem.Allocator, route: Route, o: Options) !RouteResult {
 }
 
 const Concurrent = struct {
-    io: Io,
+    ios: []Io,
     dur: Io.Duration,
     end_ns: u64,
     count: std.atomic.Value(u64) = .init(0),
@@ -208,10 +244,11 @@ const Concurrent = struct {
     sample_idx: std.atomic.Value(usize) = .init(0),
 };
 
-fn concurrentWorker(ctx: *Concurrent) void {
+fn concurrentWorker(ctx: *Concurrent, worker_index: usize) void {
+    const io = ctx.ios[worker_index % ctx.ios.len];
     while (nowNs() < ctx.end_ns) {
         const t0 = nowNs();
-        Io.sleep(ctx.io, ctx.dur, .awake) catch return;
+        Io.sleep(io, ctx.dur, .awake) catch return;
         const dt = nowNs() - t0;
         _ = ctx.count.fetchAdd(1, .monotonic);
         const idx = ctx.sample_idx.fetchAdd(1, .monotonic);
@@ -237,8 +274,9 @@ pub fn main(init: std.process.Init.Minimal) !void {
             // >= 95% of Threaded's concurrent ops/s with p99 no worse.
             const ratio = born_result.ops_per_sec / threaded.ops_per_sec;
             const met = ratio >= 0.95 and born_result.p99_us <= threaded.p99_us;
-            out("target threads={d} sleep_ms={d} ops_ratio={d:.3} (need >= 0.950) p99_born_us={d:.1} p99_threaded_us={d:.1} (need born <= threaded): {s}\n", .{
+            out("target threads={d} instances={d} sleep_ms={d} ops_ratio={d:.3} (need >= 0.950) p99_born_us={d:.1} p99_threaded_us={d:.1} (need born <= threaded): {s}\n", .{
                 o.threads,
+                o.instances,
                 o.sleep_ms,
                 ratio,
                 born_result.p99_us,
