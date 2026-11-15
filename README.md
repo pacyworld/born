@@ -134,6 +134,13 @@ inline-successful Winsock operation queues a completion. On teardown, call
 `deinit` and free the stream. Closing the handle alone does not end the lifetime
 of its `OVERLAPPED` storage.
 
+`PlainNb.sock` is the native Winsock socket handle, of type `born.windows.SOCKET`,
+with sentinel `born.windows.INVALID_SOCKET`. These are born's own nominal types,
+distinct from `std.os.windows.ws2_32.SOCKET`, so they do not interconvert implicitly:
+a consumer that stores or returns the socket, or declares its own ws2_32 externs
+that take it, names `born.windows.SOCKET` or casts at the boundary. `born.windows`
+also exports `OVERLAPPED`, the operation-storage type used by `Event.overlapped`.
+
 Windows anonymous pipes for application-created children, such as those from
 `std.process.Child`, are **not overlappable**. The TCP companion does not make
 those pipes IOCP-capable: use explicitly created overlappable named pipes or a
@@ -142,11 +149,11 @@ blocking-pipe relay, as mcp-bridge does. This is separate from
 
 ### Common event surface
 
-`born.Handle` is the native descriptor type (`std.posix.fd_t` or
-`std.os.windows.HANDLE`). Every backend uses it for descriptor arguments.
+`born.Handle` is the native descriptor type (`std.posix.fd_t` on POSIX,
+`*anyopaque` on Windows). Every backend uses it for descriptor arguments.
 `born.Event` has the same fields on every backend: `udata`, `readable`,
 `writable`, `eof`, `err`, `err_no: usize`, `wake`,
-`overlapped: ?*std.os.windows.OVERLAPPED`, `bytes: usize`, the timer and
+`overlapped: ?*born.windows.OVERLAPPED`, `bytes: usize`, the timer and
 signal fields `timer: bool`, `signal: ?born.Signal` and `fired: u32` (see
 [primitive contracts](#primitive-contracts)), which stay false, null and zero
 for every other event, `avail: usize`, the readiness count (see
