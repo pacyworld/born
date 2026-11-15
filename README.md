@@ -473,6 +473,13 @@ routing is explicit: each family is serviced either by Born's reactor or by
 Threaded, and a Born route that is not implemented is rejected at
 construction (`CapabilityUnsupported`), never silently delegated.
 
+**Status in v0.3.0: opt-in and experimental.** `born.io` requires Zig >= 0.16
+and is not exported on 0.15.2. The Born time route
+(`capabilities.time = .born_evented`) is experimental: it currently misses its
+written benchmark target, and the remaining work is tracked in #101. It is not
+recommended for production until #101 meets that target. The default remains
+the all-Threaded baseline, which is the supported configuration in 0.3.0.
+
 The time family is the first enabled Born route
 (`capabilities.time = .born_evented`): `sleep` runs on Born's timers and
 monotonic `now` on Born's timer clock; every other slot delegates to
