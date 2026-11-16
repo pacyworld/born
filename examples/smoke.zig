@@ -22,10 +22,10 @@ const ns_per_ms = std.time.ns_per_ms;
 /// Winsock setsockopt for the test-only socket-buffer cap below. born
 /// exposes no public socket-option setter; a consumer declares its own
 /// ws2_32 extern with born.windows.SOCKET (pointer-sized, the UINT_PTR
-/// ABI) and casts the handle at the boundary. The default C calling
-/// convention matches ws2_32 on every supported toolchain. Referenced
-/// only in the Windows branch, so POSIX builds never link ws2_32.
-extern "ws2_32" fn setsockopt(s: born.windows.SOCKET, level: c_int, optname: c_int, optval: [*]const u8, optlen: c_int) c_int;
+/// ABI) and casts the handle at the boundary, matching the callconv born
+/// uses for ws2_32. Referenced only in the Windows branch, so POSIX builds
+/// never link ws2_32.
+extern "ws2_32" fn setsockopt(s: born.windows.SOCKET, level: c_int, optname: c_int, optval: ?[*]const u8, optlen: c_int) callconv(.winapi) c_int;
 
 /// Test-only: bound a socket's buffer so loopback kernel buffers cannot
 /// absorb the whole payload. With default buffers Linux autotunes large
@@ -242,16 +242,19 @@ test "example smoke: full echo buffer resumes reading after the write drains" {
     try s.init(.{}, len);
     defer s.deinit();
     s.read_enabled = false;
-    // Force the stall on every backend: bound the client receive window so
-    // the kernel cannot buffer the full echo and the server's write pends.
-    try capSockBuf(s.client.handle(), false);
     const payload = try alloc.alloc(u8, len);
     defer alloc.free(payload);
     for (payload, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
     const deadline = try born.nowNs() + 20_000 * ns_per_ms;
-    // Establish the connection, then bound the accepted stream's send buffer
-    // too, so queued data is capped regardless of send-buffer autotuning.
-    while (s.engine.activeCount() == 0) try s.step(payload, deadline);
+    // Force the stall on every backend by bounding both socket buffers (see
+    // capSockBuf). Apply the caps to established sockets before any payload
+    // flows: an empty payload steps connect/accept to completion without
+    // sending. The client receive window must be set on a connected socket
+    // (Windows ignores SO_RCVBUF set during a pending ConnectEx), and the
+    // server send buffer on an accepted stream.
+    while (!s.connected) try s.step("", deadline);
+    try capSockBuf(s.client.handle(), false);
+    while (s.engine.activeCount() == 0) try s.step("", deadline);
     for (s.engine.conns) |*c| {
         if (c.active) try capSockBuf(c.stream.handle(), true);
     }
