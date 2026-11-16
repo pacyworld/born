@@ -51,6 +51,9 @@ const Conn = struct {
     len: usize = 0,
     off: usize = 0,
     last_ns: u64 = 0,
+    /// A drive ended with a pending send; the next drive that reads again
+    /// counts one full-buffer resume (see Echo.resume_count).
+    pending_resume: bool = false,
 };
 
 const sweep_id: u32 = 1;
@@ -68,6 +71,10 @@ pub const Echo = struct {
     accepted_total: usize = 0,
     /// Bytes read from peers for echo (a pending tail may be cut by drain).
     echoed_bytes: usize = 0,
+    /// Full-buffer resumes: drive ended with a pending send and a later
+    /// drive read again after it drained. Nonzero proves the resume path
+    /// ran, independent of how much the kernel buffered (backpressure test).
+    resume_count: usize = 0,
     // Timer events carry no id; distinct udata sentinels tell them apart.
     sweep_tag: u8 = 0,
     drain_tag: u8 = 0,
@@ -323,11 +330,21 @@ pub const Echo = struct {
         while (c.active) {
             try self.flush(c);
             // Send still pending: resume on its completion or writable event.
-            if (c.off != c.len) return;
+            if (c.off != c.len) {
+                c.pending_resume = true;
+                return;
+            }
             if (c.peer_eof) return self.closeConn(c);
             switch (try c.stream.readNb(c.buf[0..])) {
                 .data => |n| {
                     if (n == 0) return;
+                    // Reading again after a pending send drained: one full-buffer
+                    // resume. Counted here, not by kernel buffer occupancy, so the
+                    // backpressure test is deterministic on every backend.
+                    if (c.pending_resume) {
+                        self.resume_count += 1;
+                        c.pending_resume = false;
+                    }
                     c.len = n;
                     c.last_ns = try born.nowNs();
                     self.echoed_bytes += n;

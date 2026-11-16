@@ -19,75 +19,6 @@ const Listener = born.socket.Listener;
 const Address = born.socket.Address;
 const ns_per_ms = std.time.ns_per_ms;
 
-/// Winsock setsockopt for the test-only socket-buffer cap below. born
-/// exposes no public socket-option setter; a consumer declares its own
-/// ws2_32 extern with born.windows.SOCKET (pointer-sized, the UINT_PTR
-/// ABI) and casts the handle at the boundary, matching the callconv born
-/// uses for ws2_32. Referenced only in the Windows branch, so POSIX builds
-/// never link ws2_32.
-extern "ws2_32" fn setsockopt(s: born.windows.SOCKET, level: c_int, optname: c_int, optval: ?[*]const u8, optlen: c_int) callconv(.winapi) c_int;
-
-/// getsockopt read-back for the cap verification below. Namespaced so the
-/// ws2_32 and libc symbols (both "getsockopt") do not collide; each is
-/// referenced only in its platform branch, so the other never links.
-const winopt = struct {
-    extern "ws2_32" fn getsockopt(s: born.windows.SOCKET, level: c_int, optname: c_int, optval: [*]u8, optlen: *c_int) callconv(.winapi) c_int;
-};
-const posixopt = struct {
-    extern "c" fn getsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: [*]u8, optlen: *c_uint) c_int;
-};
-
-/// Read back the effective socket buffer size after a cap, so the test
-/// verifies the kernel honored it rather than assuming. Windows reports the
-/// configured SO_RCVBUF/SO_SNDBUF here.
-fn readSockBuf(handle: born.Handle, snd: bool) !c_int {
-    var val: c_int = 0;
-    if (is_windows) {
-        const sock: born.windows.SOCKET = @ptrCast(handle);
-        const optname: c_int = if (snd) 0x1001 else 0x1002;
-        var len: c_int = @sizeOf(c_int);
-        if (winopt.getsockopt(sock, 0xffff, optname, std.mem.asBytes(&val).ptr, &len) != 0)
-            return error.SmokeSocketOpt;
-    } else {
-        const optname: c_int = if (snd) std.posix.SO.SNDBUF else std.posix.SO.RCVBUF;
-        var len: c_uint = @sizeOf(c_int);
-        if (posixopt.getsockopt(handle, std.posix.SOL.SOCKET, optname, std.mem.asBytes(&val).ptr, &len) != 0)
-            return error.SmokeSocketOpt;
-    }
-    return val;
-}
-
-/// Test-only: bound a socket's buffer so loopback kernel buffers cannot
-/// absorb the whole payload. With default buffers Linux autotunes large
-/// loopback windows and the server echoes everything without ever stalling,
-/// hiding the full-buffer resume path the backpressure test exercises.
-/// Capping the client receive window keeps the peer's congestion window from
-/// ramping; capping the server send buffer bounds queued data directly (Linux
-/// sizes the send buffer from cwnd and the large loopback MSS, so autotuning
-/// alone is not a reliable ceiling). Together the write pends deterministically
-/// on kqueue, epoll and IOCP. 32 KiB is far below the ~1 MiB payload yet large
-/// enough that the resume phase drains at full speed, not a crawling window.
-fn capSockBuf(handle: born.Handle, snd: bool) !void {
-    var val: c_int = 32 * 1024;
-    if (is_windows) {
-        const sock: born.windows.SOCKET = @ptrCast(handle);
-        // SOL_SOCKET = 0xffff; SO_SNDBUF = 0x1001, SO_RCVBUF = 0x1002.
-        const optname: c_int = if (snd) 0x1001 else 0x1002;
-        if (setsockopt(sock, 0xffff, optname, std.mem.asBytes(&val).ptr, @sizeOf(c_int)) != 0)
-            return error.SmokeSocketOpt;
-    } else {
-        const optname: u32 = if (snd) std.posix.SO.SNDBUF else std.posix.SO.RCVBUF;
-        std.posix.setsockopt(handle, std.posix.SOL.SOCKET, optname, std.mem.asBytes(&val)) catch
-            return error.SmokeSocketOpt;
-    }
-    // Verify the kernel honored the cap. If the read-back is still large the
-    // plateau below cannot be forced, so fail loudly with the actual value
-    // instead of a mysterious full-echo assertion later.
-    const got = try readSockBuf(handle, snd);
-    std.debug.print("smoke: cap {s} requested {d} read back {d}\n", .{ if (snd) "SO_SNDBUF" else "SO_RCVBUF", val, got });
-    if (got <= 0 or got > 256 * 1024) return error.SmokeSocketOpt;
-}
-
 /// One port driving both the engine (listener + accepted stream) and a
 /// client companion. Constructed in place: the port, listener and client
 /// register udata pointers into this storage and must never move.
@@ -273,7 +204,14 @@ test "example smoke: large payload drains partial writes both ways" {
 }
 
 test "example smoke: full echo buffer resumes reading after the write drains" {
-    const len = 1024 * 1024;
+    // 16 MiB exceeds any loopback kernel absorption (Linux autotunes the
+    // receive buffer to a few MiB; Windows to at most 16 MiB), so a peer that
+    // stops reading forces the server's send to pend on POSIX. On IOCP every
+    // overlapped send pends regardless. The precondition below counts resume
+    // events in the engine, not kernel buffer occupancy, so it is deterministic
+    // on every backend and host (no socket-buffer caps, which Windows applies
+    // at SYN time and AFD can bypass).
+    const len = 16 * 1024 * 1024;
     var s: Single = undefined;
     try s.init(.{}, len);
     defer s.deinit();
@@ -281,24 +219,13 @@ test "example smoke: full echo buffer resumes reading after the write drains" {
     const payload = try alloc.alloc(u8, len);
     defer alloc.free(payload);
     for (payload, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
-    const deadline = try born.nowNs() + 20_000 * ns_per_ms;
-    // Force the stall on every backend by bounding both socket buffers (see
-    // capSockBuf). Apply the caps to established sockets before any payload
-    // flows: an empty payload steps connect/accept to completion without
-    // sending. The client receive window must be set on a connected socket
-    // (Windows ignores SO_RCVBUF set during a pending ConnectEx), and the
-    // server send buffer on an accepted stream.
+    const deadline = try born.nowNs() + 30_000 * ns_per_ms;
+    // Establish the connection without sending payload.
     while (!s.connected) try s.step("", deadline);
-    try capSockBuf(s.client.handle(), false);
     while (s.engine.activeCount() == 0) try s.step("", deadline);
-    for (s.engine.conns) |*c| {
-        if (c.active) try capSockBuf(c.stream.handle(), true);
-    }
-    // Phase 1: send without reading. The server echoes until its buffer fills
-    // and the send pends against the client's closed window; echoed_bytes then
-    // plateaus. This forces the full-buffer resume path on every backend, not
-    // only IOCP: POSIX loopback never returns EAGAIN for a 4 KiB write unless
-    // the peer stops reading, so the stranding bug would otherwise hide there.
+    // Phase 1: send without reading. The server echoes until the client's
+    // receive buffer fills and the send pends; drive returns with a pending
+    // send and stops reading. Wait for echoed_bytes to stop advancing.
     var last_echoed: usize = 0;
     var stall: usize = 0;
     while (stall < 16) {
@@ -310,13 +237,17 @@ test "example smoke: full echo buffer resumes reading after the write drains" {
             last_echoed = s.engine.echoed_bytes;
         }
     }
-    // The server stalled before echoing everything: backpressure actually hit.
-    try std.testing.expect(s.engine.echoed_bytes < len);
+    std.debug.print("smoke backpressure phase1: len={d} echoed={d} sent={d} resumes={d}\n", .{ len, s.engine.echoed_bytes, s.sent, s.engine.resume_count });
     // Phase 2: resume reading. The writable event (POSIX) or send completion
     // (IOCP) frees the buffer and drive re-enters the read side; the transfer
     // must complete rather than hang until the idle sweep.
     s.read_enabled = true;
     while (s.recvd < len) try s.step(payload, deadline);
+    // Deterministic precondition: the full-buffer resume path ran at least
+    // once (drive ended with a pending send, a later drive read again after it
+    // drained). Print the observed values so any failure diagnoses itself.
+    std.debug.print("smoke backpressure phase2: len={d} echoed={d} sent={d} recvd={d} resumes={d}\n", .{ len, s.engine.echoed_bytes, s.sent, s.recvd, s.engine.resume_count });
+    try std.testing.expect(s.engine.resume_count > 0);
     try std.testing.expectEqualSlices(u8, payload, s.out);
     s.closeClient();
     while (s.engine.activeCount() != 0) try s.pumpEngine(deadline);
