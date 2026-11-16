@@ -10,6 +10,26 @@
   type and sentinel of `socket.PlainNb.sock` (#94), alongside `born.windows.OVERLAPPED`.
 - Tri-toolchain support: Zig 0.15.2, 0.16.0 and 0.17.1.
 
+## Windows ABI breaking change
+
+0.3.0 stabilizes the Windows ABI in `compat.zig` with born-owned types,
+because Zig 0.16.0 and 0.17.1 dropped the Win32 types (`OVERLAPPED`,
+`ws2_32.SOCKET`) from `std.os.windows`. v0.2.3 exposed those std types as
+the public Windows API, so a consumer whose Windows glue is typed against
+`std.os.windows` (for example McpBridge's `win.zig`) no longer coerces
+against 0.3.0 and must migrate to `born.windows.SOCKET`,
+`born.windows.INVALID_SOCKET` and `born.windows.OVERLAPPED` (#94, #95).
+This is a necessary consequence of tri-toolchain Windows support, not a
+revertible defect: born cannot alias std types that no longer exist on
+0.16/0.17, and aliasing them on 0.15.2 only would make the public Windows
+Handle toolchain-dependent.
+
+POSIX consumers are unchanged: McpBridge (FreeBSD host, 88/88 unit tests)
+and sonya-core (the -Dzmq daemon, 18/18 build steps) build against the RC
+with no source changes. The #23 "consumers build with no source changes"
+check is scoped to POSIX until the Windows migration lands; that
+migration is tracked in mcp-bridge#35 and follows the repin order below.
+
 ## born.io (std.Io compatibility shim) - experimental, opt-in
 
 - `born.io` requires Zig >= 0.16 and is not exported on 0.15.2. The all-Threaded
