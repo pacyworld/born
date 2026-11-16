@@ -27,6 +27,36 @@ const ns_per_ms = std.time.ns_per_ms;
 /// never link ws2_32.
 extern "ws2_32" fn setsockopt(s: born.windows.SOCKET, level: c_int, optname: c_int, optval: ?[*]const u8, optlen: c_int) callconv(.winapi) c_int;
 
+/// getsockopt read-back for the cap verification below. Namespaced so the
+/// ws2_32 and libc symbols (both "getsockopt") do not collide; each is
+/// referenced only in its platform branch, so the other never links.
+const winopt = struct {
+    extern "ws2_32" fn getsockopt(s: born.windows.SOCKET, level: c_int, optname: c_int, optval: [*]u8, optlen: *c_int) callconv(.winapi) c_int;
+};
+const posixopt = struct {
+    extern "c" fn getsockopt(sockfd: c_int, level: c_int, optname: c_int, optval: [*]u8, optlen: *c_uint) c_int;
+};
+
+/// Read back the effective socket buffer size after a cap, so the test
+/// verifies the kernel honored it rather than assuming. Windows reports the
+/// configured SO_RCVBUF/SO_SNDBUF here.
+fn readSockBuf(handle: born.Handle, snd: bool) !c_int {
+    var val: c_int = 0;
+    if (is_windows) {
+        const sock: born.windows.SOCKET = @ptrCast(handle);
+        const optname: c_int = if (snd) 0x1001 else 0x1002;
+        var len: c_int = @sizeOf(c_int);
+        if (winopt.getsockopt(sock, 0xffff, optname, std.mem.asBytes(&val).ptr, &len) != 0)
+            return error.SmokeSocketOpt;
+    } else {
+        const optname: c_int = if (snd) std.posix.SO.SNDBUF else std.posix.SO.RCVBUF;
+        var len: c_uint = @sizeOf(c_int);
+        if (posixopt.getsockopt(handle, std.posix.SOL.SOCKET, optname, std.mem.asBytes(&val).ptr, &len) != 0)
+            return error.SmokeSocketOpt;
+    }
+    return val;
+}
+
 /// Test-only: bound a socket's buffer so loopback kernel buffers cannot
 /// absorb the whole payload. With default buffers Linux autotunes large
 /// loopback windows and the server echoes everything without ever stalling,
@@ -50,6 +80,12 @@ fn capSockBuf(handle: born.Handle, snd: bool) !void {
         std.posix.setsockopt(handle, std.posix.SOL.SOCKET, optname, std.mem.asBytes(&val)) catch
             return error.SmokeSocketOpt;
     }
+    // Verify the kernel honored the cap. If the read-back is still large the
+    // plateau below cannot be forced, so fail loudly with the actual value
+    // instead of a mysterious full-echo assertion later.
+    const got = try readSockBuf(handle, snd);
+    std.debug.print("smoke: cap {s} requested {d} read back {d}\n", .{ if (snd) "SO_SNDBUF" else "SO_RCVBUF", val, got });
+    if (got <= 0 or got > 256 * 1024) return error.SmokeSocketOpt;
 }
 
 /// One port driving both the engine (listener + accepted stream) and a
