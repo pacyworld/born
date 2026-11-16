@@ -19,6 +19,39 @@ const Listener = born.socket.Listener;
 const Address = born.socket.Address;
 const ns_per_ms = std.time.ns_per_ms;
 
+/// Winsock setsockopt for the test-only socket-buffer cap below. born
+/// exposes no public socket-option setter; a consumer declares its own
+/// ws2_32 extern with born.windows.SOCKET (pointer-sized, the UINT_PTR
+/// ABI) and casts the handle at the boundary. The default C calling
+/// convention matches ws2_32 on every supported toolchain. Referenced
+/// only in the Windows branch, so POSIX builds never link ws2_32.
+extern "ws2_32" fn setsockopt(s: born.windows.SOCKET, level: c_int, optname: c_int, optval: [*]const u8, optlen: c_int) c_int;
+
+/// Test-only: bound a socket's buffer so loopback kernel buffers cannot
+/// absorb the whole payload. With default buffers Linux autotunes large
+/// loopback windows and the server echoes everything without ever stalling,
+/// hiding the full-buffer resume path the backpressure test exercises.
+/// Capping the client receive window keeps the peer's congestion window from
+/// ramping; capping the server send buffer bounds queued data directly (Linux
+/// sizes the send buffer from cwnd and the large loopback MSS, so autotuning
+/// alone is not a reliable ceiling). Together the write pends deterministically
+/// on kqueue, epoll and IOCP. 32 KiB is far below the ~1 MiB payload yet large
+/// enough that the resume phase drains at full speed, not a crawling window.
+fn capSockBuf(handle: born.Handle, snd: bool) !void {
+    var val: c_int = 32 * 1024;
+    if (is_windows) {
+        const sock: born.windows.SOCKET = @ptrCast(handle);
+        // SOL_SOCKET = 0xffff; SO_SNDBUF = 0x1001, SO_RCVBUF = 0x1002.
+        const optname: c_int = if (snd) 0x1001 else 0x1002;
+        if (setsockopt(sock, 0xffff, optname, std.mem.asBytes(&val).ptr, @sizeOf(c_int)) != 0)
+            return error.SmokeSocketOpt;
+    } else {
+        const optname: u32 = if (snd) std.posix.SO.SNDBUF else std.posix.SO.RCVBUF;
+        std.posix.setsockopt(handle, std.posix.SOL.SOCKET, optname, std.mem.asBytes(&val)) catch
+            return error.SmokeSocketOpt;
+    }
+}
+
 /// One port driving both the engine (listener + accepted stream) and a
 /// client companion. Constructed in place: the port, listener and client
 /// register udata pointers into this storage and must never move.
@@ -209,10 +242,19 @@ test "example smoke: full echo buffer resumes reading after the write drains" {
     try s.init(.{}, len);
     defer s.deinit();
     s.read_enabled = false;
+    // Force the stall on every backend: bound the client receive window so
+    // the kernel cannot buffer the full echo and the server's write pends.
+    try capSockBuf(s.client.handle(), false);
     const payload = try alloc.alloc(u8, len);
     defer alloc.free(payload);
     for (payload, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
     const deadline = try born.nowNs() + 20_000 * ns_per_ms;
+    // Establish the connection, then bound the accepted stream's send buffer
+    // too, so queued data is capped regardless of send-buffer autotuning.
+    while (s.engine.activeCount() == 0) try s.step(payload, deadline);
+    for (s.engine.conns) |*c| {
+        if (c.active) try capSockBuf(c.stream.handle(), true);
+    }
     // Phase 1: send without reading. The server echoes until its buffer fills
     // and the send pends against the client's closed window; echoed_bytes then
     // plateaus. This forces the full-buffer resume path on every backend, not
