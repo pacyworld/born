@@ -51,6 +51,10 @@ OS per primitive, and lists real runs only.
 | kqueue, FreeBSD 15 (CI FreeBSD runner) | process descriptors (pdfork, EVFILT_PROCDESC) | [run 127, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/127/jobs/0): Debug and ReleaseSafe, 108 passed, 8 skipped, 0 failed | 2026-11-09 | [6f4f6ed](https://pacyworld.dev/pacyworld/born/commit/6f4f6ed776306c37e5beaa4cd238263cb980d1be) |
 | epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | process descriptors (pidfd, waitid) | [run 127, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/127/jobs/1): ReleaseSafe, 104 passed, 7 skipped, 0 failed | 2026-11-09 | [6f4f6ed](https://pacyworld.dev/pacyworld/born/commit/6f4f6ed776306c37e5beaa4cd238263cb980d1be) |
 | IOCP, Windows Server 2022 build 20348 (CI Windows runner) | process descriptors: unsupported contract | [run 134, Windows job](https://pacyworld.dev/pacyworld/born/actions/runs/134/jobs/2): ReleaseSafe, 74 passed, 25 skipped, 0 failed; Unsupported test passed | 2026-11-10 | [1aaf70e](https://pacyworld.dev/pacyworld/born/commit/1aaf70e9d5f61dc8bb4a92aee3f2ca4682057b4c) |
+| kqueue, FreeBSD 15 (CI FreeBSD runner) | timers (EVFILT_TIMER plus deadline heap) | [run 275, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/275/jobs/1): Debug and ReleaseSafe, 151 passed, 18 skipped, 0 failed | 2026-11-15 | [2605345](https://pacyworld.dev/pacyworld/born/commit/26053451f8fa4d1fd70973618db28ca69c7ca16e) |
+| kqueue, FreeBSD 15 (CI FreeBSD runner) | signals (EVFILT_SIGNAL) | [run 275, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/275/jobs/1): Debug and ReleaseSafe, 151 passed, 18 skipped, 0 failed | 2026-11-15 | [2605345](https://pacyworld.dev/pacyworld/born/commit/26053451f8fa4d1fd70973618db28ca69c7ca16e) |
+| kqueue, FreeBSD 15 (CI FreeBSD runner) | TCP listener (accept drain, SO_REUSEPORT_LB) | [run 275, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/275/jobs/1): Debug and ReleaseSafe, 151 passed, 18 skipped, 0 failed | 2026-11-15 | [2605345](https://pacyworld.dev/pacyworld/born/commit/26053451f8fa4d1fd70973618db28ca69c7ca16e) |
+| epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | TCP listener (accept drain, SO_REUSEPORT) | [run 275, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/275/jobs/7): ReleaseSafe, 149 passed, 12 skipped, 0 failed | 2026-11-15 | [2605345](https://pacyworld.dev/pacyworld/born/commit/26053451f8fa4d1fd70973618db28ca69c7ca16e) |
 | kqueue, FreeBSD 15 (CI FreeBSD runner) | born.io time route (sleep, now) | [run 272, FreeBSD job (zig 0.16.0)](https://pacyworld.dev/pacyworld/born/actions/runs/272/jobs/2) and [zig 0.17.1 job](https://pacyworld.dev/pacyworld/born/actions/runs/272/jobs/3): Debug and ReleaseSafe, 34 passed, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
 | epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | born.io time route (sleep, now) | [run 272, Linux job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/272/jobs/8): Debug and ReleaseSafe on 0.16.0 and 0.17.1, 33 passed, 1 skipped, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
 | IOCP, Windows Server 2022 build 20348 (CI Windows runner) | born.io time route (sleep, now) | [run 272, Windows job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/272/jobs/14): Debug and ReleaseSafe on 0.16.0 and 0.17.1, 33 passed, 1 skipped, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
@@ -472,6 +476,13 @@ Born's event port with upstream's `Io.Threaded` worker pool. Capability
 routing is explicit: each family is serviced either by Born's reactor or by
 Threaded, and a Born route that is not implemented is rejected at
 construction (`CapabilityUnsupported`), never silently delegated.
+
+**Status in v0.3.0: opt-in and experimental.** `born.io` requires Zig >= 0.16
+and is not exported on 0.15.2. The Born time route
+(`capabilities.time = .born_evented`) is experimental: it currently misses its
+written benchmark target, and the remaining work is tracked in #101. It is not
+recommended for production until #101 meets that target. The default remains
+the all-Threaded baseline, which is the supported configuration in 0.3.0.
 
 The time family is the first enabled Born route
 (`capabilities.time = .born_evented`): `sleep` runs on Born's timers and
