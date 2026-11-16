@@ -31,6 +31,9 @@ const Single = struct {
     connected: bool = false,
     client_closed: bool = false,
     client_eof: bool = false,
+    /// When false the client sends but does not read, forcing the server's
+    /// echo buffer to fill and its write to pend (backpressure regression).
+    read_enabled: bool = true,
     sent: usize = 0,
     recvd: usize = 0,
 
@@ -60,21 +63,37 @@ const Single = struct {
 
     /// One non-blocking progress pass plus one wait. Client events feed the
     /// client state machine; the whole batch also goes to the engine, which
-    /// ignores events naming other port users.
+    /// ignores events naming other port users. Each side loops until it wants
+    /// readiness/completion: IOCP reports a completed send without posting the
+    /// next one and returns buffered reads without posting a receive, so a
+    /// single op per step would idle out the wait with nothing in flight.
     fn step(self: *Single, payload: []const u8, deadline_ns: u64) !void {
         if (try born.nowNs() > deadline_ns) return error.SmokeTimeout;
         if (self.connected and self.sent < payload.len) {
-            switch (try self.client.writeNb(payload[self.sent..])) {
-                .done => |n| self.sent += n,
-                .want_write => if (!is_windows) self.port.wantWrite(self.client.handle(), &self.client),
-                .want_read => return error.SmokeUnexpected,
+            while (self.sent < payload.len) {
+                switch (try self.client.writeNb(payload[self.sent..])) {
+                    .done => |n| self.sent += n,
+                    .want_write => {
+                        if (!is_windows) self.port.wantWrite(self.client.handle(), &self.client);
+                        break;
+                    },
+                    .want_read => return error.SmokeUnexpected,
+                }
             }
         }
-        if (self.connected and !self.client_eof and !self.client_closed and self.recvd < self.out.len) {
-            switch (try self.client.readNb(self.out[self.recvd..])) {
-                .data => |n| self.recvd += n,
-                .want_read, .want_write => {},
-                .eof => self.client_eof = true,
+        if (self.read_enabled and self.connected and !self.client_eof and !self.client_closed and self.recvd < self.out.len) {
+            while (self.recvd < self.out.len) {
+                switch (try self.client.readNb(self.out[self.recvd..])) {
+                    .data => |n| {
+                        if (n == 0) break;
+                        self.recvd += n;
+                    },
+                    .want_read, .want_write => break,
+                    .eof => {
+                        self.client_eof = true;
+                        break;
+                    },
+                }
             }
         }
         var events: [32]born.Event = undefined;
@@ -184,6 +203,47 @@ test "example smoke: large payload drains partial writes both ways" {
     try std.testing.expectEqual(len, s.engine.echoed_bytes);
 }
 
+test "example smoke: full echo buffer resumes reading after the write drains" {
+    const len = 1024 * 1024;
+    var s: Single = undefined;
+    try s.init(.{}, len);
+    defer s.deinit();
+    s.read_enabled = false;
+    const payload = try alloc.alloc(u8, len);
+    defer alloc.free(payload);
+    for (payload, 0..) |*b, i| b.* = @truncate(i *% 31 +% 7);
+    const deadline = try born.nowNs() + 20_000 * ns_per_ms;
+    // Phase 1: send without reading. The server echoes until its buffer fills
+    // and the send pends against the client's closed window; echoed_bytes then
+    // plateaus. This forces the full-buffer resume path on every backend, not
+    // only IOCP: POSIX loopback never returns EAGAIN for a 4 KiB write unless
+    // the peer stops reading, so the stranding bug would otherwise hide there.
+    var last_echoed: usize = 0;
+    var stall: usize = 0;
+    while (stall < 16) {
+        try s.step(payload, deadline);
+        if (s.engine.echoed_bytes == last_echoed) {
+            stall += 1;
+        } else {
+            stall = 0;
+            last_echoed = s.engine.echoed_bytes;
+        }
+    }
+    // The server stalled before echoing everything: backpressure actually hit.
+    try std.testing.expect(s.engine.echoed_bytes < len);
+    // Phase 2: resume reading. The writable event (POSIX) or send completion
+    // (IOCP) frees the buffer and drive re-enters the read side; the transfer
+    // must complete rather than hang until the idle sweep.
+    s.read_enabled = true;
+    while (s.recvd < len) try s.step(payload, deadline);
+    try std.testing.expectEqualSlices(u8, payload, s.out);
+    s.closeClient();
+    while (s.engine.activeCount() != 0) try s.pumpEngine(deadline);
+    try s.engine.beginDrain();
+    try std.testing.expect(!s.engine.running());
+    try std.testing.expectEqual(len, s.engine.echoed_bytes);
+}
+
 /// One full client lifecycle on its own port: connect, echo, verify, close.
 fn echoOnce(addr: Address, payload: []const u8) !void {
     var port = try born.EvPort.init(alloc);
@@ -201,17 +261,27 @@ fn echoOnce(addr: Address, payload: []const u8) !void {
     while (recvd < payload.len) {
         if (try born.nowNs() > deadline) return error.SmokeTimeout;
         if (connected and sent < payload.len) {
-            switch (try client.writeNb(payload[sent..])) {
-                .done => |n| sent += n,
-                .want_write => if (!is_windows) port.wantWrite(client.handle(), &client),
-                .want_read => return error.SmokeUnexpected,
+            while (sent < payload.len) {
+                switch (try client.writeNb(payload[sent..])) {
+                    .done => |n| sent += n,
+                    .want_write => {
+                        if (!is_windows) port.wantWrite(client.handle(), &client);
+                        break;
+                    },
+                    .want_read => return error.SmokeUnexpected,
+                }
             }
         }
         if (connected) {
-            switch (try client.readNb(out[recvd..])) {
-                .data => |n| recvd += n,
-                .want_read, .want_write => {},
-                .eof => return error.SmokeUnexpectedEof,
+            while (recvd < payload.len) {
+                switch (try client.readNb(out[recvd..])) {
+                    .data => |n| {
+                        if (n == 0) break;
+                        recvd += n;
+                    },
+                    .want_read, .want_write => break,
+                    .eof => return error.SmokeUnexpectedEof,
+                }
             }
         }
         if (recvd >= payload.len) break;

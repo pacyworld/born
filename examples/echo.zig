@@ -167,12 +167,7 @@ pub const Echo = struct {
                 try self.onListenerEvent(ev);
                 continue;
             }
-            for (self.conns) |*c| {
-                if ((c.active or c.closing) and ev.udata == @as(?*anyopaque, c)) {
-                    try self.onConnEvent(c, ev);
-                    break;
-                }
-            }
+            if (self.connFrom(ev.udata)) |c| try self.onConnEvent(c, ev);
         }
     }
 
@@ -256,6 +251,21 @@ pub const Echo = struct {
         return null;
     }
 
+    /// Resolve an event's udata to its connection slot in O(1). udata is the
+    /// `*Conn` registered at accept; range-check it against the slot table so
+    /// events naming other port users fall through. The reference shape avoids
+    /// a per-event linear scan of the table.
+    fn connFrom(self: *Echo, udata: ?*anyopaque) ?*Conn {
+        const p = udata orelse return null;
+        const base = @intFromPtr(self.conns.ptr);
+        const addr = @intFromPtr(p);
+        if (addr < base or addr >= base + self.conns.len * @sizeOf(Conn)) return null;
+        if ((addr - base) % @sizeOf(Conn) != 0) return null;
+        const c: *Conn = @ptrCast(@alignCast(p));
+        if (!c.active and !c.closing) return null;
+        return c;
+    }
+
     fn pauseListener(self: *Echo) void {
         if (self.paused or self.listener_closed) return;
         self.paused = true;
@@ -302,28 +312,30 @@ pub const Echo = struct {
         self.drive(c) catch self.closeConn(c);
     }
 
-    /// Read into the echo buffer and flush it, draining reads to EAGAIN (or
-    /// a posted receive) unless the buffer is full. A full buffer resumes
-    /// reading after the write drains, without waiting for a new edge.
+    /// Read into the echo buffer and flush it, looping until neither
+    /// direction can progress. Flushing first frees the buffer before the
+    /// next read, so a full buffer resumes reading after the pending write
+    /// drains (its completion on IOCP, the writable event on POSIX) without
+    /// waiting for a new read edge. Reading only once per drive would strand
+    /// buffered input (IOCP recv_buf, or socket data behind EV_CLEAR/EPOLLET)
+    /// whenever the buffer filled mid-transfer.
     fn drive(self: *Echo, c: *Conn) !void {
-        while (c.active and !c.peer_eof and c.len < c.buf.len) {
-            switch (try c.stream.readNb(c.buf[c.len..])) {
+        while (c.active) {
+            try self.flush(c);
+            // Send still pending: resume on its completion or writable event.
+            if (c.off != c.len) return;
+            if (c.peer_eof) return self.closeConn(c);
+            switch (try c.stream.readNb(c.buf[0..])) {
                 .data => |n| {
-                    if (n == 0) break;
-                    c.len += n;
+                    if (n == 0) return;
+                    c.len = n;
                     c.last_ns = try born.nowNs();
                     self.echoed_bytes += n;
-                    try self.flush(c);
                 },
-                .want_read, .want_write => break,
-                .eof => {
-                    c.peer_eof = true;
-                    break;
-                },
+                .want_read, .want_write => return,
+                .eof => c.peer_eof = true,
             }
         }
-        try self.flush(c);
-        if (c.active and c.peer_eof and c.off == c.len) self.closeConn(c);
     }
 
     /// Consume partial writes until the buffer drains or the send side
@@ -392,14 +404,11 @@ pub const Echo = struct {
                     _ = self.listener.absorbCompletion(ev.overlapped, ev.bytes, if (ev.err) ev.err_no else null);
                     continue;
                 }
-                for (self.conns) |*c| {
-                    if ((c.active or c.closing) and ev.udata == @as(?*anyopaque, c)) {
-                        _ = c.stream.absorbCompletion(ev.overlapped, ev.bytes, if (ev.err) ev.err_no else null);
-                        if (c.closing and c.stream.pendingOps() == 0) {
-                            c.stream.deinit();
-                            c.closing = false;
-                        }
-                        break;
+                if (self.connFrom(ev.udata)) |c| {
+                    _ = c.stream.absorbCompletion(ev.overlapped, ev.bytes, if (ev.err) ev.err_no else null);
+                    if (c.closing and c.stream.pendingOps() == 0) {
+                        c.stream.deinit();
+                        c.closing = false;
                     }
                 }
             }
