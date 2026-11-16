@@ -65,6 +65,10 @@ OS per primitive, and lists real runs only.
 | epoll, Linux 7.0 (Ubuntu 26.04 VM, manual host) | born.io time route (sleep, now) | born-io-tests Debug and ReleaseSafe on Zig 0.16.0: 33 passed, 1 skipped, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
 | epoll, Linux 7.0 (Ubuntu 26.04 VM, manual host) | born.io time route, default config (stats off) | born-io-tests-default ReleaseSafe on Zig 0.16.0: 33 passed, 1 skipped, 0 failed | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
 | IOCP, Windows 11 build 26100 (manual host) | born.io time route (sleep, now) | born-io-tests.exe Debug and ReleaseSafe on Zig 0.16.0 over OpenSSH: 33 passed, 1 skipped, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
+| kqueue, FreeBSD 15 (CI FreeBSD runner) | examples smoke suite (echo engine) | [run 297, FreeBSD job (zig 0.15.2)](https://pacyworld.dev/pacyworld/born/actions/runs/297/jobs/1): example-smoke Debug and ReleaseSafe, 7/7 tests passed each; green on all three toolchains | 2026-11-16 | [a474347](https://pacyworld.dev/pacyworld/born/commit/a4743479f711f418f59e9f17c5db9c12cc5af2c4) |
+| epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | examples smoke suite (echo engine) | [run 297, Linux job (zig 0.15.2, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/297/jobs/7): born-example-smoke All 7 tests passed; green on all six legs | 2026-11-16 | [a474347](https://pacyworld.dev/pacyworld/born/commit/a4743479f711f418f59e9f17c5db9c12cc5af2c4) |
+| IOCP, Windows Server 2022 build 20348 (CI Windows runner) | examples smoke suite (echo engine) | [run 297, Windows job (zig 0.15.2, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/297/jobs/13): born-example-smoke.exe 5 passed; 2 skipped; 0 failed (SIGTERM and balanced skip on Windows); green on all six legs | 2026-11-16 | [a474347](https://pacyworld.dev/pacyworld/born/commit/a4743479f711f418f59e9f17c5db9c12cc5af2c4) |
+| kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | examples live drive (echo servers, SIGTERM drain) | born-echo-server and born-echo-per-core ReleaseSafe on Zig 0.15.2: 8 and 24 connections echoed (203105 and 808280 bytes), clean SIGTERM drain exit 0 each | 2026-11-16 | [a474347](https://pacyworld.dev/pacyworld/born/commit/a4743479f711f418f59e9f17c5db9c12cc5af2c4) |
 
 Commit 3ed3785 changes only the CI workflow; its library and tests are
 those of master d1017b8. Skips identify platform exclusions or primitives
@@ -74,6 +78,13 @@ kqueue-only loop-death test. The default-config (stats off) runs use
 born-io-tests-default, the exported module built without -Dtime-stats. The
 commit adding these rows changes only this README; its library, tests and
 CI are those of 1a008de.
+
+The examples smoke rows record the example integration suite
+(examples/smoke.zig) through the shared echo engine; Windows skips the
+SIGTERM-drain and balanced-listener tests. The live-drive row records
+the two example servers under real clients and SIGTERM on a manual
+FreeBSD host. The commit adding these rows changes only this README;
+its library, tests and CI are those of a474347.
 
 ## Programming model
 
@@ -562,6 +573,9 @@ zig build docs            # API documentation in zig-out/docs/index.html
 zig build test-bin -Dtarget=x86_64-windows-gnu --prefix zig-out/windows
 zig build test-bin -Dtarget=x86_64-linux-gnu --prefix zig-out/linux
 zig build test-io-bin -Dtarget=x86_64-linux-gnu --prefix zig-out/linux   # born.io, Zig >= 0.16
+zig build examples            # install born-echo-server and born-echo-per-core
+zig build example-smoke       # example integration tests on the selected target
+zig build example-smoke-bin -Dtarget=x86_64-linux-gnu --prefix zig-out/linux
 ```
 
 Born supports Zig 0.15.2, 0.16.0, and 0.17.1. `src/compat.zig` owns native ABI
@@ -592,6 +606,45 @@ the kqueue benchmark on a quiet FreeBSD CI runner and fails on a syscall or
 latency regression against `bench/thresholds.txt` (#31). macOS Apple Silicon
 stays a manual host; the target-coverage list in `AGENTS.md` says which
 targets run in CI, on manual hosts, or compile-only.
+
+## Examples
+
+`examples/` holds two reference programs for downstream ports. Both import
+only the public `born` module and the shared echo engine (`examples/echo.zig`),
+so they compile on all seven supported triples and show the contracts above
+in a complete program rather than a fragment.
+
+- **`born-echo-server`** (`examples/echo_server.zig`): a single-threaded TCP
+  echo server on one event port. A TCP listener accepts into a fixed table of
+  stable stream slots; an idle-timeout sweep timer closes silent connections;
+  SIGTERM or Ctrl+C closes the listener and drains established connections
+  until they finish or a drain deadline fires. Usage: `born-echo-server [port]`
+  (default 7000, binds 127.0.0.1). On Windows the signal watch maps to console
+  control events and needs a console.
+- **`born-echo-per-core`** (`examples/thread_per_core.zig`): the thread-per-core
+  variant. N worker threads each own one event port and one `.balanced`
+  listener on the same TCP port; the kernel spreads connections across them
+  (`SO_REUSEPORT_LB` on FreeBSD, `SO_REUSEPORT` on Linux). The main thread
+  watches SIGTERM/Ctrl+C and shuts workers down with cross-thread `wake()`.
+  Usage: `born-echo-per-core [port] [threads]` (default port 7001, one thread
+  per CPU, clamped to 1..64). `.balanced` needs kernel load balancing, so this
+  program runs on FreeBSD and Linux; elsewhere it reports Unsupported and
+  exits cleanly. It still compiles on every target.
+
+The engine demonstrates the rules that matter for a port: accepted streams
+live in stable heap slots and a Windows slot is not reused until its close
+completions are absorbed; reads drain to EAGAIN (or a posted receive) and a
+full echo buffer resumes reading after the pending write drains, so no edge
+is stranded; write interest is armed only on `want_write`; listener exhaustion
+and a full table pause with `unmonitorRead` and resume by re-registering and
+draining at once; timers measure deadlines, never drive I/O.
+
+`zig build example-smoke` runs an integration suite (`examples/smoke.zig`)
+through the engine with real sockets on the selected backend: echo round trip,
+idle-timeout close, large-payload partial writes and backpressure, cross-thread
+wake shutdown, SIGTERM drain (POSIX), and balanced-listener spread
+(FreeBSD/Linux). CI runs it on FreeBSD, Linux and Windows alongside the core
+suite, so the examples carry runtime evidence, not just cross-compilation.
 
 ## Provenance
 
