@@ -238,6 +238,7 @@ pub const Echo = struct {
                     c.peer_eof = false;
                     c.len = 0;
                     c.off = 0;
+                    c.pending_resume = false;
                     c.last_ns = try born.nowNs();
                     self.accepted_total += 1;
                     // POSIX: register read interest yourself after accept.
