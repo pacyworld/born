@@ -65,6 +65,10 @@ OS per primitive, and lists real runs only.
 | epoll, Linux 7.0 (Ubuntu 26.04 VM, manual host) | born.io time route (sleep, now) | born-io-tests Debug and ReleaseSafe on Zig 0.16.0: 33 passed, 1 skipped, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
 | epoll, Linux 7.0 (Ubuntu 26.04 VM, manual host) | born.io time route, default config (stats off) | born-io-tests-default ReleaseSafe on Zig 0.16.0: 33 passed, 1 skipped, 0 failed | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
 | IOCP, Windows 11 build 26100 (manual host) | born.io time route (sleep, now) | born-io-tests.exe Debug and ReleaseSafe on Zig 0.16.0 over OpenSSH: 33 passed, 1 skipped, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
+| kqueue, FreeBSD 15 (CI FreeBSD runner) | examples smoke suite (echo engine) | [run 297, FreeBSD job (zig 0.15.2)](https://pacyworld.dev/pacyworld/born/actions/runs/297/jobs/1): example-smoke Debug and ReleaseSafe, 7/7 tests passed each; green on all three toolchains | 2026-11-16 | [a474347](https://pacyworld.dev/pacyworld/born/commit/a4743479f711f418f59e9f17c5db9c12cc5af2c4) |
+| epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | examples smoke suite (echo engine) | [run 297, Linux job (zig 0.15.2, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/297/jobs/7): born-example-smoke All 7 tests passed; green on all six legs | 2026-11-16 | [a474347](https://pacyworld.dev/pacyworld/born/commit/a4743479f711f418f59e9f17c5db9c12cc5af2c4) |
+| IOCP, Windows Server 2022 build 20348 (CI Windows runner) | examples smoke suite (echo engine) | [run 297, Windows job (zig 0.15.2, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/297/jobs/13): born-example-smoke.exe 5 passed; 2 skipped; 0 failed (SIGTERM and balanced skip on Windows); green on all six legs | 2026-11-16 | [a474347](https://pacyworld.dev/pacyworld/born/commit/a4743479f711f418f59e9f17c5db9c12cc5af2c4) |
+| kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | examples live drive (echo servers, SIGTERM drain) | born-echo-server and born-echo-per-core ReleaseSafe on Zig 0.15.2: 8 and 24 connections echoed (203105 and 808280 bytes), clean SIGTERM drain exit 0 each | 2026-11-16 | [a474347](https://pacyworld.dev/pacyworld/born/commit/a4743479f711f418f59e9f17c5db9c12cc5af2c4) |
 
 Commit 3ed3785 changes only the CI workflow; its library and tests are
 those of master d1017b8. Skips identify platform exclusions or primitives
@@ -74,6 +78,13 @@ kqueue-only loop-death test. The default-config (stats off) runs use
 born-io-tests-default, the exported module built without -Dtime-stats. The
 commit adding these rows changes only this README; its library, tests and
 CI are those of 1a008de.
+
+The examples smoke rows record the example integration suite
+(examples/smoke.zig) through the shared echo engine; Windows skips the
+SIGTERM-drain and balanced-listener tests. The live-drive row records
+the two example servers under real clients and SIGTERM on a manual
+FreeBSD host. The commit adding these rows changes only this README;
+its library, tests and CI are those of a474347.
 
 ## Programming model
 
