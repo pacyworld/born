@@ -357,12 +357,43 @@ test "Unix over-long pathname maps NameTooLong to FileNotFound" {
     defer port.deinit();
     const io = try initNetIo(&port);
     defer born_io.deinit(io);
-    // 106 bytes passes std's max_len (108) but exceeds Born's sun_path (104),
+    // 108 bytes passes std's max_len (108) but exceeds Born's sun_path on
+    // every POSIX platform (104 on BSD/macOS, 108 on Linux, counting the NUL),
     // so Born refuses NameTooLong; the coarse map degrades it to FileNotFound.
-    var long_buf: [106]u8 = undefined;
+    var long_buf: [108]u8 = undefined;
     @memset(&long_buf, 'a');
     const ua: Io.net.UnixAddress = .{ .path = &long_buf };
     try expectError(error.FileNotFound, io.vtable.netConnectUnix(io.userdata, &ua));
+}
+
+test "Unix connect to a missing pathname surfaces the coarse ConnectFailed row" {
+    if (!has_unix or builtin.single_threaded) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const io = try initNetIo(&port);
+    defer born_io.deinit(io);
+    // A path that fits sun_path but names no socket: the kernel answers ENOENT,
+    // which Born folds into ConnectFailed (no errno until the post-0.3.0
+    // lastErrno() accessor). The coarse map surfaces the ConnectFailed row:
+    // Unexpected on 0.16, ConnectionRefused on 0.17. Threaded itself maps
+    // ENOENT to FileNotFound; that distinction is the documented loss of the
+    // coarse map (design section 8), not a silent fallback.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/m", .{tmp.sub_path});
+    const ua: Io.net.UnixAddress = .{ .path = path };
+    const st_before = born_io.networkStats(io).connect;
+    const result = io.vtable.netConnectUnix(io.userdata, &ua);
+    if (is_017) {
+        try expectError(error.ConnectionRefused, result);
+    } else {
+        try expectError(error.Unexpected, result);
+    }
+    if (born_io.network_stats_enabled) {
+        // A failed connect is not a Born connect completion.
+        try expectEqual(st_before, born_io.networkStats(io).connect);
+    }
 }
 
 test "stream write flattens header, vectored data and splat; read drains vectored" {
