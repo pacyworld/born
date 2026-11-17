@@ -512,9 +512,10 @@ test "shutdown(.recv) completes a pending Born read with EOF (Blocker 1)" {
     defer client.close(io);
     defer server.deinit(fixture.io());
 
-    // A Born read parks (no data yet). shutdown(.recv) on the same Born-owned
-    // socket is a plain shutdown(2), safe with a pending op; the parked read
-    // must wake and complete with EOF (0 bytes), not hang or reset.
+    // A Born read parks (no data yet). POSIX shutdown(2) wakes it with EOF;
+    // Windows shutdown() does not complete the pending WSARecv, so the shim
+    // cancels it and the loop maps the abort to EOF. Either way the parked
+    // read must complete with EOF (0 bytes), not hang or reset.
     var outcome: std.atomic.Value(u32) = .init(0); // 0 pending, 1 eof, 2 error
     const thread = try std.Thread.spawn(.{}, struct {
         fn run(ioc: Io, h: Io.net.Socket.Handle, out: *std.atomic.Value(u32)) void {
@@ -554,6 +555,86 @@ test "shutdown(.send) gives the peer EOF" {
     var buf: [8]u8 = undefined;
     var iov = [_][]u8{buf[0..]};
     try expectEqual(@as(usize, 0), try rawRead(fixture.io(), peer.socket.handle, &iov));
+}
+
+test "shutdown(.send) completes a pending Born write with an error (Windows)" {
+    // Windows shutdown(SD_SEND) does not complete a pending overlapped WSASend;
+    // the shim cancels it and the abort retires through the coarse write error
+    // (ConnectionResetByPeer). POSIX plain shutdown(2) is the Threaded baseline
+    // and is covered by the peer-EOF test above.
+    if (!is_windows or builtin.single_threaded) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const io = try initNetIo(&port);
+    defer born_io.deinit(io);
+    var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer fixture.deinit();
+    var server: Io.net.Server = undefined;
+    var client: Io.net.Stream = undefined;
+    var peer: Io.net.Stream = undefined;
+    try setupPair(io, &fixture, &server, &client, &peer);
+    defer peer.close(fixture.io());
+    defer client.close(io);
+    defer server.deinit(fixture.io());
+
+    // The peer never reads, so a write larger than the loopback send buffers
+    // parks on a pending WSASend.
+    const big = try std.testing.allocator.alloc(u8, 4 * 1024 * 1024);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+    var outcome: std.atomic.Value(u32) = .init(0); // 0 pending, 1 error, 2 full write
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(ioc: Io, h: Io.net.Socket.Handle, data: []const u8, out: *std.atomic.Value(u32)) void {
+            var iov = [_][]const u8{data};
+            const n = rawWrite(ioc, h, &.{}, &iov, 1) catch {
+                out.store(1, .release);
+                return;
+            };
+            out.store(if (n == data.len) 2 else 1, .release);
+        }
+    }.run, .{ io, client.socket.handle, big, &outcome });
+    // Let the writer submit and park.
+    try Io.sleep(fixture.io(), .fromMilliseconds(50), .awake);
+    try client.shutdown(io, .send);
+    thread.join();
+    try expectEqual(@as(u32, 1), outcome.load(.acquire));
+}
+
+test "shutdown(.recv) drains buffered bytes then EOF (Windows)" {
+    // Bytes already absorbed into the shim's recv buffer before the shutdown
+    // still drain; the next read completes with EOF. Windows-only: POSIX
+    // shutdown(SHUT_RD) kernel-buffer semantics differ per OS.
+    if (!is_windows or builtin.single_threaded) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const io = try initNetIo(&port);
+    defer born_io.deinit(io);
+    var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer fixture.deinit();
+    var server: Io.net.Server = undefined;
+    var client: Io.net.Stream = undefined;
+    var peer: Io.net.Stream = undefined;
+    try setupPair(io, &fixture, &server, &client, &peer);
+    defer peer.close(fixture.io());
+    defer client.close(io);
+    defer server.deinit(fixture.io());
+
+    var msg = [_][]const u8{"0123456789abcdef"};
+    try expectEqual(@as(usize, 16), try rawWrite(fixture.io(), peer.socket.handle, &.{}, &msg, 1));
+    // Reading only 8 of the 16 bytes leaves the rest in the shim's recv
+    // buffer (the completion absorbed all 16 before the partial retire).
+    var a: [8]u8 = undefined;
+    var iov_a = [_][]u8{a[0..]};
+    try expectEqual(@as(usize, 8), try rawRead(io, client.socket.handle, &iov_a));
+    try client.shutdown(io, .recv);
+    var b: [8]u8 = undefined;
+    var iov_b = [_][]u8{b[0..]};
+    try expectEqual(@as(usize, 8), try rawRead(io, client.socket.handle, &iov_b));
+    try expectEqualSlices(u8, "01234567", &a);
+    try expectEqualSlices(u8, "89abcdef", &b);
+    var c: [8]u8 = undefined;
+    var iov_c = [_][]u8{c[0..]};
+    try expectEqual(@as(usize, 0), try rawRead(io, client.socket.handle, &iov_c));
 }
 
 test "close cancels a pending Born read" {

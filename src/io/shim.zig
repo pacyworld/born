@@ -412,6 +412,10 @@ const SocketState = struct {
     deadline_armed: bool = false,
     /// Windows: cancelAndClose issued, draining completions before free.
     closing: bool = false,
+    /// Windows: shutdown(.recv/.both) issued. shutdown() does not complete a
+    /// pending overlapped WSARecv, so netShutdown cancels it and the loop maps
+    /// the abort completion (or a recv posted after shutdown) to EOF.
+    shutdown_recv: std.atomic.Value(bool) = .init(false),
 };
 
 /// Sockets per registry chunk. `SocketState` embeds a `PlainNb`, which on
@@ -1714,7 +1718,13 @@ pub const Shim = struct {
                 if (network_stats_enabled) _ = self.net_stats.read.fetchAdd(1, .monotonic);
                 return self.netRetireOk(op, op.cursor, false);
             };
-            const r = state.plain.readNb(slice) catch {
+            // Windows: after shutdown(.recv) no new data can arrive. Drain
+            // buffered bytes through readNb, then complete with EOF without
+            // posting a WSARecv (which would fail WSAESHUTDOWN). A real error
+            // latched before the shutdown still wins.
+            const shut_eof = is_windows and state.shutdown_recv.load(.acquire) and
+                state.plain.recv_have == 0 and state.plain.recv_err == null;
+            const r: born.socket.NbRead = if (shut_eof) .eof else state.plain.readNb(slice) catch {
                 return self.netRetireErr(op, .read_failed);
             };
             switch (r) {
@@ -1820,6 +1830,34 @@ pub const Shim = struct {
         state.write_armed = true;
     }
 
+    /// Windows only: cancel the in-flight WSARecv/WSASend so their abort
+    /// completions reach the loop, which completes a parked read with EOF
+    /// (shutdown_recv) and a parked write with the coarse write error. The
+    /// registry mutex makes the slot lookup atomic with sockFree, so the
+    /// OVERLAPPED addresses belong to this handle's live slot; CancelIoEx on
+    /// an ov with no pending op is a harmless ERROR_NOT_FOUND. The wake covers
+    /// a cancel racing the loop's next post.
+    fn shutdownCancelPending(self: *Shim, handle: Io.net.Socket.Handle, how: Io.net.ShutdownHow) void {
+        self.registry.mutex.lockUncancelable(self.threaded_io);
+        const slot: ?*SocketState = blk: {
+            const index = self.registry.map.get(handle) orelse break :blk null;
+            const s = self.sockAt(index) orelse break :blk null;
+            if (!s.occupied) break :blk null;
+            break :blk s;
+        };
+        if (slot) |s| {
+            if (how == .recv or how == .both) {
+                s.shutdown_recv.store(true, .release);
+                _ = compat.windows.kernel32.CancelIoEx(handle, &s.plain.recv_ov);
+            }
+            if (how == .send or how == .both) {
+                _ = compat.windows.kernel32.CancelIoEx(handle, &s.plain.send_ov);
+            }
+        }
+        self.registry.mutex.unlock(self.threaded_io);
+        self.port.wake();
+    }
+
     /// Dispatch one socket readiness (POSIX) or completion (Windows) event after
     /// the generation check drops stale events for a closed-and-reused fd.
     fn socketEvent(self: *Shim, ev: born.Event) void {
@@ -1839,7 +1877,16 @@ pub const Shim = struct {
             const kind = s.plain.absorbCompletion(ev.overlapped, ev.bytes, err);
             switch (kind) {
                 .connect => if (s.pending_connect) |op| self.connectComplete(op, s),
-                .recv => if (s.pending_read) |op| self.readDrive(op),
+                .recv => {
+                    // A shutdown(.recv) abort (or a recv posted after shutdown)
+                    // completes the read with EOF, not the abort error; bytes
+                    // buffered before the shutdown still drain first.
+                    if (s.shutdown_recv.load(.acquire)) {
+                        s.plain.recv_eof = true;
+                        s.plain.recv_err = null;
+                    }
+                    if (s.pending_read) |op| self.readDrive(op);
+                },
                 .send => if (s.pending_write) |op| self.writeDrive(op),
                 .unknown => {},
             }
@@ -2947,8 +2994,11 @@ const network_route = struct {
         return op.result.handle;
     }
 
-    /// Shutdown on a Born-owned socket is a plain shutdown(2)/shutdown() (safe,
-    /// no I/O, no completion); Threaded-owned forwards (section 6, Q6).
+    /// Shutdown on a Born-owned socket: POSIX is a plain shutdown(2), which
+    /// wakes a parked read with EOF. Windows shutdown() does not complete
+    /// pending overlapped ops, so a recv/send shutdown also cancels the
+    /// in-flight WSARecv/WSASend (shutdownCancelPending). Threaded-owned
+    /// forwards (section 6, Q6).
     fn netShutdown(userdata: ?*anyopaque, handle: Io.net.Socket.Handle, how: Io.net.ShutdownHow) Io.net.ShutdownError!void {
         const self = shimFrom(userdata);
         if (self.lookupBorn(handle) == null) return fwd.netShutdown(userdata, handle, how);
@@ -2958,6 +3008,7 @@ const network_route = struct {
             .both => .both,
         };
         compat.shutdown(compatSock(handle), born_how) catch |e| return mapShutdownError(e);
+        if (is_windows) self.shutdownCancelPending(handle, how);
     }
 
     /// Bind-only sockets are outside the stream-only client profile (section
@@ -3676,9 +3727,9 @@ test "stale socket events drop without touching the pending op" {
 }
 
 test "connect deadline fire retires Timeout and frees the socket (POSIX)" {
-    // Windows timeout is an explicit completion drain (5.2), exercised by the
-    // integration close/timeout tests on Windows CI; this unit covers the
-    // POSIX purge-before-deinit retire on a real unconnected socket.
+    // Windows timeout is an explicit completion drain (5.2), covered by the
+    // Windows drain unit below; this unit covers the POSIX purge-before-deinit
+    // retire on a real unconnected socket.
     if (is_windows) return error.SkipZigTest;
     var port = try born.EvPort.init(std.testing.allocator);
     defer port.deinit();
@@ -3726,6 +3777,90 @@ test "connect deadline fire retires Timeout and frees the socket (POSIX)" {
     // it returns false so loopMain falls through to timerFired, which drops it
     // (the net udata's bit-63 generation never matches a sleep timer slot).
     try std.testing.expect(!state.connectDeadlineFired(netTimerUdata(index, s.generation)));
+}
+
+test "connect deadline fire drains the pending ConnectEx before freeing (Windows)" {
+    // Windows timeout is an explicit completion drain (5.2): cancelAndClose
+    // aborts the in-flight ConnectEx, but the stable SocketState must stay
+    // occupied until that completion is absorbed. No loop thread runs here, so
+    // the completion waits in the IOCP queue and the drain is driven manually
+    // through socketEvent. Freeing the slot unconditionally (the should-fix 2
+    // mutation) leaves the aborted completion unabsorbed and fails the
+    // occupied assertion below.
+    if (!is_windows) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    state.port = &port;
+    try testNetGrow(&state, 1);
+    defer state.netFreeChunks();
+    try state.registryInit();
+    defer state.registryDeinit();
+
+    // A real loopback listener: ConnectEx posts (pending or inline) and its
+    // completion stays queued because nothing dequeues it before the deadline.
+    const fio = state.threaded_io;
+    const listen: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try listen.listen(fio, .{});
+    defer server.deinit(fio);
+    const target_std: Io.net.IpAddress = .{ .ip4 = .loopback(server.socket.address.ip4.port) };
+    const target = ipToBorn(&target_std);
+
+    const index = try state.sockAllocLocked();
+    const s = state.sockAt(index).?;
+    s.generation +%= 1;
+    s.occupied = true;
+    s.closing = false;
+    s.index = index;
+    s.pending_connect = null;
+    s.pending_read = null;
+    s.pending_write = null;
+    s.read_armed = false;
+    s.write_armed = false;
+    s.deadline_armed = false;
+    s.plain = .{};
+    const udata = slotUdata(index, s.generation);
+    try s.plain.startConnectAddrInto(target, &port, udata);
+    s.handle = s.plain.handle();
+    try state.registerHandle(s.handle, index);
+    try std.testing.expectEqual(@as(usize, 1), s.plain.pendingOps());
+
+    var op: NetOp = .{ .kind = .connect, .sock_index = index, .payload = .{ .connect = .{ .target = .{ .ip = target } } } };
+    op.slot_index = try state.netAllocSlotLocked();
+    state.netSlotAt(op.slot_index).op = &op;
+    s.pending_connect = &op;
+    try port.addTimer(net_timer_id_base + op.slot_index, netTimerUdata(index, s.generation), 60_000, .once);
+    s.deadline_armed = true;
+
+    // The deadline fires while ConnectEx is pending: Timeout retire (not
+    // canceled), cancel/close, deadline disarmed, but the slot stays occupied
+    // until the completion drains.
+    try std.testing.expect(state.connectDeadlineFired(netTimerUdata(index, s.generation)));
+    try std.testing.expectEqual(@as(?NetError, .timeout), op.result.err);
+    try std.testing.expectEqual(@as(u32, 1), op.state.load(.acquire));
+    try std.testing.expect(!op.outcome_canceled);
+    try std.testing.expect(s.closing);
+    try std.testing.expectEqual(@as(?*NetOp, null), s.pending_connect);
+    try std.testing.expect(!s.deadline_armed);
+    try std.testing.expect(s.occupied);
+    try std.testing.expectEqual(@as(usize, 1), s.plain.pendingOps());
+
+    // Drain the aborted completion through the real event path; the slot is
+    // freed only once pendingOps() reaches zero.
+    var events: [8]born.Event = undefined;
+    var guard: u32 = 0;
+    while (s.occupied and guard < 100) : (guard += 1) {
+        const n = try port.wait(&events, 100);
+        for (events[0..n]) |ev| {
+            if (ev.timer or ev.wake) continue;
+            state.socketEvent(ev);
+        }
+    }
+    try std.testing.expect(!s.occupied);
+    try std.testing.expectEqual(@as(usize, 0), s.plain.pendingOps());
+    try std.testing.expectEqual(@as(?u32, null), state.lookupBorn(s.handle));
 }
 
 test "batch partition detaches Born members with tag Unexpected, keeps Threaded" {
