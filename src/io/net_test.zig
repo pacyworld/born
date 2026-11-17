@@ -282,12 +282,12 @@ test "Unix pathname connect and echo run on Born" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const dir_path = try tmp.dir.realPathFileAlloc(fio, ".", std.testing.allocator);
-    defer std.testing.allocator.free(dir_path);
-    const sock_path = try std.fmt.allocPrint(std.testing.allocator, "{s}/s", .{dir_path});
-    defer std.testing.allocator.free(sock_path);
-    // Born's sun_path capacity is 104; keep the fixture path within it.
-    if (sock_path.len > 100) return error.SkipZigTest;
+    // A relative pathname keeps the fixture portable: Threaded's
+    // realPathFile is unsupported on NetBSD, and both the Threaded listener
+    // and the Born client resolve it against the same process cwd. The path
+    // is far below every platform's sun_path capacity.
+    var path_buf: [128]u8 = undefined;
+    const sock_path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}/s", .{tmp.sub_path});
 
     const ua: Io.net.UnixAddress = .{ .path = sock_path };
     var userver = try ua.listen(fio, .{});
