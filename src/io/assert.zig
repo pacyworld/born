@@ -300,6 +300,16 @@ fn checkSlotShape(comptime name: []const u8, comptime T: type) void {
         @compileError("Io.VTable." ++ name ++ " first parameter is not ?*anyopaque");
 }
 
+/// Pin one slot's full function type against a written-out signature. The
+/// baseline vtable's explicit thunk assignments enforce the same contract at
+/// their assignment sites; these pins surface the drift at the assert gate,
+/// which runs on any analysis of `born.io`, and document the pinned interface.
+fn pinSlot(comptime name: []const u8, comptime Expected: type) void {
+    const actual = @TypeOf(@field(@as(Io.VTable, undefined), name));
+    if (actual != Expected)
+        @compileError("Io.VTable." ++ name ++ " signature drifted from the pinned interface");
+}
+
 /// Runs all compatibility assertions at comptime. Called from the module root
 /// so any analysis of `born.io` enforces them, and from a dedicated test.
 pub fn verify() void {
@@ -324,16 +334,33 @@ pub fn verify() void {
         checkSlotShape(slot.name, slot.type);
     }
 
-    // Pin the parameter type of the slot that changed between the two pinned
-    // releases without changing the slot count or name. A count/name check
-    // alone cannot see this drift.
-    const net_close = @TypeOf(@field(@as(Io.VTable, undefined), "netClose"));
-    const expected_net_close = if (is_017)
+    // Pin the full function type of every slot whose signature the shim
+    // depends on. netClose changed parameter type between the two pinned
+    // releases without changing the slot count or name; a count/name check
+    // alone cannot see that drift. The remaining network slots are pinned so
+    // any upstream signature change fails the gate, not just the baseline
+    // thunk assignment.
+    pinSlot("netClose", if (is_017)
         *const fn (?*anyopaque, []const Io.net.Socket) void
     else
-        *const fn (?*anyopaque, []const Io.net.Socket.Handle) void;
-    if (net_close != expected_net_close)
-        @compileError("Io.VTable.netClose signature drifted from the pinned interface");
+        *const fn (?*anyopaque, []const Io.net.Socket.Handle) void);
+    pinSlot("operate", *const fn (?*anyopaque, Io.Operation) Io.Cancelable!Io.Operation.Result);
+    pinSlot("batchAwaitAsync", *const fn (?*anyopaque, *Io.Batch) Io.Cancelable!void);
+    pinSlot("batchAwaitConcurrent", *const fn (?*anyopaque, *Io.Batch, Io.Timeout) Io.Batch.AwaitConcurrentError!void);
+    pinSlot("netBindIp", *const fn (?*anyopaque, *const Io.net.IpAddress, Io.net.IpAddress.BindOptions) Io.net.IpAddress.BindError!Io.net.Socket);
+    pinSlot("netConnectIp", *const fn (?*anyopaque, *const Io.net.IpAddress, Io.net.IpAddress.ConnectOptions) Io.net.IpAddress.ConnectError!Io.net.Socket);
+    pinSlot("netConnectUnix", *const fn (?*anyopaque, *const Io.net.UnixAddress) Io.net.UnixAddress.ConnectError!Io.net.Socket.Handle);
+    pinSlot("netSocketCreatePair", *const fn (?*anyopaque, Io.net.Socket.CreatePairOptions) Io.net.Socket.CreatePairError![2]Io.net.Socket);
+    pinSlot("netWriteFile", *const fn (?*anyopaque, Io.net.Socket.Handle, []const u8, *Io.File.Reader, Io.Limit) Io.net.Stream.Writer.WriteFileError!usize);
+    pinSlot("netShutdown", *const fn (?*anyopaque, Io.net.Socket.Handle, Io.net.ShutdownHow) Io.net.ShutdownError!void);
+    if (!is_017) {
+        // 0.16 carries netRead/netWrite/netSend as direct slots; 0.17 moved
+        // them to operate tags (net_read/net_write/net_send), pinned via the
+        // operate signature above.
+        pinSlot("netRead", *const fn (?*anyopaque, Io.net.Socket.Handle, [][]u8) Io.net.Stream.Reader.Error!usize);
+        pinSlot("netWrite", *const fn (?*anyopaque, Io.net.Socket.Handle, []const u8, []const []const u8, usize) Io.net.Stream.Writer.Error!usize);
+        pinSlot("netSend", *const fn (?*anyopaque, Io.net.Socket.Handle, []Io.net.OutgoingMessage, Io.net.SendFlags) struct { ?Io.net.Socket.SendError, usize });
+    }
 }
 
 test "per-tag Io.VTable compatibility assertions" {

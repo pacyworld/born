@@ -67,6 +67,7 @@ pub fn build(b: *std.Build) void {
     const io_options_mod = if (builtin.zig_version.minor >= 16) blk: {
         const io_options = b.addOptions();
         io_options.addOption(bool, "time_stats", b.option(bool, "time-stats", "Enable born.io time-route latency stats (default off)") orelse false);
+        io_options.addOption(bool, "network_stats", b.option(bool, "network-stats", "Enable born.io network-route per-route counters (default off)") orelse false);
         break :blk io_options.createModule();
     } else undefined;
 
@@ -82,12 +83,14 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "born", .module = mod },
                 .{ .name = "born_io_options", .module = io_options_mod },
+                .{ .name = "compat", .module = compat_mod },
             },
         });
         linkPlatform(io_mod, target);
 
         const io_stats_options = b.addOptions();
         io_stats_options.addOption(bool, "time_stats", true);
+        io_stats_options.addOption(bool, "network_stats", true);
         const io_test_mod = b.createModule(.{
             .root_source_file = b.path("src/io/root.zig"),
             .target = target,
@@ -95,6 +98,7 @@ pub fn build(b: *std.Build) void {
             .imports = &.{
                 .{ .name = "born", .module = mod },
                 .{ .name = "born_io_options", .module = io_stats_options.createModule() },
+                .{ .name = "compat", .module = compat_mod },
             },
         });
         linkPlatform(io_test_mod, target);
@@ -232,6 +236,7 @@ pub fn build(b: *std.Build) void {
                 .imports = &.{
                     .{ .name = "born", .module = cross_mod },
                     .{ .name = "born_io_options", .module = io_options_mod },
+                    .{ .name = "compat", .module = cross_compat_mod },
                 },
             });
             linkPlatform(cross_io_mod, cross_target);

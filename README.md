@@ -492,8 +492,10 @@ construction (`CapabilityUnsupported`), never silently delegated.
 and is not exported on 0.15.2. The Born time route
 (`capabilities.time = .born_evented`) is experimental: it currently misses its
 written benchmark target, and the remaining work is tracked in #101. It is not
-recommended for production until #101 meets that target. The default remains
-the all-Threaded baseline, which is the supported configuration in 0.3.0.
+recommended for production until #101 meets that target. The Born network
+client route (`capabilities.network = .born_evented`) is likewise opt-in and
+experimental. The default remains the all-Threaded baseline, which is the
+supported configuration in 0.3.0.
 
 The time family is the first enabled Born route
 (`capabilities.time = .born_evented`): `sleep` runs on Born's timers and
@@ -518,6 +520,32 @@ awake clock, not of the Born timer clock that `now(.awake)` reads. The
 per-slot failure mapping and the Scale model machinery are documented in
 `src/io/shim.zig`.
 
+The network client route (`capabilities.network = .born_evented`) services the
+stream client path on Born's reactor: IP and pathname Unix connect (with
+connect deadlines), stream reads and writes, close and shutdown. Listen,
+accept and DNS resolution stay on Threaded. A handle registry tracks only
+Born-owned sockets; a handle it does not know is forwarded to Threaded, so a
+Threaded listener and a Born connect compose in one interface. Socket event
+identity carries a generation, so an event for a closed-and-reused handle is
+dropped without touching caller storage. Every submitted op attempts its
+operation once when the loop swaps it in and arms interest only on a
+not-ready result, so edge-triggered readiness cannot strand already-buffered
+data. Born outcomes map coarsely onto the declared std error sets (a failed
+read or write becomes `ConnectionResetByPeer`); `Canceled` is reserved for
+real cancellation. Out-of-profile requests are declared errors, never silent
+fallbacks: bind and non-stream/non-TCP connect options return
+`OptionUnsupported`, socket pairs `OperationUnsupported`, message and
+control-buffer I/O on a Born-owned handle complete with their tag result
+`Unexpected` (a batch with Born members completes those members per-op and
+awaits the rest normally), and `netWriteFile` is a read/copy loop through the
+Born write path on 0.16 and declared `Unimplemented` on 0.17. On Windows,
+connect timeout and close drain pending IOCP completions before the socket
+state is freed. Per-route counters (connect/read/write completions serviced
+by Born, and Threaded-forward counts) are readable via
+`born_io.networkStats(io)` when the `network_stats` build option is on
+(default off; the test and bench builds enable it). The per-slot contracts
+and the coarse error map are documented in `src/io/shim.zig`.
+
 ```zig
 // build.zig (Zig >= 0.16)
 const born = b.dependency("born", .{ .target = target, .optimize = optimize });
@@ -537,6 +565,22 @@ const io = try born_io.io(&port, .{
 });
 defer born_io.deinit(io);
 try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+```
+
+```zig
+// Network client route: DNS stays Threaded, connect and stream I/O run on Born.
+const io = try born_io.io(&port, .{
+    .allocator = allocator,
+    .capabilities = .{ .network = .born_evented },
+});
+defer born_io.deinit(io);
+const addr = try std.Io.net.IpAddress.resolve(io, "127.0.0.1", 8080);
+var stream = try addr.connect(io, .{ .mode = .stream });
+defer stream.close(io);
+var wbuf: [64]u8 = undefined;
+var writer = stream.writer(io, &wbuf);
+try writer.interface.writeAll("ping");
+try writer.interface.flush();
 ```
 
 The all-Threaded baseline (every slot delegated, no loop thread) remains
