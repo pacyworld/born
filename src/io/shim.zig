@@ -2591,14 +2591,24 @@ pub const Shim = struct {
         if (comptime is_freebsd) {
             var events: [64]born.Event = undefined;
             var flush_failed = false;
+            var saw_wake = false;
             while (self.port.changes.items.len != 0) {
                 const n = self.port.wait(&events, 0) catch |err| {
                     self.latch(err);
                     flush_failed = true;
                     break;
                 };
-                for (events[0..n]) |ev| self.dispatchEvent(ev);
+                for (events[0..n]) |ev| {
+                    if (ev.wake) saw_wake = true;
+                    self.dispatchEvent(ev);
+                }
             }
+            // The flush sits between the queue drain and the blocking wait, so
+            // a wake it harvests is cleared (EVFILT_USER EV_CLEAR) without a
+            // re-drain: an op a worker queued during the flush would otherwise
+            // leave the loop blocked on a non-empty queue (lost wakeup). Re-
+            // trigger so the main wait returns and the next cycle drains it.
+            if (saw_wake) self.port.wake();
             var node = self.proc_arm_head;
             self.proc_arm_head = null;
             while (node) |op| {
@@ -4246,8 +4256,13 @@ const ProcPipe = struct { child_end: compat.fd_t, parent_end: compat.fd_t };
 
 /// Create a `pipe2(O_CLOEXEC)` pair for each `.pipe` stdio slot (5.3). Both
 /// ends are close-on-exec before the fork so a racing spawn never inherits
-/// them. stdin's child end is the write end; stdout/stderr's is the read end.
-/// On any failure every pipe created so far is destroyed (both ends).
+/// them. `pipe2` returns [read, write]: stdin's child end is the read end
+/// (the child reads it) and the parent keeps the write end; stdout/stderr's
+/// child end is the write end (the child writes it) and the parent keeps the
+/// read end. The orientation matters on half-duplex pipes (Linux): reading a
+/// write end or writing a read end is EBADF. FreeBSD's full-duplex pipes mask
+/// a swap, so the contract tests must run on Linux too. On any failure every
+/// pipe created so far is destroyed (both ends).
 fn makePipes(options: std.process.SpawnOptions) std.process.SpawnError![3]?ProcPipe {
     var pipes: [3]?ProcPipe = .{ null, null, null };
     errdefer destroyPipes(&pipes);
@@ -4259,8 +4274,8 @@ fn makePipes(options: std.process.SpawnOptions) std.process.SpawnError![3]?ProcP
             else => return error.Unexpected,
         };
         pipes[i] = .{
-            .child_end = if (i == 0) ends[1] else ends[0],
-            .parent_end = if (i == 0) ends[0] else ends[1],
+            .child_end = if (i == 0) ends[0] else ends[1],
+            .parent_end = if (i == 0) ends[1] else ends[0],
         };
     }
     return pipes;

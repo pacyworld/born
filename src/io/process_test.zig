@@ -251,6 +251,38 @@ test "spawn honors an explicit environ_map" {
     try expectEqual(@as(u8, 0), term.exited);
 }
 
+test "spawn with stdin and stdout pipes: parent writes stdin, reads stdout" {
+    if (skip_unsupported) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const io = try initProcIo(&port);
+    defer born_io.deinit(io);
+
+    // The child reads one line from stdin and echoes it without the newline,
+    // then exits. This exercises all four pipe orientations: the parent writes
+    // stdin's write end and reads stdout's read end; the child reads stdin's
+    // read end and writes stdout's write end. On half-duplex pipes (Linux) a
+    // swapped end is EBADF, so this catches an orientation regression that
+    // FreeBSD's full-duplex pipes would mask. The caller does not close the
+    // pipes; wait closes the parent ends (the std contract).
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/sh", "-c", "read line; printf %s \"$line\"" },
+        .stdin = .pipe,
+        .stdout = .pipe,
+        .stderr = .ignore,
+    });
+    try expect(child.stdin != null);
+    try expect(child.stdout != null);
+    try child.stdin.?.writeStreamingAll(io, "hello\n");
+    const out = try readPipeToEnd(io, child.stdout.?);
+    defer std.testing.allocator.free(out);
+    try expectEqualSlices(u8, "hello", out);
+    const term = try std.process.Child.wait(&child, io);
+    try expectEqual(@as(u8, 0), term.exited);
+    try expectEqual(@as(?Io.File, null), child.stdin);
+    try expectEqual(@as(?Io.File, null), child.stdout);
+}
+
 test "spawn resolves argv[0] against PATH when it has no slash" {
     if (skip_unsupported) return error.SkipZigTest;
     var port = try born.EvPort.init(std.testing.allocator);
@@ -731,4 +763,65 @@ test "deinit kills a still-running abandoned child" {
     try std.posix.kill(pid, @enumFromInt(0));
     born_io.deinit(io);
     try expectPidGone(pid);
+}
+
+const ConcurrentSpawn = struct {
+    io: Io,
+    iterations: u32,
+    success: std.atomic.Value(u64) = .init(0),
+    failed: std.atomic.Value(u64) = .init(0),
+};
+
+fn concurrentSpawnWorker(ctx: *ConcurrentSpawn) void {
+    var i: u32 = 0;
+    while (i < ctx.iterations) : (i += 1) {
+        var child = std.process.spawn(ctx.io, .{
+            .argv = &.{ "/bin/sh", "-c", "exit 0" },
+            .stdin = .ignore,
+            .stdout = .ignore,
+            .stderr = .ignore,
+        }) catch {
+            _ = ctx.failed.fetchAdd(1, .monotonic);
+            return;
+        };
+        const term = std.process.Child.wait(&child, ctx.io) catch {
+            _ = ctx.failed.fetchAdd(1, .monotonic);
+            return;
+        };
+        if (term.exited == 0) {
+            _ = ctx.success.fetchAdd(1, .monotonic);
+        } else {
+            _ = ctx.failed.fetchAdd(1, .monotonic);
+        }
+    }
+}
+
+test "concurrent spawn/wait from many workers runs on Born without lost wakeups" {
+    if (skip_unsupported) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const io = try initProcIo(&port);
+    defer born_io.deinit(io);
+
+    // Regression guard for the FreeBSD arm-flush lost wakeup: the flush sits
+    // between the queue drain and the blocking wait and can harvest a worker's
+    // wake for an op queued during the flush, leaving the loop blocked on a
+    // non-empty queue. Many concurrent spawn/wait round-trips exercise that
+    // race; a lost wakeup stalls a worker forever (the join never returns).
+    const workers = 16;
+    const iterations = 24;
+    var ctx = ConcurrentSpawn{ .io = io, .iterations = iterations };
+    var threads: [workers]std.Thread = undefined;
+    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, concurrentSpawnWorker, .{&ctx});
+    for (threads) |t| t.join();
+    try expectEqual(@as(u64, 0), ctx.failed.load(.monotonic));
+    try expectEqual(@as(u64, workers * iterations), ctx.success.load(.monotonic));
+    if (born_io.process_stats_enabled) {
+        const s = born_io.processStats(io);
+        try expect(s.spawn >= workers * iterations);
+        try expect(s.wait >= workers * iterations);
+        try expectEqual(@as(u64, 0), s.threaded_spawn);
+        try expectEqual(@as(u64, 0), s.threaded_wait);
+        try expectEqual(@as(u64, 0), s.threaded_kill);
+    }
 }
