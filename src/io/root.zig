@@ -16,7 +16,10 @@
 //! machinery. With `capabilities.network = .born_evented` the network client
 //! path (IP and pathname Unix connect, stream read/write, close, shutdown) runs
 //! on Born; listen/accept, DNS and message I/O stay Threaded hybrids or declared
-//! exclusions. Every other slot keeps delegating. Later increments enable the
+//! exclusions. With `capabilities.process = .born_evented` on FreeBSD or Linux
+//! the process family (`processSpawn`, `childWait`, `childKill`) runs on Born
+//! through process descriptors / pidfds; other targets reject the capability at
+//! construction. Every other slot keeps delegating. Later increments enable the
 //! remaining families.
 //!
 //! Removal is `git rm -r src/io` plus the conditional export lines in
@@ -45,10 +48,11 @@ pub const InitError = shim.InitError;
 pub const Shim = shim.Shim;
 
 /// Builds a `std.Io` over Born's event port. Release the returned interface
-/// with `deinit`. The time route (`capabilities.time = .born_evented`) and the
-/// network client route (`capabilities.network = .born_evented`) are serviced
-/// by Born's reactor; Born routes for the file and process families are still
-/// rejected at construction.
+/// with `deinit`. The time route (`capabilities.time = .born_evented`), the
+/// network client route (`capabilities.network = .born_evented`) and, on
+/// FreeBSD or Linux, the process route (`capabilities.process = .born_evented`)
+/// are serviced by Born's reactor; the file family and the process family on
+/// other targets are rejected at construction.
 pub const io = shim.io;
 /// Releases the composite created by `io`. Stops and joins the Born route's
 /// loop thread first, then joins the Threaded pool.
@@ -78,6 +82,19 @@ pub const networkStats = shim.networkStats;
 /// option): off by default, enabled in the test and bench builds.
 pub const network_stats_enabled = shim.network_stats_enabled;
 
+/// Per-route process counters (Born spawn/wait/kill completions and
+/// Threaded-forward counts). Child stream I/O on pipe parent ends stays
+/// Threaded-serviced, so these claim only spawn/wait/kill on Born.
+pub const ProcessStats = shim.ProcessStats;
+/// Snapshot of the process route's per-route counters. Reports zeros when the
+/// `process_stats` build option is off (the default).
+pub const processStats = shim.processStats;
+/// Comptime gate for the per-route process counters (`process_stats` build
+/// option): off by default, enabled in the test and bench builds.
+pub const process_stats_enabled = shim.process_stats_enabled;
+/// Compile-time target support for the process route (FreeBSD and Linux).
+pub const process_supported = shim.process_supported;
+
 /// The complete explicit Threaded-delegation baseline vtable. To check that an
 /// interface uses it, compare slot contents (`std.meta.eql`), not the address:
 /// comptime-known constants have no guaranteed unique runtime address.
@@ -94,12 +111,27 @@ pub const network_vtable = shim.network_vtable;
 /// Both Born routes active: the network vtable plus the time-route sleep/now.
 pub const time_network_vtable = shim.time_network_vtable;
 
+/// The process-route vtable: the baseline with `processSpawn`, `childWait` and
+/// `childKill` serviced by Born's reactor (FreeBSD and Linux). Compare slot
+/// contents, not the address.
+pub const process_vtable = shim.process_vtable;
+
+/// The time and process routes active.
+pub const time_process_vtable = shim.time_process_vtable;
+
+/// The network and process routes active.
+pub const network_process_vtable = shim.network_process_vtable;
+
+/// All three Born routes active: time, network and process.
+pub const time_network_process_vtable = shim.time_network_process_vtable;
+
 test {
     _ = @import("assert.zig");
     _ = @import("shim.zig");
     _ = @import("shim_test.zig");
     _ = @import("time_test.zig");
     _ = @import("net_test.zig");
+    _ = @import("process_test.zig");
 }
 
 test "module exposes the pinned interface shape" {
