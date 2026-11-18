@@ -69,6 +69,18 @@ OS per primitive, and lists real runs only.
 | epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | examples smoke suite (echo engine) | [run 297, Linux job (zig 0.15.2, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/297/jobs/7): born-example-smoke All 7 tests passed; green on all six legs | 2026-11-16 | [a474347](https://pacyworld.dev/pacyworld/born/commit/a4743479f711f418f59e9f17c5db9c12cc5af2c4) |
 | IOCP, Windows Server 2022 build 20348 (CI Windows runner) | examples smoke suite (echo engine) | [run 297, Windows job (zig 0.15.2, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/297/jobs/13): born-example-smoke.exe 5 passed; 2 skipped; 0 failed (SIGTERM and balanced skip on Windows); green on all six legs | 2026-11-16 | [a474347](https://pacyworld.dev/pacyworld/born/commit/a4743479f711f418f59e9f17c5db9c12cc5af2c4) |
 | kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | examples live drive (echo servers, SIGTERM drain) | born-echo-server and born-echo-per-core ReleaseSafe on Zig 0.15.2: 8 and 24 connections echoed (203105 and 808280 bytes), clean SIGTERM drain exit 0 each | 2026-11-16 | [a474347](https://pacyworld.dev/pacyworld/born/commit/a4743479f711f418f59e9f17c5db9c12cc5af2c4) |
+| kqueue, FreeBSD 15 (CI FreeBSD runner) | born.io network client route (connect, stream I/O, shutdown) | [run 314, FreeBSD job (zig 0.16.0)](https://pacyworld.dev/pacyworld/born/actions/runs/314/jobs/2) and [zig 0.17.1 job](https://pacyworld.dev/pacyworld/born/actions/runs/314/jobs/3): Debug and ReleaseSafe, born-io-tests 77 passed, 5 skipped, 0 failed each | 2026-11-17 | [068212d](https://pacyworld.dev/pacyworld/born/commit/068212d7e73ee0bb4e8c02bdee15ac8c86f314eb) |
+| epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | born.io network client route (connect, stream I/O, shutdown) | [run 314, Linux job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/314/jobs/8): Debug and ReleaseSafe on 0.16.0 and 0.17.1, born-io-tests 76 passed, 6 skipped, 0 failed each | 2026-11-17 | [068212d](https://pacyworld.dev/pacyworld/born/commit/068212d7e73ee0bb4e8c02bdee15ac8c86f314eb) |
+| IOCP, Windows Server 2022 build 20348 (CI Windows runner) | born.io network client route (connect, stream I/O, shutdown) | [run 314, Windows job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/314/jobs/14): Debug and ReleaseSafe on 0.16.0 and 0.17.1, born-io-tests.exe 74 passed, 8 skipped, 0 failed each | 2026-11-17 | [068212d](https://pacyworld.dev/pacyworld/born/commit/068212d7e73ee0bb4e8c02bdee15ac8c86f314eb) |
+| kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io network client route (connect, stream I/O, shutdown) | born-io-tests Debug and ReleaseSafe on Zig 0.16.0 and 0.17.1: 77 passed, 5 skipped, 0 failed each | 2026-11-17 | [068212d](https://pacyworld.dev/pacyworld/born/commit/068212d7e73ee0bb4e8c02bdee15ac8c86f314eb) |
+| kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io network route, default config (stats off) | born-io-tests-default Debug and ReleaseSafe on Zig 0.16.0 and 0.17.1: 77 passed, 5 skipped, 0 failed each; the echo test asserts the documented zero counter snapshot | 2026-11-17 | [068212d](https://pacyworld.dev/pacyworld/born/commit/068212d7e73ee0bb4e8c02bdee15ac8c86f314eb) |
+| kqueue, macOS 26.1 arm64 (manual host) | born.io network client route (connect, stream I/O, shutdown) | born-io-tests Debug and ReleaseSafe on Zig 0.16.0 and 0.17.1: 77 passed, 5 skipped, 0 failed each | 2026-11-17 | [068212d](https://pacyworld.dev/pacyworld/born/commit/068212d7e73ee0bb4e8c02bdee15ac8c86f314eb) |
+| kqueue, NetBSD 10.1 amd64 (manual host) | born.io network client route (pipe wake) | born-io-tests Debug and ReleaseSafe on Zig 0.16.0 and 0.17.1: 77 passed, 5 skipped, 0 failed each | 2026-11-17 | [068212d](https://pacyworld.dev/pacyworld/born/commit/068212d7e73ee0bb4e8c02bdee15ac8c86f314eb) |
+| epoll, Linux 7.0.0-34-generic x86_64 (manual host) | born.io network client route (connect, stream I/O, shutdown) | born-io-tests Debug and ReleaseSafe on Zig 0.16.0 and 0.17.1: 76 passed, 6 skipped, 0 failed each | 2026-11-17 | [068212d](https://pacyworld.dev/pacyworld/born/commit/068212d7e73ee0bb4e8c02bdee15ac8c86f314eb) |
+| IOCP, Windows 11 build 26100.6901 (manual host) | born.io network client route (connect, stream I/O, shutdown) | born-io-tests.exe Debug and ReleaseSafe on Zig 0.16.0 and 0.17.1 over OpenSSH: 74 passed, 8 skipped, 0 failed each | 2026-11-17 | [068212d](https://pacyworld.dev/pacyworld/born/commit/068212d7e73ee0bb4e8c02bdee15ac8c86f314eb) |
+| kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io network route, route_dead vs canceled retirement (mutation proof) | the retirement unit and loop-death integration test pass clean; forcing a failure exit to report canceled fails both (75 passed, 5 skipped, 2 failed); reverted, green again | 2026-11-17 | [068212d](https://pacyworld.dev/pacyworld/born/commit/068212d7e73ee0bb4e8c02bdee15ac8c86f314eb) |
+| IOCP, Windows 11 build 26100.6901 (manual host) | born.io network route, two-socket exit drain (mutation proof) | the two-socket drain unit passes clean; reverting registryCloseAll to the per-socket polled drain fails its prompt-drain bound (73 passed, 8 skipped, 1 failed); reverted, green again | 2026-11-17 | [068212d](https://pacyworld.dev/pacyworld/born/commit/068212d7e73ee0bb4e8c02bdee15ac8c86f314eb) |
+| IOCP, Windows 11 build 26100.6901 (manual host) | born.io network route, connect-deadline drain (mutation proof) | the Windows drain unit passes clean; the unconditional slot-free mutation in connectDeadlineFired fails exactly that unit (67 passed, 6 skipped, 1 failed); reverted, green again | 2026-11-17 | [cfe247d](https://pacyworld.dev/pacyworld/born/commit/cfe247d2d92b3442e1262ba2235d458fcdc718bc) |
 
 Commit 3ed3785 changes only the CI workflow; its library and tests are
 those of master d1017b8. Skips identify platform exclusions or primitives
@@ -85,6 +97,23 @@ SIGTERM-drain and balanced-listener tests. The live-drive row records
 the two example servers under real clients and SIGTERM on a manual
 FreeBSD host. The commit adding these rows changes only this README;
 its library, tests and CI are those of a474347.
+
+The born.io network rows record the P5.3 client route: IP and pathname
+Unix connect with deadlines, stream read/write, close, shutdown, the
+coarse error map, try-before-park, the stale-handle generation guard,
+the provenance gate, the per-route counters, unregister-before-close,
+the two-phase Windows exit drain, route_dead versus canceled retirement
+and persistent read interest. The kqueue POSIX runs skip the four
+Windows-only tests and the Unix-on-Windows test; Linux also skips the
+kqueue-only time loop-death test; Windows skips the POSIX deadline unit,
+both loop-death tests, the four Unix tests and the POSIX handle-reuse
+test. The NetBSD born.io suite is separate from born-tests, whose four
+pre-existing failures are tracked in #76. The mutation rows record three
+revert experiments: route_dead retirement (FreeBSD) and the two-socket
+exit drain (Windows) at 068212d, and the connect-deadline drain at
+cfe247d; each mutant fails only its targeted tests and the reverted tree
+is green again. The CI rows record run 314 at 068212d; the commit adding
+these rows changes only this README.
 
 ## Programming model
 
@@ -492,8 +521,10 @@ construction (`CapabilityUnsupported`), never silently delegated.
 and is not exported on 0.15.2. The Born time route
 (`capabilities.time = .born_evented`) is experimental: it currently misses its
 written benchmark target, and the remaining work is tracked in #101. It is not
-recommended for production until #101 meets that target. The default remains
-the all-Threaded baseline, which is the supported configuration in 0.3.0.
+recommended for production until #101 meets that target. The Born network
+client route (`capabilities.network = .born_evented`) is likewise opt-in and
+experimental. The default remains the all-Threaded baseline, which is the
+supported configuration in 0.3.0.
 
 The time family is the first enabled Born route
 (`capabilities.time = .born_evented`): `sleep` runs on Born's timers and
@@ -518,6 +549,56 @@ awake clock, not of the Born timer clock that `now(.awake)` reads. The
 per-slot failure mapping and the Scale model machinery are documented in
 `src/io/shim.zig`.
 
+The network client route (`capabilities.network = .born_evented`) services the
+stream client path on Born's reactor: IP and pathname Unix connect (with
+connect deadlines), stream reads and writes, close and shutdown. Listen,
+accept and DNS resolution stay on Threaded. A handle registry tracks only
+Born-owned sockets; a handle it does not know is forwarded to Threaded, so a
+Threaded listener and a Born connect compose in one interface. A socket is
+unregistered from the registry before its descriptor closes, so an fd or
+SOCKET value reused by another thread never resolves to a dying slot. Socket
+event identity carries a generation, so an event for a closed-and-reused
+handle is dropped without touching caller storage. Read interest is
+persistent: armed once when the connect completes and removed only at close,
+with a readable event that has no pending read recording the kernel hint, so
+a completed parked read does not unmonitor and re-arm on the hot path. A
+parked-read echo benchmark on Linux epoll (`bench/net.zig`, `strace -f -c`)
+measures the saving: `epoll_ctl` drops from 2.00 to about 0 per request and
+total syscalls from 17.76 to 15.62 per request, at a small consistent
+latency cost (~30us p50) dominated by the server delay. Every
+submitted op attempts its operation once when the loop swaps it in and arms
+interest only on a not-ready result, so edge-triggered readiness cannot
+strand already-buffered data. A second concurrent read or write on a parked
+op is rejected rather than orphaning it.
+
+Born outcomes map coarsely onto the declared std error sets (a failed read or
+write becomes `ConnectionResetByPeer`); `Canceled` is reserved for real
+cancellation and the deinit stop request. A dead route (a failure loop exit,
+or a submit refused after the queue dies) surfaces as `Unexpected`, never as
+the caller's cancellation. Out-of-profile requests are declared errors, never
+silent fallbacks: bind and non-stream/non-TCP connect options return
+`OptionUnsupported`, socket pairs `OperationUnsupported`, message and
+control-buffer I/O on a Born-owned handle complete with their tag result
+`Unexpected` (a batch with Born members completes those members per-op and
+awaits the rest normally), and `netWriteFile` is a read/copy loop through the
+Born write path on 0.16 and declared `Unimplemented` on 0.17.
+
+Connect timeouts stay on the Born route for every clock: a `.duration` is
+relative, and a `.deadline` on `.real` or `.boot` is converted to a Born
+monotonic deadline using that clock's now; a clock read refusal fails the
+connect with `Unexpected` rather than dropping the timeout. On Windows,
+connect timeout and close drain pending IOCP completions before the socket
+state is freed, and at loop exit every socket is canceled first, then
+completions are dispatched to their owning socket until the outstanding op
+count reaches zero. `shutdown()` does not complete pending overlapped ops, so
+a recv/send shutdown also cancels the in-flight `WSARecv`/`WSASend` and the
+loop completes a parked read with EOF. Per-route counters (connect, read
+and write completions serviced by Born, and Threaded-forward counts) are
+readable via `born_io.networkStats(io)` when the `network_stats` build
+option is on (default off; the test and bench builds enable it). The
+per-slot contracts and the coarse error map are documented in
+`src/io/shim.zig`.
+
 ```zig
 // build.zig (Zig >= 0.16)
 const born = b.dependency("born", .{ .target = target, .optimize = optimize });
@@ -537,6 +618,22 @@ const io = try born_io.io(&port, .{
 });
 defer born_io.deinit(io);
 try std.Io.sleep(io, .fromMilliseconds(10), .awake);
+```
+
+```zig
+// Network client route: DNS stays Threaded, connect and stream I/O run on Born.
+const io = try born_io.io(&port, .{
+    .allocator = allocator,
+    .capabilities = .{ .network = .born_evented },
+});
+defer born_io.deinit(io);
+const addr = try std.Io.net.IpAddress.resolve(io, "127.0.0.1", 8080);
+var stream = try addr.connect(io, .{ .mode = .stream });
+defer stream.close(io);
+var wbuf: [64]u8 = undefined;
+var writer = stream.writer(io, &wbuf);
+try writer.interface.writeAll("ping");
+try writer.interface.flush();
 ```
 
 The all-Threaded baseline (every slot delegated, no loop thread) remains

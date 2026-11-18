@@ -101,10 +101,12 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const born = @import("born");
+const compat = @import("compat");
 const io_options = @import("born_io_options");
 const Io = std.Io;
 
 const is_017 = builtin.zig_version.minor >= 17;
+const is_windows = builtin.os.tag == .windows;
 
 /// Comptime gate for the latency-breakdown instrument: when false the sleep
 /// path performs no shared writes and no extra clock reads, and `timeStats`
@@ -256,6 +258,346 @@ pub fn decodeSlotUdata(udata: ?*anyopaque) struct { index: u32, generation: u32 
     return .{ .index = @truncate(encoded), .generation = @truncate(encoded >> 32) };
 }
 
+// ------------------------------------------------------ network engine ----
+//
+// P5.3 generalizes the P5.2 timer engine to network operations without
+// touching the timer machinery above. The network engine mirrors it: a
+// caller-owned `NetOp` node, a non-moving net-op slot table with a cancel
+// list and deferred free, and a sole-driver loop. A separate socket registry
+// maps the raw std handle to a stable `SocketState` (the `PlainNb` plus its
+// pending ops and a generation for stale-event rejection). The loop thread is
+// shared: `loopMain` drives timer fires and socket events in one `wait`.
+
+/// Comptime gate for the per-route network counters: when false the network
+/// path performs no shared counter writes and `networkStats` reports zeros.
+/// Set by the `network_stats` build option.
+pub const network_stats_enabled: bool = io_options.network_stats;
+
+/// Provenance of a socket handle. The registry holds Born-owned sockets only;
+/// a handle absent from the registry is Threaded-owned and is forwarded to the
+/// saved Threaded vtable. A Born-owned handle is never handed to Threaded
+/// (Blocker 1): POSIX Born sockets are non-blocking and Windows Born sockets
+/// are associated with Born's IOCP port.
+const Provenance = enum { born };
+
+/// Born-level outcome of a network operation, set by the loop and mapped to a
+/// declared std error by the thunk (section 8 coarse mapping). Synthetic tags
+/// disambiguate outcomes that share a Born error name (e.g. setup vs mid-connect
+/// `SocketError`).
+const NetError = enum {
+    connect_refused,
+    connect_setup,
+    connect_state,
+    timeout,
+    read_failed,
+    write_failed,
+    unix_refused,
+    unix_setup,
+    unix_name_too_long,
+    unix_backlog_full,
+    unix_unsupported,
+    canceled,
+    route_dead,
+    busy,
+};
+
+/// Caller-owned network operation node: one per blocking std network call,
+/// stack-allocated by the submitter. Ownership follows `SleepOp`: the submitter
+/// owns it until enqueue, the loop from dequeue until the terminal `state`
+/// store, the submitter again afterwards. The loop never touches it after
+/// retirement. `cursor` is loop-only after enqueue (read/write byte progress).
+pub const NetOp = struct {
+    /// Submission-queue link (submitter writes before enqueue, loop reads after).
+    next: ?*NetOp = null,
+    /// Net-op slot index assigned at submit under the net queue mutex.
+    slot_index: u32 = 0,
+    /// Registry index of the target socket. Read/write/close resolve it at
+    /// submit; connect assigns it when the loop creates the socket.
+    sock_index: u32 = 0,
+    /// Futex word: 0 = pending, 1 = terminal (loop releases, submitter acquires).
+    state: std.atomic.Value(u32) = .init(0),
+    /// Submitter sets this (release) when its wait observes cancellation.
+    cancel_requested: std.atomic.Value(bool) = .init(false),
+    /// Loop sets this before the terminal store for a cancel/stop/close drain.
+    outcome_canceled: bool = false,
+    kind: Kind,
+    payload: Payload,
+    result: Result = .{},
+    /// Read/write byte progress; loop-only after enqueue.
+    cursor: usize = 0,
+
+    pub const Kind = enum { connect, read, write, close };
+
+    pub const Payload = union(enum) {
+        connect: Connect,
+        read: Read,
+        write: Write,
+        close: void,
+    };
+
+    pub const Connect = struct {
+        target: union(enum) { ip: born.socket.Address, unix: []const u8 },
+        /// Born monotonic deadline in ns; 0 = no timeout.
+        deadline_ns: u64 = 0,
+    };
+
+    pub const Read = struct {
+        /// Destination iovecs; caller-owned, valid until completion.
+        data: [][]u8,
+    };
+
+    pub const Write = struct {
+        header: []const u8,
+        data: []const []const u8,
+        splat: usize,
+    };
+
+    pub const Result = struct {
+        /// Born-level failure; null on success. The thunk maps it to std.
+        err: ?NetError = null,
+        /// Connect: the created handle.
+        handle: born.Handle = invalidHandle(),
+        /// Connect: local address from getsockname.
+        address: born.socket.Address = undefined,
+        /// Read/write: bytes transferred.
+        count: usize = 0,
+        /// Read: clean peer close (count bytes may precede it).
+        eof: bool = false,
+    };
+};
+
+/// The platform invalid-handle sentinel for `NetOp.Result.handle`.
+fn invalidHandle() born.Handle {
+    return if (is_windows) @ptrCast(born.windows.INVALID_SOCKET) else -1;
+}
+
+/// Loop-owned net-op slot: occupancy plus cancel-list and free-list links,
+/// mirroring the timer `Slot` minus the timer-only `armed`/`generation` (socket
+/// events carry the registry generation, not the net-op slot's). All fields
+/// are protected by the net queue mutex. Slots live in non-moving chunks.
+const NetSlot = struct {
+    op: ?*NetOp = null,
+    next_free: ?u32 = null,
+    cancel_next: ?u32 = null,
+    on_cancel_list: bool = false,
+};
+
+const net_slots_per_chunk: usize = 64;
+const max_net_chunks: usize = 1024;
+
+const NetSlotChunk = struct {
+    slots: [net_slots_per_chunk]NetSlot,
+};
+
+/// A registered Born-owned socket. The `PlainNb` is embedded so its storage
+/// (including Windows OVERLAPPED buffers) stays at a stable address for the
+/// socket's lifetime. `generation` is bumped when the slot is handed to a new
+/// socket; socket `udata` carries (generation, index) so a stale event for a
+/// closed-and-reused fd is dropped. Occupancy/generation/free-list are registry
+/// mutex protected; the pending-op pointers and armed flags are loop-only.
+const SocketState = struct {
+    plain: born.socket.PlainNb = .{},
+    provenance: Provenance = .born,
+    generation: u32 = 0,
+    handle: born.Handle = invalidHandle(),
+    occupied: bool = false,
+    next_free: ?u32 = null,
+    /// Registry index of this slot, set when the loop hands it to a socket.
+    /// Lets the loop arm interest without scanning the chunk table.
+    index: u32 = 0,
+    pending_connect: ?*NetOp = null,
+    pending_read: ?*NetOp = null,
+    pending_write: ?*NetOp = null,
+    read_armed: bool = false,
+    write_armed: bool = false,
+    deadline_armed: bool = false,
+    /// Windows: cancelAndClose issued, draining completions before free.
+    closing: bool = false,
+    /// Windows: shutdown(.recv/.both) issued. shutdown() does not complete a
+    /// pending overlapped WSARecv, so netShutdown cancels it and the loop maps
+    /// the abort completion (or a recv posted after shutdown) to EOF.
+    shutdown_recv: std.atomic.Value(bool) = .init(false),
+};
+
+/// Sockets per registry chunk. `SocketState` embeds a `PlainNb`, which on
+/// Windows carries two 16 KiB buffers, so chunks are smaller than the timer
+/// table's to bound the preallocated footprint.
+const sock_per_chunk: usize = 16;
+const max_sock_chunks: usize = 4096;
+
+const SockChunk = struct {
+    socks: [sock_per_chunk]SocketState,
+};
+
+/// Tag bit distinguishing a connect-deadline timer `udata` from a sleep timer
+/// `udata` in the shared `ev.timer` dispatch. The tag is decisive: a net-tagged
+/// fire goes only to `connectDeadlineFired` (a stale one is dropped there), and
+/// sleep generations are masked to 31 bits so a sleep udata can never carry it.
+const net_timer_bit: u64 = 1 << 63;
+/// Sleep generations stay below bit 31, which `slotUdata` shifts into bit 63
+/// (the network tag). Wrapping at 2^31 reuses keeps the tag space disjoint.
+const sleep_generation_mask: u32 = 0x7fff_ffff;
+/// Connect-deadline timer ids live in the high half of the u32 id space so they
+/// never collide with sleep timer ids (timer slot indices, < 65536).
+const net_timer_id_base: u32 = 0x8000_0000;
+
+/// Encode a connect-deadline timer identity (registry index + generation) with
+/// the network tag bit set.
+fn netTimerUdata(index: u32, generation: u32) ?*anyopaque {
+    const base: u64 = @intCast(@intFromPtr(slotUdata(index, generation)));
+    return @ptrFromInt(@as(usize, @intCast(base | net_timer_bit)));
+}
+
+// ---------------------------------------------------- network helpers ----
+
+/// born.Handle -> compat socket argument. On Windows born.Handle is the raw
+/// HANDLE (*anyopaque) while compat socket calls take ws2_32.SOCKET; POSIX
+/// keeps the fd integer unchanged.
+fn compatSock(h: born.Handle) compat.socket_t {
+    return if (is_windows) @ptrCast(h) else h;
+}
+
+/// Local address of a connected socket via getsockname (section 5.2).
+fn localAddress(handle: born.Handle) born.socket.Address {
+    var addr: born.socket.Address = undefined;
+    var len: compat.socklen_t = @intCast(@sizeOf(born.socket.Address));
+    compat.getsockname(compatSock(handle), &addr.any, &len) catch {
+        // The connect already succeeded; a refused getsockname degrades to a
+        // zero address rather than failing the connection.
+        return .{ .in = .{ .port = 0, .addr = 0 } };
+    };
+    return addr;
+}
+
+/// std IpAddress (native-endian port) -> Born native sockaddr (big-endian port).
+fn ipToBorn(address: *const Io.net.IpAddress) born.socket.Address {
+    return switch (address.*) {
+        .ip4 => |a| .{ .in = .{
+            .port = std.mem.nativeToBig(u16, a.port),
+            .addr = @bitCast(a.bytes),
+        } },
+        .ip6 => |a| .{ .in6 = .{
+            .port = std.mem.nativeToBig(u16, a.port),
+            .flowinfo = a.flow,
+            .addr = a.bytes,
+            .scope_id = a.interface.index,
+        } },
+    };
+}
+
+/// Born native sockaddr -> std IpAddress. Only inet/inet6 reach here (the
+/// connect thunk validated the family); anything else degrades to loopback.
+fn bornToIp(addr: born.socket.Address) Io.net.IpAddress {
+    return switch (addr.any.family) {
+        compat.AF.INET => .{ .ip4 = .{
+            .bytes = @bitCast(addr.in.addr),
+            .port = std.mem.bigToNative(u16, addr.in.port),
+        } },
+        compat.AF.INET6 => .{ .ip6 = .{
+            .bytes = addr.in6.addr,
+            .port = std.mem.bigToNative(u16, addr.in6.port),
+            .flow = addr.in6.flowinfo,
+            .interface = .{ .index = addr.in6.scope_id },
+        } },
+        else => .{ .ip4 = .loopback(0) },
+    };
+}
+
+/// First unread destination byte across the read iovecs at byte offset `off`,
+/// or null when every iovec is full.
+fn readSliceAt(data: [][]u8, off: usize) ?[]u8 {
+    var pos = off;
+    for (data) |buf| {
+        if (pos < buf.len) return buf[pos..];
+        pos -= buf.len;
+    }
+    return null;
+}
+
+/// Total bytes a std write describes: header once, each data buffer except the
+/// last once, and the last buffer (the pattern) repeated `splat` times.
+fn writeTotal(header: []const u8, data: []const []const u8, splat: usize) usize {
+    var total = header.len;
+    if (data.len == 0) return total;
+    for (data[0 .. data.len - 1]) |buf| total += buf.len;
+    total += splat * data[data.len - 1].len;
+    return total;
+}
+
+/// The slice to write at byte offset `off` of the flattened header+data+splat
+/// stream, or null when the stream is exhausted. A one-byte pattern is expanded
+/// into `fill` (a 64-byte run, matching Threaded's splat_buffer_size); a longer
+/// pattern is written one repetition at a time. `fill` is caller stack storage
+/// valid for the returned slice's lifetime (one writeNb call).
+fn writeSliceAt(header: []const u8, data: []const []const u8, splat: usize, off: usize, fill: *[64]u8) ?[]const u8 {
+    var pos = off;
+    if (pos < header.len) return header[pos..];
+    pos -= header.len;
+    if (data.len == 0) return null;
+    for (data[0 .. data.len - 1]) |buf| {
+        if (pos < buf.len) return buf[pos..];
+        pos -= buf.len;
+    }
+    const pattern = data[data.len - 1];
+    if (pattern.len == 0 or splat == 0) return null;
+    const splat_total = splat * pattern.len;
+    if (pos >= splat_total) return null;
+    if (pattern.len == 1) {
+        const n = @min(splat_total - pos, fill.len);
+        @memset(fill[0..n], pattern[0]);
+        return fill[0..n];
+    }
+    return pattern[pos % pattern.len ..];
+}
+
+/// Coarse read/write error map (section 8): a failed Born read/write becomes
+/// ConnectionResetByPeer; anything else Unexpected. Cancellation is raised by
+/// the thunk as the outer error, never mapped here.
+fn mapIoError(e: NetError) error{ ConnectionResetByPeer, Unexpected } {
+    return switch (e) {
+        .read_failed, .write_failed => error.ConnectionResetByPeer,
+        else => error.Unexpected,
+    };
+}
+
+/// Coarse IP connect error map (section 8).
+fn mapConnectIpError(e: NetError) Io.net.IpAddress.ConnectError {
+    return switch (e) {
+        .connect_refused => error.ConnectionRefused,
+        .connect_setup => error.SystemResources,
+        .connect_state => error.Unexpected,
+        .timeout => error.Timeout,
+        else => error.Unexpected,
+    };
+}
+
+/// Coarse Unix connect error map (section 8). 0.16's UnixAddress.ConnectError
+/// lacks ConnectionRefused, so a refusal degrades to Unexpected there (mirrors
+/// Threaded 0.16); 0.17 carries it.
+fn mapConnectUnixError(e: NetError) Io.net.UnixAddress.ConnectError {
+    return switch (e) {
+        .unix_refused => if (is_017) error.ConnectionRefused else error.Unexpected,
+        .unix_setup => error.SystemResources,
+        .unix_name_too_long => error.FileNotFound,
+        .unix_backlog_full => error.WouldBlock,
+        .unix_unsupported => error.AddressFamilyUnsupported,
+        else => error.Unexpected,
+    };
+}
+
+/// Coarse shutdown error map (section 8): compat.shutdown's richer set folded
+/// into std ShutdownError.
+fn mapShutdownError(e: compat.ShutdownError) Io.net.ShutdownError {
+    return switch (e) {
+        error.ConnectionAborted => error.ConnectionAborted,
+        error.ConnectionResetByPeer => error.ConnectionResetByPeer,
+        error.SocketNotConnected => error.SocketUnconnected,
+        error.NetworkSubsystemFailed => error.NetworkDown,
+        error.SystemResources => error.SystemResources,
+        error.BlockingOperationInProgress, error.Unexpected => error.Unexpected,
+    };
+}
+
 /// Consecutive `wait` failures with no successful wait between them before
 /// the loop retires everything and exits. One-shot stashed failures (a refused
 /// wake trigger, a transient allocation failure) are retried; a persistently
@@ -320,6 +662,50 @@ pub const Shim = struct {
         queue_arm: std.atomic.Value(u64) = .init(0),
         timer_span: std.atomic.Value(u64) = .init(0),
         futex_return: std.atomic.Value(u64) = .init(0),
+    } = .{},
+
+    // ------------------------------------------------ network route state ----
+
+    /// Network submission queue: intrusive FIFO of caller-owned `NetOp` nodes,
+    /// the same discipline as the timer `queue` (O(1) critical sections, never
+    /// held across `wait`, uncancelable, `dead` after the loop exits). Its mutex
+    /// also protects the net-op slot table's occupancy, free list and cancel list.
+    net_queue: struct {
+        mutex: Io.Mutex = .init,
+        head: ?*NetOp = null,
+        tail: ?*NetOp = null,
+        dead: bool = false,
+    } = .{},
+    /// Loop-owned net-op slot table (non-moving chunks), mirroring `chunks`.
+    net_chunks: [max_net_chunks]std.atomic.Value(?*NetSlotChunk) = @splat(.init(null)),
+    net_chunk_count: usize = 0,
+    net_free_head: ?u32 = null,
+    net_cancel_head: ?u32 = null,
+
+    /// Socket registry: handle -> registry index, plus the non-moving
+    /// `SocketState` chunk table. The mutex protects the map and the table's
+    /// occupancy/generation/free list; the loop never holds it across `wait`.
+    /// Submitters resolve a handle to its index under this mutex, release it,
+    /// then enqueue under `net_queue.mutex` (never both at once, so no lock
+    /// order inversion with the loop).
+    registry: struct {
+        mutex: Io.Mutex = .init,
+        map: std.AutoHashMap(born.Handle, u32) = undefined,
+        chunks: [max_sock_chunks]std.atomic.Value(?*SockChunk) = @splat(.init(null)),
+        chunk_count: usize = 0,
+        free_head: ?u32 = null,
+        initialized: bool = false,
+    } = .{},
+
+    /// Per-route network counters, fed by the loop on Born-route completions
+    /// and by the thunks on Threaded forwards; read via `networkStats`.
+    net_stats: struct {
+        connect: std.atomic.Value(u64) = .init(0),
+        read: std.atomic.Value(u64) = .init(0),
+        write: std.atomic.Value(u64) = .init(0),
+        threaded_connect: std.atomic.Value(u64) = .init(0),
+        threaded_read: std.atomic.Value(u64) = .init(0),
+        threaded_write: std.atomic.Value(u64) = .init(0),
     } = .{},
 
     /// Latch the first route-level failure; later failures do not overwrite.
@@ -402,7 +788,7 @@ pub const Shim = struct {
         };
         const slot = self.slotAt(index);
         slot.op = op;
-        slot.generation +%= 1;
+        slot.generation = (slot.generation +% 1) & sleep_generation_mask;
         // Defensive: a free slot is always off the cancel list with a null
         // link (drain clears both before freeing), so this cannot truncate.
         slot.cancel_next = null;
@@ -432,30 +818,47 @@ pub const Shim = struct {
         return was_empty;
     }
 
-    /// The loop thread: sole driver of the port. Each cycle drains the cancel
-    /// list and swaps out the submission queue under the mutex, arms the
-    /// swapped nodes, then blocks in `wait` until a timer fires or a wake
-    /// arrives. Retires everything on stop or persistent port failure.
+    /// The loop thread: sole driver of the port for both the time and network
+    /// routes. Each cycle drains the timer cancel list and swaps out the timer
+    /// submission queue, then the network cancel list and queue; arms the
+    /// swapped timer nodes and drives the swapped network ops (try-before-park);
+    /// blocks in `wait`; dispatches timer fires and socket events. Retires
+    /// everything on stop or persistent port failure.
     fn loopMain(self: *Shim) void {
         var events: [64]born.Event = undefined;
         var fail_streak: u32 = 0;
         while (!self.stopping.load(.acquire)) {
             const batch = self.drainLocked();
             self.armBatch(batch);
+            const net_batch = self.netDrainLocked();
+            self.netArmBatch(net_batch);
             const n = self.port.wait(&events, null) catch |err| {
                 self.latch(err);
                 fail_streak += 1;
                 if (fail_streak >= wait_fail_limit) break;
-                // The next cycle drains the cancel list again, so requests
+                // The next cycle drains the cancel lists again, so requests
                 // carried by a refused wake are still serviced.
                 continue;
             };
             fail_streak = 0;
             for (events[0..n]) |ev| {
-                if (ev.timer) self.timerFired(ev.udata);
+                if (ev.timer) {
+                    const raw: u64 = @intCast(@intFromPtr(ev.udata.?));
+                    if (raw & net_timer_bit != 0) {
+                        // The tag is decisive: a connect deadline, live or
+                        // stale, never reaches the sleep timer path.
+                        _ = self.connectDeadlineFired(ev.udata);
+                    } else self.timerFired(ev.udata);
+                } else if (ev.wake) {
+                    // Cross-thread wakeup only; the queues were drained above.
+                } else {
+                    self.socketEvent(ev);
+                }
             }
         }
+        const stopped = self.stopping.load(.acquire);
         self.retireAll();
+        self.netRetireAll(stopped);
     }
 
     /// One critical section: drain the cancel list, then swap out the whole
@@ -651,6 +1054,951 @@ pub const Shim = struct {
         };
         slot.armed = true;
     }
+
+    // -------------------------------------------- network engine methods ----
+
+    /// Resolve a net-op slot index to its stable storage (acquire pairs with the
+    /// release publication at growth). Field access follows the net queue mutex
+    /// discipline.
+    fn netSlotAt(self: *Shim, index: u32) *NetSlot {
+        const chunk = self.net_chunks[index / net_slots_per_chunk].load(.acquire).?;
+        return &chunk.slots[index % net_slots_per_chunk];
+    }
+
+    /// Allocate one net-op chunk and thread its slots onto the free list. Net
+    /// queue mutex held, or construction before the loop starts.
+    fn netGrowLocked(self: *Shim) error{OutOfMemory}!void {
+        if (self.net_chunk_count >= max_net_chunks) return error.OutOfMemory;
+        const chunk = self.allocator.create(NetSlotChunk) catch return error.OutOfMemory;
+        chunk.* = .{ .slots = undefined };
+        const base = self.net_chunk_count * net_slots_per_chunk;
+        var i: usize = net_slots_per_chunk;
+        while (i > 0) {
+            i -= 1;
+            chunk.slots[i] = .{ .next_free = self.net_free_head };
+            self.net_free_head = @intCast(base + i);
+        }
+        self.net_chunks[self.net_chunk_count].store(chunk, .release);
+        self.net_chunk_count += 1;
+    }
+
+    fn netAllocSlotLocked(self: *Shim) error{OutOfMemory}!u32 {
+        if (self.net_free_head == null) try self.netGrowLocked();
+        const head = self.net_free_head.?;
+        self.net_free_head = self.netSlotAt(head).next_free;
+        return head;
+    }
+
+    fn netFreeSlotLocked(self: *Shim, index: u32) void {
+        const slot = self.netSlotAt(index);
+        slot.next_free = self.net_free_head;
+        self.net_free_head = index;
+    }
+
+    fn netFreeChunks(self: *Shim) void {
+        for (&self.net_chunks) |*c| {
+            if (c.load(.monotonic)) |chunk| self.allocator.destroy(chunk);
+        }
+    }
+
+    /// Enqueue a caller-owned network node into a fresh net-op slot. Returns
+    /// null after the loop exits (`net_queue.dead`) or on a growth refusal.
+    fn netSubmit(self: *Shim, op: *NetOp) ?SubmitResult {
+        self.net_queue.mutex.lockUncancelable(self.threaded_io);
+        defer self.net_queue.mutex.unlock(self.threaded_io);
+        if (self.net_queue.dead) return null;
+        const index = self.netAllocSlotLocked() catch {
+            self.latch(error.OutOfMemory);
+            return null;
+        };
+        const slot = self.netSlotAt(index);
+        slot.op = op;
+        slot.cancel_next = null;
+        op.slot_index = index;
+        op.next = null;
+        const was_empty = self.net_queue.head == null;
+        if (self.net_queue.tail) |tail| tail.next = op else self.net_queue.head = op;
+        self.net_queue.tail = op;
+        return .{ .index = index, .was_empty = was_empty };
+    }
+
+    /// Push the node's net-op slot on the cancel list unless retired or already
+    /// linked. Returns whether the list went empty-to-non-empty.
+    fn netRequestCancel(self: *Shim, op: *NetOp) bool {
+        self.net_queue.mutex.lockUncancelable(self.threaded_io);
+        defer self.net_queue.mutex.unlock(self.threaded_io);
+        const slot = self.netSlotAt(op.slot_index);
+        if (slot.op != op) return false;
+        if (slot.on_cancel_list) return false;
+        const was_empty = self.net_cancel_head == null;
+        slot.cancel_next = self.net_cancel_head;
+        slot.on_cancel_list = true;
+        self.net_cancel_head = op.slot_index;
+        return was_empty;
+    }
+
+    /// One critical section: drain the network cancel list, then swap out the
+    /// whole submission list. Driven ops on the cancel list are chained for
+    /// disarm/retire/wake OUTSIDE the mutex (port calls and futexWake must not
+    /// lengthen the submitter-facing lock, the `netRetireOp` shape); entries
+    /// for ops still in the swapped queue are left to `netArmOrRetire`'s
+    /// `cancel_requested` check.
+    fn netDrainLocked(self: *Shim) ?*NetOp {
+        self.net_queue.mutex.lockUncancelable(self.threaded_io);
+        var driven: ?*NetOp = null;
+        var idx = self.net_cancel_head;
+        self.net_cancel_head = null;
+        while (idx) |i| {
+            const slot = self.netSlotAt(i);
+            const next = slot.cancel_next;
+            slot.cancel_next = null;
+            slot.on_cancel_list = false;
+            if (slot.op) |op| {
+                if (self.opIsPending(op)) {
+                    // A driven op is off the submission queue, so its stale
+                    // batch link is reusable as the cancel-chain link. A
+                    // cancel re-push before the retire below defers the slot
+                    // free (on_cancel_list), which the next drain completes.
+                    op.next = driven;
+                    driven = op;
+                }
+            } else {
+                self.netFreeSlotLocked(i);
+            }
+            idx = next;
+        }
+        const head = self.net_queue.head;
+        self.net_queue.head = null;
+        self.net_queue.tail = null;
+        self.net_queue.mutex.unlock(self.threaded_io);
+        var node = driven;
+        while (node) |op| {
+            const next = op.next;
+            self.netRetireOp(op, true);
+            node = next;
+        }
+        return head;
+    }
+
+    /// Whether the loop has already driven this op (its socket pending pointer
+    /// refers to it). Loop-only field access, no registry mutex needed.
+    fn opIsPending(self: *Shim, op: *NetOp) bool {
+        const state = self.sockAt(op.sock_index) orelse return false;
+        return switch (op.kind) {
+            .connect => state.pending_connect == op,
+            .read => state.pending_read == op,
+            .write => state.pending_write == op,
+            .close => false,
+        };
+    }
+
+    fn netArmBatch(self: *Shim, head: ?*NetOp) void {
+        var node = head;
+        while (node) |op| {
+            const next = op.next;
+            self.netArmOrRetire(op);
+            node = next;
+        }
+    }
+
+    fn netArmOrRetire(self: *Shim, op: *NetOp) void {
+        // A close must always run (std netClose is infallible), even if the
+        // submitter requested cancellation; every other op retires as canceled.
+        if (op.kind != .close and op.cancel_requested.load(.acquire)) return self.netRetireOp(op, true);
+        switch (op.kind) {
+            .connect => self.connectArm(op),
+            .read => self.readDrive(op),
+            .write => self.writeDrive(op),
+            .close => self.closeDrive(op),
+        }
+    }
+
+    /// Mark the net queue dead and retire every queued and driven network op,
+    /// then close any remaining registered sockets. Loop thread, just before
+    /// exit. A stop request retires ops as canceled; a failure exit retires
+    /// them as route_dead (the thunks map it to Unexpected), never as the
+    /// caller's cancellation.
+    fn netRetireAll(self: *Shim, stopped: bool) void {
+        self.net_queue.mutex.lockUncancelable(self.threaded_io);
+        self.net_queue.dead = true;
+        const head = self.net_queue.head;
+        self.net_queue.head = null;
+        self.net_queue.tail = null;
+        var idx = self.net_cancel_head;
+        self.net_cancel_head = null;
+        while (idx) |i| {
+            const slot = self.netSlotAt(i);
+            const next = slot.cancel_next;
+            slot.cancel_next = null;
+            slot.on_cancel_list = false;
+            if (slot.op == null) self.netFreeSlotLocked(i);
+            idx = next;
+        }
+        const chunk_count = self.net_chunk_count;
+        self.net_queue.mutex.unlock(self.threaded_io);
+        var node = head;
+        while (node) |op| {
+            const next = op.next;
+            self.netRetireRoute(op, stopped);
+            node = next;
+        }
+        var ci: usize = 0;
+        while (ci < chunk_count) : (ci += 1) {
+            const chunk = self.net_chunks[ci].load(.acquire).?;
+            for (&chunk.slots) |*slot| {
+                if (slot.op) |op| self.netRetireRoute(op, stopped);
+            }
+        }
+        self.registryCloseAll();
+    }
+
+    /// Retire one op at loop exit: canceled for a stop request or an op whose
+    /// submitter already requested cancellation, route_dead otherwise. A
+    /// failure exit is not the caller's cancellation; the thunks map route_dead
+    /// to Unexpected so a consumer sees the dead route instead of a quiet stop.
+    fn netRetireRoute(self: *Shim, op: *NetOp, stopped: bool) void {
+        const canceled = stopped or op.cancel_requested.load(.acquire);
+        if (!canceled) op.result.err = .route_dead;
+        self.netRetireOp(op, canceled);
+    }
+
+    /// Disarm interest and clear the socket pending pointer for a retiring op.
+    /// Loop-only fields and port calls; no registry mutex (the pending pointers
+    /// and armed flags are written only by the loop).
+    fn disarmOp(self: *Shim, op: *NetOp) void {
+        const state = self.sockAt(op.sock_index) orelse return;
+        switch (op.kind) {
+            .connect => {
+                if (state.pending_connect == op) {
+                    state.pending_connect = null;
+                    if (state.deadline_armed) {
+                        self.port.cancelTimer(net_timer_id_base + op.slot_index);
+                        state.deadline_armed = false;
+                    }
+                    if (state.write_armed) {
+                        self.port.cancelWrite(state.handle);
+                        state.write_armed = false;
+                    }
+                }
+            },
+            .read => {
+                if (state.pending_read == op) {
+                    state.pending_read = null;
+                    // Read interest is persistent (armed once at connect,
+                    // removed only at close): a readable event with no pending
+                    // read just records the hint, so a completed parked read
+                    // does not unmonitor/re-arm on the hot path.
+                }
+            },
+            .write => {
+                if (state.pending_write == op) {
+                    state.pending_write = null;
+                    if (state.write_armed) {
+                        self.port.cancelWrite(state.handle);
+                        state.write_armed = false;
+                    }
+                }
+            },
+            .close => {},
+        }
+    }
+
+    /// Disarm, publish the terminal state and free the net-op slot under the net
+    /// queue mutex, then wake the submitter outside it (the P5.2 retire shape).
+    fn netRetireOp(self: *Shim, op: *NetOp, canceled: bool) void {
+        self.disarmOp(op);
+        self.net_queue.mutex.lockUncancelable(self.threaded_io);
+        self.netRetireLocked(op, op.slot_index, canceled);
+        self.net_queue.mutex.unlock(self.threaded_io);
+        self.threaded_io.vtable.futexWake(self.threaded_io.userdata, &op.state.raw, 1);
+    }
+
+    /// Net queue mutex held: terminal store plus slot release, no wake. A slot
+    /// still on the cancel list is deferred (its entry must drain first).
+    fn netRetireLocked(self: *Shim, op: *NetOp, index: u32, canceled: bool) void {
+        op.outcome_canceled = canceled;
+        op.state.store(1, .release);
+        const slot = self.netSlotAt(index);
+        slot.op = null;
+        if (!slot.on_cancel_list) self.netFreeSlotLocked(index);
+    }
+
+    fn netRetireOk(self: *Shim, op: *NetOp, count: usize, eof: bool) void {
+        op.result.count = count;
+        op.result.eof = eof;
+        self.netRetireOp(op, false);
+    }
+
+    fn netRetireErr(self: *Shim, op: *NetOp, e: NetError) void {
+        op.result.err = e;
+        self.netRetireOp(op, false);
+    }
+
+    /// Submitter-side completion wait for a network op, the same retry shape as
+    /// `time_route.sleep`: enqueue, conditional wake, cancelable futex wait,
+    /// and on cancellation request the disarm then drain uncancelably until the
+    /// loop retires the node (it must never touch this stack storage after we
+    /// return). Returns error.Canceled on any cancellation path; a submit
+    /// refusal (dead queue or growth OOM) completes the op with route_dead,
+    /// which the thunk maps to Unexpected. On normal completion the thunk
+    /// inspects `op.result`.
+    fn netWait(self: *Shim, op: *NetOp) Io.Cancelable!void {
+        const submitted = self.netSubmit(op) orelse {
+            op.result.err = .route_dead;
+            return;
+        };
+        if (submitted.was_empty) self.port.wake();
+        while (true) {
+            self.threaded_io.vtable.futexWait(self.threaded_io.userdata, &op.state.raw, 0, .none) catch |err| switch (err) {
+                error.Canceled => {
+                    op.cancel_requested.store(true, .release);
+                    if (self.netRequestCancel(op)) self.port.wake();
+                    while (op.state.load(.acquire) == 0) {
+                        self.threaded_io.vtable.futexWaitUncancelable(self.threaded_io.userdata, &op.state.raw, 0);
+                    }
+                    return error.Canceled;
+                },
+            };
+            if (op.state.load(.acquire) != 0) break;
+        }
+        if (op.outcome_canceled) return error.Canceled;
+    }
+
+    /// Uncancelable completion wait for a close op. std `netClose` is void and
+    /// infallible and must close even while the calling task unwinds from
+    /// cancellation, so this never honors a cancel request: it drains until the
+    /// loop retires the close. `closeDrive` always closes the socket regardless
+    /// of `cancel_requested`. If the loop is already dead the socket is closed
+    /// by `registryCloseAll` at exit instead.
+    fn netCloseWait(self: *Shim, op: *NetOp) void {
+        const submitted = self.netSubmit(op) orelse return;
+        if (submitted.was_empty) self.port.wake();
+        while (op.state.load(.acquire) == 0) {
+            self.threaded_io.vtable.futexWaitUncancelable(self.threaded_io.userdata, &op.state.raw, 0);
+        }
+    }
+
+    /// Batch provenance gate (section 10): walk the submitted list, detach every
+    /// Born-owned socket member and complete it with its tag result
+    /// `error.Unexpected` (no socket touch, never submitted to Born or Threaded).
+    /// Threaded-owned and file/device members stay in `submitted` for the
+    /// forwarded Threaded await, which appends its completions after these.
+    /// Returns whether any Born-owned member was completed.
+    fn batchPartitionBorn(self: *Shim, batch: *Io.Batch) bool {
+        var found = false;
+        var prev: Io.Operation.OptionalIndex = .none;
+        var index = batch.submitted.head;
+        while (index != .none) {
+            const storage = &batch.storage[index.toIndex()];
+            const next = storage.submission.node.next;
+            const handle = net01x.batchSocketHandle(storage.submission.operation);
+            const is_born = if (handle) |h| self.lookupBorn(h) != null else false;
+            if (is_born) {
+                found = true;
+                switch (prev) {
+                    .none => batch.submitted.head = next,
+                    else => |p| batch.storage[p.toIndex()].submission.node.next = next,
+                }
+                if (next == .none) batch.submitted.tail = prev;
+                const result = net01x.batchUnexpectedResult(storage.submission.operation);
+                switch (batch.completed.tail) {
+                    .none => batch.completed.head = index,
+                    else => |t| batch.storage[t.toIndex()].completion.node.next = index,
+                }
+                storage.* = .{ .completion = .{ .node = .{ .next = .none }, .result = result } };
+                batch.completed.tail = index;
+            } else {
+                prev = index;
+            }
+            index = next;
+        }
+        return found;
+    }
+
+    // ---------------------------------------------------- socket registry ----
+
+    /// Resolve a registry index to its stable storage, or null if the index is
+    /// past the chunk ceiling or the chunk was never published. The ceiling
+    /// guard mirrors `timerFired`: a stale event udata must drop before any
+    /// table access. Lock-free acquire load; field access follows the registry
+    /// mutex (occupancy/generation) or loop-only ownership (pending pointers,
+    /// armed flags).
+    fn sockAt(self: *Shim, index: u32) ?*SocketState {
+        const chunk_index = index / sock_per_chunk;
+        if (chunk_index >= max_sock_chunks) return null;
+        const chunk = self.registry.chunks[chunk_index].load(.acquire) orelse return null;
+        return &chunk.socks[index % sock_per_chunk];
+    }
+
+    /// Initialize the registry map and preallocate the first socket chunk.
+    /// Construction, before the loop starts.
+    fn registryInit(self: *Shim) error{OutOfMemory}!void {
+        self.registry.map = std.AutoHashMap(born.Handle, u32).init(self.allocator);
+        self.registry.initialized = true;
+        try self.sockGrowLocked();
+    }
+
+    fn sockGrowLocked(self: *Shim) error{OutOfMemory}!void {
+        if (self.registry.chunk_count >= max_sock_chunks) return error.OutOfMemory;
+        const chunk = self.allocator.create(SockChunk) catch return error.OutOfMemory;
+        chunk.* = .{ .socks = undefined };
+        const base = self.registry.chunk_count * sock_per_chunk;
+        var i: usize = sock_per_chunk;
+        while (i > 0) {
+            i -= 1;
+            chunk.socks[i] = .{ .next_free = self.registry.free_head };
+            self.registry.free_head = @intCast(base + i);
+        }
+        self.registry.chunks[self.registry.chunk_count].store(chunk, .release);
+        self.registry.chunk_count += 1;
+    }
+
+    fn sockAllocLocked(self: *Shim) error{OutOfMemory}!u32 {
+        if (self.registry.free_head == null) try self.sockGrowLocked();
+        const head = self.registry.free_head.?;
+        self.registry.free_head = self.sockAt(head).?.next_free;
+        return head;
+    }
+
+    fn sockFreeLocked(self: *Shim, index: u32) void {
+        const state = self.sockAt(index).?;
+        state.occupied = false;
+        state.next_free = self.registry.free_head;
+        self.registry.free_head = index;
+    }
+
+    fn sockFreeChunks(self: *Shim) void {
+        for (&self.registry.chunks) |*c| {
+            if (c.load(.monotonic)) |chunk| self.allocator.destroy(chunk);
+        }
+    }
+
+    /// Release the registry map and socket chunks. Called at deinit after the
+    /// loop has closed every remaining socket, and on construction failure.
+    fn registryDeinit(self: *Shim) void {
+        if (!self.registry.initialized) return;
+        self.registry.map.deinit();
+        self.sockFreeChunks();
+        self.registry.initialized = false;
+    }
+
+    /// Submit-time provenance gate: resolve a std handle to its registry index,
+    /// or null if it is not Born-owned (forward to Threaded). Registry mutex.
+    fn lookupBorn(self: *Shim, handle: born.Handle) ?u32 {
+        self.registry.mutex.lockUncancelable(self.threaded_io);
+        defer self.registry.mutex.unlock(self.threaded_io);
+        if (!self.registry.initialized) return null;
+        return self.registry.map.get(handle);
+    }
+
+    fn registerHandle(self: *Shim, handle: born.Handle, index: u32) error{OutOfMemory}!void {
+        self.registry.mutex.lockUncancelable(self.threaded_io);
+        defer self.registry.mutex.unlock(self.threaded_io);
+        self.registry.map.put(handle, index) catch return error.OutOfMemory;
+    }
+
+    /// Remove the handle mapping only if it still refers to this index (a newer
+    /// connect may have reused the fd number and overwritten the entry).
+    fn unregisterHandle(self: *Shim, handle: born.Handle, index: u32) void {
+        self.registry.mutex.lockUncancelable(self.threaded_io);
+        defer self.registry.mutex.unlock(self.threaded_io);
+        if (self.registry.map.get(handle)) |cur| {
+            if (cur == index) _ = self.registry.map.remove(handle);
+        }
+    }
+
+    /// Snapshot a registered socket under the registry mutex, checking occupancy.
+    fn sockSnapshot(self: *Shim, index: u32) ?*SocketState {
+        self.registry.mutex.lockUncancelable(self.threaded_io);
+        defer self.registry.mutex.unlock(self.threaded_io);
+        const state = self.sockAt(index) orelse return null;
+        if (!state.occupied) return null;
+        return state;
+    }
+
+    /// Free a socket slot and remove its handle mapping. Registry mutex.
+    fn sockFree(self: *Shim, state: *SocketState, index: u32) void {
+        self.unregisterHandle(state.handle, index);
+        self.registry.mutex.lockUncancelable(self.threaded_io);
+        self.sockFreeLocked(index);
+        self.registry.mutex.unlock(self.threaded_io);
+    }
+
+    /// Retire a socket on the loop thread: drop the handle mapping BEFORE the
+    /// descriptor closes, so a reused fd/SOCKET value opened by another thread
+    /// (a Threaded accept or connect in the same process) never resolves to this
+    /// dying slot. POSIX purges staged registrations then closes and frees.
+    /// Windows cancels/closes and keeps the slot occupied/closing until
+    /// socketEvent absorbs every completion (the stable OVERLAPPED storage must
+    /// outlive the drain); the generation guard still protects late completions.
+    fn sockRetire(self: *Shim, state: *SocketState, index: u32) void {
+        self.unregisterHandle(state.handle, index);
+        if (is_windows) {
+            state.plain.cancelAndClose();
+            state.closing = true;
+            if (state.plain.pendingOps() == 0) self.sockFree(state, index);
+        } else {
+            self.port.purgeFd(state.handle);
+            state.plain.deinit();
+            self.sockFree(state, index);
+        }
+    }
+
+    /// Total outstanding overlapped ops across occupied registry slots (the
+    /// Windows exit-drain termination condition). Loop-only at exit: every op
+    /// is retired and the net queue is dead, so no submitter can post more.
+    fn registryPendingOps(self: *Shim) usize {
+        if (!is_windows) return 0;
+        var total: usize = 0;
+        var ci: usize = 0;
+        while (ci < self.registry.chunk_count) : (ci += 1) {
+            const chunk = self.registry.chunks[ci].load(.acquire).?;
+            for (&chunk.socks) |*state| {
+                if (state.occupied) total += state.plain.pendingOps();
+            }
+        }
+        return total;
+    }
+
+    /// Close every remaining registered socket (loop exit). Loop thread.
+    /// Phase 1 retires each socket (unregister before close; Windows keeps
+    /// occupied/closing slots for the drain). Phase 2 (Windows) dispatches the
+    /// drained completions through socketEvent with no timeout until the total
+    /// outstanding ops reach zero, so each completion reaches its OWN socket's
+    /// absorbCompletion and no OVERLAPPED storage is freed with ops pending.
+    fn registryCloseAll(self: *Shim) void {
+        if (!self.registry.initialized) return;
+        const chunk_count = self.registry.chunk_count;
+        var ci: usize = 0;
+        while (ci < chunk_count) : (ci += 1) {
+            const chunk = self.registry.chunks[ci].load(.acquire).?;
+            for (&chunk.socks, 0..) |*state, si| {
+                if (state.occupied) {
+                    const index: u32 = @intCast(ci * sock_per_chunk + si);
+                    self.sockRetire(state, index);
+                }
+            }
+        }
+        if (is_windows) {
+            var events: [64]born.Event = undefined;
+            while (self.registryPendingOps() != 0) {
+                const n = self.port.wait(&events, null) catch break;
+                for (events[0..n]) |ev| {
+                    if (ev.timer or ev.wake) continue;
+                    self.socketEvent(ev);
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------- connect path (5.x) ----
+
+    /// Convert a std connect timeout to an absolute Born monotonic deadline in
+    /// ns (0 = no timeout), keeping the connect on the Born route for every
+    /// clock. A `.duration` is relative on any clock. A `.deadline` on `.awake`
+    /// is already on Born's timeline; on `.real`/`.boot` it becomes remaining =
+    /// deadline - that clock's now (read via the Threaded vtable). A clock read
+    /// refusal (born.nowNs, or a zero Threaded timestamp) fails the connect with
+    /// Unexpected rather than silently dropping the timeout. A past deadline
+    /// maps to now so the connect arm sees it as already expired.
+    fn timeoutToDeadline(self: *Shim, timeout: Io.Timeout) error{Unexpected}!u64 {
+        const now_ns = born.nowNs() catch return error.Unexpected;
+        return switch (timeout) {
+            .none => 0,
+            .duration => |d| blk: {
+                if (d.raw.nanoseconds <= 0) break :blk now_ns;
+                const ns: u64 = @intCast(@min(d.raw.nanoseconds, @as(i96, std.math.maxInt(u64))));
+                break :blk now_ns +| ns;
+            },
+            .deadline => |d| blk: {
+                if (d.clock == .awake) {
+                    if (d.raw.nanoseconds <= 0) break :blk now_ns;
+                    break :blk @intCast(@min(d.raw.nanoseconds, @as(i96, std.math.maxInt(u64))));
+                }
+                const clock_now = self.threaded_io.vtable.now(self.threaded_io.userdata, d.clock);
+                if (clock_now.nanoseconds == 0) break :blk error.Unexpected;
+                const remaining = d.raw.nanoseconds - clock_now.nanoseconds;
+                if (remaining <= 0) break :blk now_ns;
+                break :blk now_ns +| @as(u64, @intCast(@min(remaining, @as(i96, std.math.maxInt(u64)))));
+            },
+        };
+    }
+
+    /// Create the socket and initiate the non-blocking connect on the loop
+    /// thread, then arm write interest (POSIX) and the optional deadline timer.
+    /// Windows ConnectEx is posted and associated by `startConnectAddrInto`.
+    fn connectArm(self: *Shim, op: *NetOp) void {
+        // A deadline already in the past expires the connect before any socket
+        // is created (std returns Timeout without connecting). A clock read
+        // refusal fails the connect rather than silently dropping the timeout.
+        const c0 = op.payload.connect;
+        if (c0.deadline_ns != 0) {
+            const now_ns = born.nowNs() catch return self.netRetireErr(op, .route_dead);
+            if (c0.deadline_ns <= now_ns) return self.netRetireErr(op, .timeout);
+        }
+        const index = blk: {
+            self.registry.mutex.lockUncancelable(self.threaded_io);
+            defer self.registry.mutex.unlock(self.threaded_io);
+            break :blk self.sockAllocLocked() catch {
+                self.latch(error.OutOfMemory);
+                return self.netRetireErr(op, .route_dead);
+            };
+        };
+        const state = self.sockAt(index).?;
+        state.generation +%= 1;
+        state.occupied = true;
+        state.closing = false;
+        state.index = index;
+        state.pending_connect = op;
+        state.pending_read = null;
+        state.pending_write = null;
+        state.read_armed = false;
+        state.write_armed = false;
+        state.deadline_armed = false;
+        op.sock_index = index;
+        const udata = slotUdata(index, state.generation);
+        const c = op.payload.connect;
+        const start_err: ?NetError = blk: {
+            switch (c.target) {
+                .ip => |addr| {
+                    state.plain.startConnectAddrInto(addr, self.port, udata) catch |err| break :blk switch (err) {
+                        error.ConnectFailed => NetError.connect_refused,
+                        error.SocketError => NetError.connect_setup,
+                    };
+                },
+                .unix => |path| {
+                    state.plain.startConnectUnixInto(self.allocator, path, self.port, udata) catch |err| break :blk switch (err) {
+                        error.ConnectFailed => NetError.unix_refused,
+                        error.SocketError => NetError.unix_setup,
+                        error.NameTooLong => NetError.unix_name_too_long,
+                        error.BacklogFull => NetError.unix_backlog_full,
+                        error.Unsupported => NetError.unix_unsupported,
+                    };
+                },
+            }
+            break :blk null;
+        };
+        if (start_err) |e| {
+            self.registry.mutex.lockUncancelable(self.threaded_io);
+            state.occupied = false;
+            self.sockFreeLocked(index);
+            self.registry.mutex.unlock(self.threaded_io);
+            return self.netRetireErr(op, e);
+        }
+        state.handle = state.plain.handle();
+        self.registerHandle(state.handle, index) catch {
+            self.latch(error.OutOfMemory);
+            self.sockRetire(state, index);
+            return self.netRetireErr(op, .route_dead);
+        };
+        if (c.deadline_ns != 0) {
+            const now_ns = born.nowNs() catch {
+                self.sockRetire(state, index);
+                return self.netRetireErr(op, .route_dead);
+            };
+            if (c.deadline_ns > now_ns) {
+                self.port.addTimer(net_timer_id_base + op.slot_index, netTimerUdata(index, state.generation), ceilMs(c.deadline_ns - now_ns), .once) catch |err| {
+                    self.latch(err);
+                    self.sockRetire(state, index);
+                    return self.netRetireErr(op, .route_dead);
+                };
+                state.deadline_armed = true;
+            }
+        }
+        if (!is_windows) {
+            self.port.wantWrite(state.handle, udata);
+            state.write_armed = true;
+        }
+    }
+
+    /// Confirm the connect after a writable event (POSIX) or connect completion
+    /// (Windows). On success populate the local address, arm persistent read
+    /// interest and keep the socket registered; on failure retire it.
+    fn connectComplete(self: *Shim, op: *NetOp, state: *SocketState) void {
+        if (op.cancel_requested.load(.acquire)) {
+            self.sockRetire(state, op.sock_index);
+            return self.netRetireOp(op, true);
+        }
+        state.plain.connectDone() catch |err| {
+            const e: NetError = switch (err) {
+                error.ConnectFailed => .connect_refused,
+                error.SocketError => .connect_state,
+            };
+            self.sockRetire(state, op.sock_index);
+            return self.netRetireErr(op, e);
+        };
+        // Success: cancel the deadline, disarm write interest, keep the socket.
+        if (state.deadline_armed) {
+            self.port.cancelTimer(net_timer_id_base + op.slot_index);
+            state.deadline_armed = false;
+        }
+        if (state.write_armed) {
+            self.port.cancelWrite(state.handle);
+            state.write_armed = false;
+        }
+        state.pending_connect = null;
+        // Persistent read interest: arm once here, remove only at close. A
+        // readable event with no pending read records the hint (no re-arm).
+        self.armRead(state);
+        op.result.handle = state.handle;
+        op.result.address = localAddress(state.handle);
+        if (network_stats_enabled) _ = self.net_stats.connect.fetchAdd(1, .monotonic);
+        self.netRetireOp(op, false);
+    }
+
+    /// Handle a connect-deadline timer fire. Returns true if it consumed a live
+    /// network deadline; the tag bit is decisive, so loopMain never forwards a
+    /// net-tagged fire to the sleep timer path and a stale fire is dropped here.
+    /// Timeout retires the socket (unregister before close) and the op on both
+    /// OSes; Windows keeps the stable SocketState occupied/closing until the
+    /// connect completion is absorbed by socketEvent (5.2).
+    fn connectDeadlineFired(self: *Shim, udata: ?*anyopaque) bool {
+        const raw: u64 = @intCast(@intFromPtr(udata.?));
+        const id = decodeSlotUdata(@ptrFromInt(@as(usize, @intCast(raw & ~net_timer_bit))));
+        const state = blk: {
+            self.registry.mutex.lockUncancelable(self.threaded_io);
+            defer self.registry.mutex.unlock(self.threaded_io);
+            const s = self.sockAt(id.index) orelse break :blk null;
+            if (!s.occupied) break :blk null;
+            if (s.generation != id.generation) break :blk null;
+            break :blk s;
+        };
+        const s = state orelse return false;
+        const op = s.pending_connect orelse return true; // stale deadline, drop
+        op.result.err = .timeout;
+        // Clear the pending pointer before the drain so the absorbed connect
+        // completion does not re-enter connectComplete.
+        s.pending_connect = null;
+        if (s.deadline_armed) {
+            self.port.cancelTimer(net_timer_id_base + op.slot_index);
+            s.deadline_armed = false;
+        }
+        self.sockRetire(s, id.index);
+        self.netRetireOp(op, false);
+        return true;
+    }
+
+    // ------------------------------------------- read/write/close (6.x) ----
+
+    /// Try-before-park read: drain `readNb` into the op's iovecs, completing on
+    /// EOF, on a partial drain with bytes already read, or when the iovecs fill;
+    /// park (arm read interest) only when no bytes are available yet.
+    fn readDrive(self: *Shim, op: *NetOp) void {
+        const state = self.sockSnapshot(op.sock_index) orelse return self.netRetireErr(op, .read_failed);
+        if (state.closing) return self.netRetireErr(op, .read_failed);
+        // A second concurrent read would orphan the parked op and hang its
+        // submitter; reject it with busy (mapped to Unexpected). The completion
+        // re-entry from socketEvent has p == op and proceeds.
+        if (state.pending_read) |p| {
+            if (p != op) return self.netRetireErr(op, .busy);
+        }
+        state.pending_read = op;
+        const data = op.payload.read.data;
+        while (true) {
+            const slice = readSliceAt(data, op.cursor) orelse {
+                if (network_stats_enabled) _ = self.net_stats.read.fetchAdd(1, .monotonic);
+                return self.netRetireOk(op, op.cursor, false);
+            };
+            // Windows: after shutdown(.recv) no new data can arrive. Drain
+            // buffered bytes through readNb, then complete with EOF without
+            // posting a WSARecv (which would fail WSAESHUTDOWN). A real error
+            // latched before the shutdown still wins.
+            const shut_eof = is_windows and state.shutdown_recv.load(.acquire) and
+                state.plain.recv_have == 0 and state.plain.recv_err == null;
+            const r: born.socket.NbRead = if (shut_eof) .eof else state.plain.readNb(slice) catch {
+                return self.netRetireErr(op, .read_failed);
+            };
+            switch (r) {
+                .data => |n| {
+                    op.cursor += n;
+                    if (n < slice.len) {
+                        if (network_stats_enabled) _ = self.net_stats.read.fetchAdd(1, .monotonic);
+                        return self.netRetireOk(op, op.cursor, false);
+                    }
+                },
+                .want_read => {
+                    if (op.cursor > 0) {
+                        if (network_stats_enabled) _ = self.net_stats.read.fetchAdd(1, .monotonic);
+                        return self.netRetireOk(op, op.cursor, false);
+                    }
+                    self.armRead(state);
+                    return;
+                },
+                .eof => {
+                    if (network_stats_enabled) _ = self.net_stats.read.fetchAdd(1, .monotonic);
+                    return self.netRetireOk(op, op.cursor, true);
+                },
+                // PlainNb.readNb never returns want_write; a 0-byte non-EOF
+                // completion would read as EndOfStream, so fail it instead.
+                .want_write => return self.netRetireErr(op, .read_failed),
+            }
+        }
+    }
+
+    /// Try-before-park write: flatten header + data + splat into a cursor and
+    /// drive `writeNb` until the full length is written (std all-or-error),
+    /// parking on `want_write`.
+    fn writeDrive(self: *Shim, op: *NetOp) void {
+        const state = self.sockSnapshot(op.sock_index) orelse return self.netRetireErr(op, .write_failed);
+        if (state.closing) return self.netRetireErr(op, .write_failed);
+        // Reject a concurrent write rather than orphaning the parked op.
+        if (state.pending_write) |p| {
+            if (p != op) return self.netRetireErr(op, .busy);
+        }
+        state.pending_write = op;
+        const w = op.payload.write;
+        const total = writeTotal(w.header, w.data, w.splat);
+        var fill: [64]u8 = undefined;
+        while (true) {
+            const slice = writeSliceAt(w.header, w.data, w.splat, op.cursor, &fill) orelse {
+                if (network_stats_enabled) _ = self.net_stats.write.fetchAdd(1, .monotonic);
+                return self.netRetireOk(op, op.cursor, false);
+            };
+            const r = state.plain.writeNb(slice) catch {
+                return self.netRetireErr(op, .write_failed);
+            };
+            switch (r) {
+                .done => |n| {
+                    op.cursor += n;
+                    if (op.cursor >= total) {
+                        if (network_stats_enabled) _ = self.net_stats.write.fetchAdd(1, .monotonic);
+                        return self.netRetireOk(op, op.cursor, false);
+                    }
+                },
+                .want_write => {
+                    self.armWrite(state);
+                    return;
+                },
+                .want_read => return self.netRetireErr(op, .write_failed),
+            }
+        }
+    }
+
+    /// Close a Born-owned socket: cancel and drain every pending op, then
+    /// retire the socket (unregister before close; Windows keeps the stable
+    /// SocketState alive until every completion is absorbed, 4.4).
+    fn closeDrive(self: *Shim, op: *NetOp) void {
+        const state = self.sockSnapshot(op.sock_index) orelse return self.netRetireOk(op, 0, false);
+        if (state.pending_read) |rop| {
+            rop.result.err = .canceled;
+            self.netRetireOp(rop, true);
+        }
+        if (state.pending_write) |wop| {
+            wop.result.err = .canceled;
+            self.netRetireOp(wop, true);
+        }
+        if (state.pending_connect) |cop| {
+            cop.result.err = .canceled;
+            self.netRetireOp(cop, true);
+        }
+        self.sockRetire(state, op.sock_index);
+        self.netRetireOk(op, 0, false);
+    }
+
+    fn armRead(self: *Shim, state: *SocketState) void {
+        if (is_windows) return; // readNb already posted WSARecv
+        if (!state.read_armed) {
+            self.port.monitorRead(state.handle, slotUdata(state.index, state.generation));
+            state.read_armed = true;
+        }
+    }
+
+    fn armWrite(self: *Shim, state: *SocketState) void {
+        if (is_windows) return; // writeNb already posted WSASend
+        self.port.wantWrite(state.handle, slotUdata(state.index, state.generation));
+        state.write_armed = true;
+    }
+
+    /// Windows only: cancel the in-flight WSARecv/WSASend so their abort
+    /// completions reach the loop, which completes a parked read with EOF
+    /// (shutdown_recv) and a parked write with the coarse write error. The
+    /// registry mutex makes the slot lookup atomic with sockFree, so the
+    /// OVERLAPPED addresses belong to this handle's live slot; CancelIoEx on
+    /// an ov with no pending op is a harmless ERROR_NOT_FOUND. The wake covers
+    /// a cancel racing the loop's next post.
+    fn shutdownCancelPending(self: *Shim, handle: Io.net.Socket.Handle, how: Io.net.ShutdownHow) void {
+        self.registry.mutex.lockUncancelable(self.threaded_io);
+        const slot: ?*SocketState = blk: {
+            const index = self.registry.map.get(handle) orelse break :blk null;
+            const s = self.sockAt(index) orelse break :blk null;
+            if (!s.occupied) break :blk null;
+            break :blk s;
+        };
+        if (slot) |s| {
+            if (how == .recv or how == .both) {
+                s.shutdown_recv.store(true, .release);
+                _ = compat.windows.kernel32.CancelIoEx(handle, &s.plain.recv_ov);
+            }
+            if (how == .send or how == .both) {
+                _ = compat.windows.kernel32.CancelIoEx(handle, &s.plain.send_ov);
+            }
+        }
+        self.registry.mutex.unlock(self.threaded_io);
+        self.port.wake();
+    }
+
+    /// Dispatch one socket readiness (POSIX) or completion (Windows) event after
+    /// the generation check drops stale events for a closed-and-reused fd.
+    fn socketEvent(self: *Shim, ev: born.Event) void {
+        const id = decodeSlotUdata(ev.udata);
+        const state = blk: {
+            self.registry.mutex.lockUncancelable(self.threaded_io);
+            defer self.registry.mutex.unlock(self.threaded_io);
+            const s = self.sockAt(id.index) orelse break :blk null;
+            if (!s.occupied) break :blk null;
+            if (s.generation != id.generation) break :blk null;
+            break :blk s;
+        };
+        const s = state orelse return; // stale event dropped
+
+        if (is_windows) {
+            const err: ?usize = if (ev.err) ev.err_no else null;
+            const kind = s.plain.absorbCompletion(ev.overlapped, ev.bytes, err);
+            switch (kind) {
+                .connect => if (s.pending_connect) |op| self.connectComplete(op, s),
+                .recv => {
+                    // A shutdown(.recv) abort (or a recv posted after shutdown)
+                    // completes the read with EOF, not the abort error; bytes
+                    // buffered before the shutdown still drain first.
+                    if (s.shutdown_recv.load(.acquire)) {
+                        s.plain.recv_eof = true;
+                        s.plain.recv_err = null;
+                    }
+                    if (s.pending_read) |op| self.readDrive(op);
+                },
+                .send => if (s.pending_write) |op| self.writeDrive(op),
+                .unknown => {},
+            }
+            if (s.closing and s.plain.pendingOps() == 0) self.sockFree(s, id.index);
+            return;
+        }
+
+        if (ev.err) {
+            // A native error on the registration: fail the pending ops.
+            if (s.pending_read) |op| self.netRetireErr(op, .read_failed);
+            if (s.pending_write) |op| self.netRetireErr(op, .write_failed);
+            if (s.pending_connect) |op| {
+                self.sockRetire(s, id.index);
+                self.netRetireErr(op, .connect_refused);
+            }
+            return;
+        }
+        if (ev.readable or ev.eof) {
+            // Persistent read interest: record the hint even with no pending
+            // read, so a later try-before-park read sees the buffered count.
+            s.plain.hintReadable(ev);
+            if (s.pending_read) |op| self.readDrive(op);
+        }
+        if (ev.writable) {
+            // kqueue consumes the one-shot write registration on delivery.
+            s.write_armed = false;
+            if (s.pending_connect) |op| {
+                self.connectComplete(op, s);
+            } else if (s.pending_write) |op| {
+                self.writeDrive(op);
+            }
+        }
+    }
 };
 
 /// Milliseconds for a remaining nanosecond span, rounded up so a sleep never
@@ -661,18 +2009,22 @@ pub fn ceilMs(remaining_ns: u64) u32 {
 }
 
 /// Builds a `std.Io` over Born's event port. The returned interface owns a
-/// heap-allocated composite; release it with `deinit`. The time route
-/// (`capabilities.time = .born_evented`) spawns the Scale model loop thread
-/// and services `sleep` and monotonic `now` on Born; the caller must not drive
-/// the port itself afterwards. Born routes for the other families are still
-/// rejected at construction.
+/// heap-allocated composite; release it with `deinit`. A Born route
+/// (`capabilities.time` or `capabilities.network = .born_evented`) spawns the
+/// Scale model loop thread and services that family on Born; the caller must
+/// not drive the port itself afterwards. The time route services `sleep` and
+/// monotonic `now`; the network route services the client path (IP and pathname
+/// Unix connect, stream read/write, close, shutdown). Born routes for the file
+/// and process families are still rejected at construction.
 pub fn io(port: *born.EvPort, opts: InitOptions) InitError!Io {
     const caps = opts.capabilities;
-    if (caps.network == .born_evented or caps.file == .born_evented or caps.process == .born_evented)
+    if (caps.file == .born_evented or caps.process == .born_evented)
         return error.CapabilityUnsupported;
-    // The time route needs a loop thread; a single-threaded build cannot host
+    const time_born = caps.time == .born_evented;
+    const net_born = caps.network == .born_evented;
+    // The Born routes need a loop thread; a single-threaded build cannot host
     // one, so the profile is rejected rather than silently degraded.
-    if (caps.time == .born_evented and builtin.single_threaded)
+    if ((time_born or net_born) and builtin.single_threaded)
         return error.CapabilityUnsupported;
     const shim = opts.allocator.create(Shim) catch return error.OutOfMemory;
     errdefer opts.allocator.destroy(shim);
@@ -685,24 +2037,37 @@ pub fn io(port: *born.EvPort, opts: InitOptions) InitError!Io {
     };
     shim.threaded_io = shim.threaded.io();
     errdefer shim.threaded.deinit();
-    if (caps.time == .born_evented) {
-        // Preallocate the first chunk so the steady-state sleep path performs
-        // no shim allocation; growth beyond capacity is on demand.
-        shim.growLocked() catch return error.OutOfMemory;
+    if (time_born or net_born) {
+        // Preallocate the first chunk of each active route so its steady-state
+        // path performs no shim allocation; growth beyond capacity is on demand.
+        if (time_born) shim.growLocked() catch return error.OutOfMemory;
         errdefer shim.freeChunks();
+        if (net_born) {
+            shim.netGrowLocked() catch return error.OutOfMemory;
+            shim.registryInit() catch return error.OutOfMemory;
+        }
+        errdefer shim.netFreeChunks();
+        errdefer shim.registryDeinit();
         shim.loop = std.Thread.spawn(.{}, Shim.loopMain, .{shim}) catch return error.LoopSpawnFailed;
     }
     return .{
         .userdata = shim,
-        .vtable = if (caps.time == .born_evented) &time_vtable else &baseline_vtable,
+        .vtable = if (time_born and net_born)
+            &time_network_vtable
+        else if (time_born)
+            &time_vtable
+        else if (net_born)
+            &network_vtable
+        else
+            &baseline_vtable,
     };
 }
 
 /// Releases the composite created by `io`. As with `Io.Threaded`, every task
-/// must have been awaited or canceled first. Stops and joins the time route's
-/// loop thread first (retiring any operation still pending as canceled): the
-/// loop calls into Threaded until it exits. Then joins the Threaded pool and
-/// frees the composite.
+/// must have been awaited or canceled first. Stops and joins the Born route's
+/// loop thread first (retiring any operation still pending as canceled and
+/// closing any remaining registered socket): the loop calls into Threaded until
+/// it exits. Then joins the Threaded pool and frees the composite.
 pub fn deinit(interface: Io) void {
     const shim = shimFrom(interface.userdata);
     const allocator = shim.allocator;
@@ -713,6 +2078,8 @@ pub fn deinit(interface: Io) void {
     }
     shim.threaded.deinit();
     shim.freeChunks();
+    shim.netFreeChunks();
+    shim.registryDeinit();
     allocator.destroy(shim);
 }
 
@@ -769,6 +2136,45 @@ pub fn timeStats(interface: Io) TimeStats {
         .queue_arm_ns = s.queue_arm.load(.monotonic),
         .timer_span_ns = s.timer_span.load(.monotonic),
         .futex_return_ns = s.futex_return.load(.monotonic),
+    };
+}
+
+/// Per-route network counters (should-fix 4, done-when evidence). `connect`,
+/// `read` and `write` count Born-route completions fed by the loop; the
+/// `threaded_*` fields count forwards to the saved Threaded vtable fed by the
+/// thunks. A TCP client consumer asserts the Born counts are non-zero after an
+/// exchange, proving the client ran on Born's reactor (passing over the
+/// all-Threaded baseline, which reports zero Born counts, is not evidence).
+/// With the `network_stats` build option off (the default) no counter is ever
+/// written and every field reports zero.
+pub const NetworkStats = struct {
+    connect: u64,
+    read: u64,
+    write: u64,
+    threaded_connect: u64,
+    threaded_read: u64,
+    threaded_write: u64,
+};
+
+/// Snapshot of the network route's per-route counters. Reports zeros when the
+/// `network_stats` build option is off.
+pub fn networkStats(interface: Io) NetworkStats {
+    if (!network_stats_enabled) return .{
+        .connect = 0,
+        .read = 0,
+        .write = 0,
+        .threaded_connect = 0,
+        .threaded_read = 0,
+        .threaded_write = 0,
+    };
+    const s = &shimFrom(interface.userdata).net_stats;
+    return .{
+        .connect = s.connect.load(.monotonic),
+        .read = s.read.load(.monotonic),
+        .write = s.write.load(.monotonic),
+        .threaded_connect = s.threaded_connect.load(.monotonic),
+        .threaded_read = s.threaded_read.load(.monotonic),
+        .threaded_write = s.threaded_write.load(.monotonic),
     };
 }
 
@@ -1604,6 +3010,347 @@ pub const time_vtable: Io.VTable = blk: {
     break :blk v;
 };
 
+/// Born evented implementations of the network client path (P5.3, Option B).
+/// Shared thunks have identical signatures on both toolchains; the
+/// toolchain-specific slots live in `net016`/`net017`. Every other slot keeps
+/// its baseline forwarding thunk; `network_vtable` is a comptime copy of the
+/// baseline with only these slots replaced, so the two cannot drift.
+const network_route = struct {
+    /// IP connect on Born. Only `.stream` with `protocol == null or .tcp` is
+    /// adapted; other values return declared `OptionUnsupported` (never
+    /// truncated to TCP). Timeouts on any clock are converted to a Born
+    /// monotonic deadline (`.duration` relative; `.deadline` on `.real`/`.boot`
+    /// via that clock's now), so the connect stays on the Born route; a clock
+    /// read refusal fails with Unexpected. The loop creates the socket, drives
+    /// the non-blocking connect and the deadline race, and populates the local
+    /// address via getsockname (section 5).
+    fn netConnectIp(userdata: ?*anyopaque, address: *const Io.net.IpAddress, options: Io.net.IpAddress.ConnectOptions) Io.net.IpAddress.ConnectError!Io.net.Socket {
+        const self = shimFrom(userdata);
+        if (options.mode != .stream) return error.OptionUnsupported;
+        if (options.protocol) |p| {
+            if (p != .tcp) return error.OptionUnsupported;
+        }
+        var op: NetOp = .{
+            .kind = .connect,
+            .payload = .{ .connect = .{
+                .target = .{ .ip = ipToBorn(address) },
+                .deadline_ns = self.timeoutToDeadline(options.timeout) catch return error.Unexpected,
+            } },
+        };
+        try self.netWait(&op);
+        if (op.result.err) |e| return mapConnectIpError(e);
+        return .{ .handle = op.result.handle, .address = bornToIp(op.result.address) };
+    }
+
+    /// Unix connect: pathname -> Born; abstract/embedded-NUL -> Threaded (honest
+    /// std coverage, never a fake refusal); Windows -> AddressFamilyUnsupported
+    /// (section 5.4). The Threaded fallback produces a Threaded-owned handle
+    /// that later read/write/close dispatch correctly via the provenance gate.
+    fn netConnectUnix(userdata: ?*anyopaque, address: *const Io.net.UnixAddress) Io.net.UnixAddress.ConnectError!Io.net.Socket.Handle {
+        const self = shimFrom(userdata);
+        if (is_windows) return error.AddressFamilyUnsupported;
+        const path = address.path;
+        if (address.isAbstract() or std.mem.indexOfScalar(u8, path, 0) != null) {
+            if (network_stats_enabled) _ = self.net_stats.threaded_connect.fetchAdd(1, .monotonic);
+            return fwd.netConnectUnix(userdata, address);
+        }
+        var op: NetOp = .{
+            .kind = .connect,
+            .payload = .{ .connect = .{ .target = .{ .unix = path }, .deadline_ns = 0 } },
+        };
+        try self.netWait(&op);
+        if (op.result.err) |e| return mapConnectUnixError(e);
+        return op.result.handle;
+    }
+
+    /// Shutdown on a Born-owned socket: POSIX is a plain shutdown(2), which
+    /// wakes a parked read with EOF. Windows shutdown() does not complete
+    /// pending overlapped ops, so a recv/send shutdown also cancels the
+    /// in-flight WSARecv/WSASend (shutdownCancelPending). Threaded-owned
+    /// forwards (section 6, Q6).
+    fn netShutdown(userdata: ?*anyopaque, handle: Io.net.Socket.Handle, how: Io.net.ShutdownHow) Io.net.ShutdownError!void {
+        const self = shimFrom(userdata);
+        if (self.lookupBorn(handle) == null) return fwd.netShutdown(userdata, handle, how);
+        const born_how: compat.ShutdownHow = switch (how) {
+            .recv => .recv,
+            .send => .send,
+            .both => .both,
+        };
+        compat.shutdown(compatSock(handle), born_how) catch |e| return mapShutdownError(e);
+        if (is_windows) self.shutdownCancelPending(handle, how);
+    }
+
+    /// Bind-only sockets are outside the stream-only client profile (section
+    /// 14): declared OptionUnsupported, never a silent Threaded fallback.
+    fn netBindIp(userdata: ?*anyopaque, address: *const Io.net.IpAddress, options: Io.net.IpAddress.BindOptions) Io.net.IpAddress.BindError!Io.net.Socket {
+        _ = userdata;
+        _ = address;
+        _ = options;
+        return error.OptionUnsupported;
+    }
+
+    /// Socketpair is outside the client profile (section 14): declared
+    /// OperationUnsupported.
+    fn netSocketCreatePair(userdata: ?*anyopaque, options: Io.net.Socket.CreatePairOptions) Io.net.Socket.CreatePairError![2]Io.net.Socket {
+        _ = userdata;
+        _ = options;
+        return error.OperationUnsupported;
+    }
+
+    /// Batch provenance gate (section 10): complete each Born-owned member with
+    /// its tag result error.Unexpected, then forward the remaining
+    /// Threaded-owned/file/device members. Returns normally with per-op failures
+    /// for the Born members, never a canceled await.
+    fn batchAwaitAsync(userdata: ?*anyopaque, batch: *Io.Batch) Io.Cancelable!void {
+        const self = shimFrom(userdata);
+        _ = self.batchPartitionBorn(batch);
+        if (batch.submitted.head == .none) return;
+        return fwd.batchAwaitAsync(userdata, batch);
+    }
+
+    fn batchAwaitConcurrent(userdata: ?*anyopaque, batch: *Io.Batch, timeout: Io.Timeout) Io.Batch.AwaitConcurrentError!void {
+        const self = shimFrom(userdata);
+        _ = self.batchPartitionBorn(batch);
+        if (batch.submitted.head == .none) return;
+        return fwd.batchAwaitConcurrent(userdata, batch, timeout);
+    }
+};
+
+/// Network slots specific to the 0.16.x interface: direct netRead/netWrite/
+/// netSend slots, netClose over []const Socket.Handle, the net_receive-only
+/// operate, and the non-panicking internal-copy netWriteFile.
+const net016 = if (!is_017) struct {
+    fn netRead(userdata: ?*anyopaque, src: Io.net.Socket.Handle, data: [][]u8) Io.net.Stream.Reader.Error!usize {
+        const self = shimFrom(userdata);
+        const index = self.lookupBorn(src) orelse {
+            if (network_stats_enabled) _ = self.net_stats.threaded_read.fetchAdd(1, .monotonic);
+            return fwd016.netRead(userdata, src, data);
+        };
+        var op: NetOp = .{ .kind = .read, .sock_index = index, .payload = .{ .read = .{ .data = data } } };
+        try self.netWait(&op);
+        if (op.result.err) |e| return mapIoError(e);
+        return op.result.count; // 0 on EOF; the Reader converts it to EndOfStream
+    }
+
+    fn netWrite(userdata: ?*anyopaque, dest: Io.net.Socket.Handle, header: []const u8, data: []const []const u8, splat: usize) Io.net.Stream.Writer.Error!usize {
+        const self = shimFrom(userdata);
+        const index = self.lookupBorn(dest) orelse {
+            if (network_stats_enabled) _ = self.net_stats.threaded_write.fetchAdd(1, .monotonic);
+            return fwd016.netWrite(userdata, dest, header, data, splat);
+        };
+        var op: NetOp = .{ .kind = .write, .sock_index = index, .payload = .{ .write = .{ .header = header, .data = data, .splat = splat } } };
+        try self.netWait(&op);
+        if (op.result.err) |e| return mapIoError(e);
+        return op.result.count;
+    }
+
+    /// Message send is excluded by the stream-only profile: a Born-owned handle
+    /// completes with the per-message tag result error.Unexpected (section 8).
+    fn netSend(userdata: ?*anyopaque, handle: Io.net.Socket.Handle, messages: []Io.net.OutgoingMessage, flags: Io.net.SendFlags) struct { ?Io.net.Socket.SendError, usize } {
+        const self = shimFrom(userdata);
+        if (self.lookupBorn(handle) == null) return fwd016.netSend(userdata, handle, messages, flags);
+        return .{ error.Unexpected, 0 };
+    }
+
+    fn netClose(userdata: ?*anyopaque, handles: []const Io.net.Socket.Handle) void {
+        const self = shimFrom(userdata);
+        for (handles) |h| {
+            if (self.lookupBorn(h)) |index| {
+                var op: NetOp = .{ .kind = .close, .sock_index = index, .payload = .{ .close = {} } };
+                self.netCloseWait(&op);
+            } else {
+                const one: [1]Io.net.Socket.Handle = .{h};
+                fwd016.netClose(userdata, &one);
+            }
+        }
+    }
+
+    fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
+        const self = shimFrom(userdata);
+        switch (operation) {
+            .net_receive => |o| {
+                if (self.lookupBorn(o.socket_handle) == null) return fwd.operate(userdata, operation);
+                return .{ .net_receive = .{ error.Unexpected, 0 } };
+            },
+            else => return fwd.operate(userdata, operation),
+        }
+    }
+
+    /// 0.16 WriteFileError has no Unimplemented and Threaded 0.16 netWriteFile
+    /// @panics, so the shim performs an internal read/copy for both provenances:
+    /// read from the file reader through its Io.Reader interface, write to the
+    /// socket through the provenance-routed write path (section 8). Never
+    /// forwards to Threaded's panicking slot.
+    fn netWriteFile(userdata: ?*anyopaque, handle: Io.net.Socket.Handle, header: []const u8, reader: *Io.File.Reader, limit: Io.Limit) Io.net.Stream.Writer.WriteFileError!usize {
+        var written: usize = 0;
+        var remaining = limit;
+        if (header.len != 0) {
+            const data: [1][]const u8 = .{header};
+            _ = net016.netWrite(userdata, handle, &.{}, &data, 1) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => return error.Unexpected,
+            };
+            written += header.len;
+            remaining = remaining.subtract(header.len) orelse return written;
+        }
+        var buf: [16384]u8 = undefined;
+        while (remaining.nonzero()) {
+            const slice = remaining.slice(&buf);
+            var data: [1][]u8 = .{slice};
+            const n = reader.interface.readVec(&data) catch |err| switch (err) {
+                error.EndOfStream => break,
+                else => return error.Unexpected,
+            };
+            if (n == 0) break;
+            const wdata: [1][]const u8 = .{slice[0..n]};
+            _ = net016.netWrite(userdata, handle, &.{}, &wdata, 1) catch |err| switch (err) {
+                error.Canceled => return error.Canceled,
+                else => return error.Unexpected,
+            };
+            written += n;
+            remaining = remaining.subtract(n) orelse break;
+        }
+        return written;
+    }
+
+    fn batchSocketHandle(operation: Io.Operation) ?Io.net.Socket.Handle {
+        return switch (operation) {
+            .net_receive => |o| o.socket_handle,
+            else => null,
+        };
+    }
+
+    fn batchUnexpectedResult(operation: Io.Operation) Io.Operation.Result {
+        return switch (operation) {
+            .net_receive => .{ .net_receive = .{ error.Unexpected, 0 } },
+            else => unreachable,
+        };
+    }
+} else struct {};
+
+/// Network slots specific to the 0.17.x interface: netRead/netWrite/netSend/
+/// netReceive are operate tags, netClose takes []const Socket, and netWriteFile
+/// returns declared Unimplemented for both provenances.
+const net017 = if (is_017) struct {
+    fn netClose(userdata: ?*anyopaque, sockets: []const Io.net.Socket) void {
+        const self = shimFrom(userdata);
+        for (sockets) |s| {
+            if (self.lookupBorn(s.handle)) |index| {
+                var op: NetOp = .{ .kind = .close, .sock_index = index, .payload = .{ .close = {} } };
+                self.netCloseWait(&op);
+            } else {
+                const one: [1]Io.net.Socket = .{s};
+                fwd017.netClose(userdata, &one);
+            }
+        }
+    }
+
+    fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
+        const self = shimFrom(userdata);
+        switch (operation) {
+            .net_read => |o| {
+                const index = self.lookupBorn(o.socket_handle) orelse {
+                    if (network_stats_enabled) _ = self.net_stats.threaded_read.fetchAdd(1, .monotonic);
+                    return fwd.operate(userdata, operation);
+                };
+                // Control-buffer I/O is excluded by the stream-only profile.
+                if (o.control.len != 0) return .{ .net_read = error.Unexpected };
+                var op: NetOp = .{ .kind = .read, .sock_index = index, .payload = .{ .read = .{ .data = o.data } } };
+                try self.netWait(&op);
+                if (op.result.err) |e| return .{ .net_read = mapIoError(e) };
+                return .{ .net_read = .{ .data_len = op.result.count } };
+            },
+            .net_write => |o| {
+                const index = self.lookupBorn(o.socket_handle) orelse {
+                    if (network_stats_enabled) _ = self.net_stats.threaded_write.fetchAdd(1, .monotonic);
+                    return fwd.operate(userdata, operation);
+                };
+                if (o.control.len != 0) return .{ .net_write = error.Unexpected };
+                var op: NetOp = .{ .kind = .write, .sock_index = index, .payload = .{ .write = .{ .header = o.header, .data = o.data, .splat = o.splat } } };
+                try self.netWait(&op);
+                if (op.result.err) |e| return .{ .net_write = mapIoError(e) };
+                return .{ .net_write = op.result.count };
+            },
+            .net_send => |o| {
+                if (self.lookupBorn(o.socket_handle) == null) return fwd.operate(userdata, operation);
+                return .{ .net_send = .{ error.Unexpected, 0 } };
+            },
+            .net_receive => |o| {
+                if (self.lookupBorn(o.socket_handle) == null) return fwd.operate(userdata, operation);
+                return .{ .net_receive = .{ error.Unexpected, 0 } };
+            },
+            else => return fwd.operate(userdata, operation),
+        }
+    }
+
+    /// No Born sendfile primitive: declared Unimplemented for both provenances,
+    /// returned before touching the socket. Io.Writer.sendFile catches it and
+    /// re-enters the routed read/write, so the copy still runs on Born for a
+    /// Born-owned handle (section 8).
+    fn netWriteFile(userdata: ?*anyopaque, handle: Io.net.Socket.Handle, header: []const u8, reader: *Io.File.Reader, limit: Io.Limit) Io.net.Stream.Writer.WriteFileError!usize {
+        _ = userdata;
+        _ = handle;
+        _ = header;
+        _ = reader;
+        _ = limit;
+        return error.Unimplemented;
+    }
+
+    fn batchSocketHandle(operation: Io.Operation) ?Io.net.Socket.Handle {
+        return switch (operation) {
+            .net_read => |o| o.socket_handle,
+            .net_write => |o| o.socket_handle,
+            .net_send => |o| o.socket_handle,
+            .net_receive => |o| o.socket_handle,
+            else => null,
+        };
+    }
+
+    fn batchUnexpectedResult(operation: Io.Operation) Io.Operation.Result {
+        return switch (operation) {
+            .net_read => .{ .net_read = error.Unexpected },
+            .net_write => .{ .net_write = error.Unexpected },
+            .net_send => .{ .net_send = .{ error.Unexpected, 0 } },
+            .net_receive => .{ .net_receive = .{ error.Unexpected, 0 } },
+            else => unreachable,
+        };
+    }
+} else struct {};
+
+/// The toolchain-selected network slot implementations.
+const net01x = if (is_017) net017 else net016;
+
+/// The network-route vtable: the baseline with the client-path slots serviced
+/// by Born. Listen/accept, DNS lookup, interface naming and batchCancel keep
+/// their baseline forwarding thunks (Threaded hybrids / no Born drain needed).
+pub const network_vtable: Io.VTable = blk: {
+    var v = baseline_vtable;
+    v.netConnectIp = network_route.netConnectIp;
+    v.netConnectUnix = network_route.netConnectUnix;
+    v.netShutdown = network_route.netShutdown;
+    v.netBindIp = network_route.netBindIp;
+    v.netSocketCreatePair = network_route.netSocketCreatePair;
+    v.netWriteFile = net01x.netWriteFile;
+    v.netClose = net01x.netClose;
+    v.operate = net01x.operate;
+    v.batchAwaitAsync = network_route.batchAwaitAsync;
+    v.batchAwaitConcurrent = network_route.batchAwaitConcurrent;
+    if (!is_017) {
+        v.netRead = net016.netRead;
+        v.netWrite = net016.netWrite;
+        v.netSend = net016.netSend;
+    }
+    break :blk v;
+};
+
+/// Both Born routes active: the network vtable plus the time-route sleep/now.
+pub const time_network_vtable: Io.VTable = blk: {
+    var v = network_vtable;
+    v.sleep = time_route.sleep;
+    v.now = time_route.now;
+    break :blk v;
+};
+
 test "slot identity round-trips through udata" {
     const id = decodeSlotUdata(slotUdata(123, 456));
     try std.testing.expectEqual(@as(u32, 123), id.index);
@@ -1826,4 +3573,647 @@ test "fire-retired slot with a pending cancel entry is not reused" {
     state.retire(&d, true);
     state.retire(&e, true);
     state.retire(&f, true);
+}
+
+// ------------------------------------------- network mechanism units (P5.3) ----
+//
+// These drive the network engine's queue, registry and dispatch mechanics
+// directly (private access), with a real Threaded for the uncancelable mutex
+// and a real EvPort only where a port call is on the path. No loop thread runs:
+// the test steps submit/cancel/retire/drain/fire in the exact race order, the
+// P5.2 M-series pattern. The per-slot behavioral contracts (connect, read/write,
+// close, shutdown, exclusions, counters) live in net_test.zig on real sockets.
+
+/// Publish `count` net-op chunks for network queue-mechanism unit tests,
+/// mirroring construction-time net growth (no loop thread runs).
+fn testNetGrow(state: *Shim, count: usize) !void {
+    var i: usize = 0;
+    while (i < count) : (i += 1) try state.netGrowLocked();
+}
+
+/// Fake handle for registry/dispatch units that never touch a real socket:
+/// an fd integer on POSIX, a raw HANDLE pointer on Windows.
+fn testHandle(n: usize) born.Handle {
+    return if (is_windows) @ptrFromInt(n) else @intCast(n);
+}
+
+test "net submit reports only the empty-to-non-empty transition" {
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    try testNetGrow(&state, 1);
+    defer state.netFreeChunks();
+
+    var a: NetOp = .{ .kind = .read, .payload = .{ .read = .{ .data = &.{} } } };
+    var b: NetOp = .{ .kind = .read, .payload = .{ .read = .{ .data = &.{} } } };
+    const ra = state.netSubmit(&a) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(ra.was_empty);
+    const rb = state.netSubmit(&b) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(!rb.was_empty);
+    try std.testing.expectEqual(&a, state.net_queue.head.?);
+    try std.testing.expectEqual(&b, state.net_queue.tail.?);
+    try std.testing.expectEqual(&b, a.next.?);
+    try std.testing.expectEqual(@as(?*NetOp, null), b.next);
+    try std.testing.expectEqual(@as(u32, 0), a.slot_index);
+    try std.testing.expectEqual(@as(u32, 1), b.slot_index);
+    try std.testing.expectEqual(&a, state.netSlotAt(0).op.?);
+    try std.testing.expectEqual(&b, state.netSlotAt(1).op.?);
+}
+
+test "net cancel request skips a retired slot and refuses a double push" {
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    try testNetGrow(&state, 1);
+    defer state.netFreeChunks();
+
+    const index = try state.netAllocSlotLocked();
+    var op: NetOp = .{ .kind = .read, .slot_index = index, .payload = .{ .read = .{ .data = &.{} } } };
+    state.netSlotAt(index).op = &op;
+    // Occupied: the request pushes and reports the transition.
+    try std.testing.expect(state.netRequestCancel(&op));
+    try std.testing.expectEqual(@as(?u32, index), state.net_cancel_head);
+    // Already linked: a second push must not corrupt the list.
+    try std.testing.expect(!state.netRequestCancel(&op));
+    try std.testing.expectEqual(@as(?u32, index), state.net_cancel_head);
+    // Retired while the entry is pending: the slot is deferred, not freed.
+    state.netRetireLocked(&op, index, true);
+    try std.testing.expectEqual(@as(?*NetOp, null), state.netSlotAt(index).op);
+    try std.testing.expectEqual(@as(?u32, index + 1), state.net_free_head);
+    // The occupancy check refuses a push for the retired occupant.
+    try std.testing.expect(!state.netRequestCancel(&op));
+    // Drain frees the deferred slot and clears the list.
+    _ = state.netDrainLocked();
+    try std.testing.expectEqual(@as(?u32, index), state.net_free_head);
+    try std.testing.expectEqual(@as(?u32, null), state.net_cancel_head);
+    try std.testing.expect(!state.netSlotAt(index).on_cancel_list);
+}
+
+test "net retired slot pending a cancel entry is not reallocated until drained" {
+    // The cancel-drain interleaving: a read completes and retires while its
+    // cancel entry is still queued. A new submit must not take the deferred
+    // slot (that would reset cancel_next and drop the entry); only the drain
+    // frees it for reuse. Deterministic: no loop thread, no socket.
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    try testNetGrow(&state, 1);
+    defer state.netFreeChunks();
+
+    var a: NetOp = .{ .kind = .read, .payload = .{ .read = .{ .data = &.{} } } };
+    const ra = state.netSubmit(&a) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(state.netRequestCancel(&a));
+    state.netRetireLocked(&a, ra.index, true);
+    try std.testing.expect(state.netSlotAt(ra.index).on_cancel_list);
+    try std.testing.expectEqual(@as(?*NetOp, null), state.netSlotAt(ra.index).op);
+
+    // A fresh submit takes a different slot; the deferred one stays off the
+    // free list so its cancel_next is preserved.
+    var b: NetOp = .{ .kind = .read, .payload = .{ .read = .{ .data = &.{} } } };
+    const rb = state.netSubmit(&b) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(rb.index != ra.index);
+    try std.testing.expectEqual(@as(?u32, ra.index), state.net_cancel_head);
+
+    // Drain frees the deferred slot; only now is it reusable.
+    _ = state.netDrainLocked();
+    try std.testing.expect(!state.netSlotAt(ra.index).on_cancel_list);
+    try std.testing.expectEqual(@as(?u32, null), state.net_cancel_head);
+    var c: NetOp = .{ .kind = .read, .payload = .{ .read = .{ .data = &.{} } } };
+    const rc = state.netSubmit(&c) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(ra.index, rc.index);
+}
+
+test "net slot table grows in non-moving chunks up to the ceiling" {
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    defer state.netFreeChunks();
+    try testNetGrow(&state, 1);
+    const first = state.netSlotAt(0);
+    // Exhaust the first chunk: the next allocation grows a second chunk.
+    var last: u32 = 0;
+    var i: usize = 0;
+    while (i < net_slots_per_chunk + 1) : (i += 1) {
+        last = try state.netAllocSlotLocked();
+    }
+    try std.testing.expectEqual(@as(usize, 2), state.net_chunk_count);
+    try std.testing.expectEqual(@as(u32, @intCast(net_slots_per_chunk)), last);
+    // Growth never moved the first chunk's storage.
+    try std.testing.expect(first == state.netSlotAt(0));
+    // Fill to the named ceiling; the next allocation is a resource refusal.
+    while (state.net_chunk_count < max_net_chunks) try state.netGrowLocked();
+    while (state.net_free_head != null) _ = try state.netAllocSlotLocked();
+    try std.testing.expectError(error.OutOfMemory, state.netAllocSlotLocked());
+}
+
+test "registry maps handles to indices and unregisters conditionally" {
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    try state.registryInit();
+    defer state.registryDeinit();
+
+    const h100 = testHandle(100);
+    const h101 = testHandle(101);
+    // A handle absent from the registry is Threaded-owned (lookup miss).
+    try std.testing.expectEqual(@as(?u32, null), state.lookupBorn(h100));
+    const idx0 = try state.sockAllocLocked();
+    const s0 = state.sockAt(idx0).?;
+    s0.generation +%= 1;
+    s0.occupied = true;
+    s0.handle = h100;
+    s0.index = idx0;
+    try state.registerHandle(h100, idx0);
+    try std.testing.expectEqual(@as(?u32, idx0), state.lookupBorn(h100));
+    try std.testing.expectEqual(@as(u32, 1), s0.generation);
+
+    // A second socket takes a different slot with a fresh generation.
+    const idx1 = try state.sockAllocLocked();
+    const s1 = state.sockAt(idx1).?;
+    s1.generation +%= 1;
+    s1.occupied = true;
+    s1.handle = h101;
+    s1.index = idx1;
+    try state.registerHandle(h101, idx1);
+    try std.testing.expect(idx1 != idx0);
+    try std.testing.expectEqual(@as(?u32, idx1), state.lookupBorn(h101));
+    try std.testing.expectEqual(@as(u32, 1), s1.generation);
+
+    // Reusing handle 100 for a newer socket overwrites the mapping; unregistering
+    // the OLD index must not remove the newer entry (stale-fd guard).
+    const idx2 = try state.sockAllocLocked();
+    try state.registerHandle(h100, idx2);
+    try std.testing.expectEqual(@as(?u32, idx2), state.lookupBorn(h100));
+    state.unregisterHandle(h100, idx0); // stale index: no-op
+    try std.testing.expectEqual(@as(?u32, idx2), state.lookupBorn(h100));
+    state.unregisterHandle(h100, idx2); // current index: removed
+    try std.testing.expectEqual(@as(?u32, null), state.lookupBorn(h100));
+
+    // Free returns the slot to the free list and clears occupancy.
+    state.sockFree(s1, idx1);
+    try std.testing.expect(!s1.occupied);
+    try std.testing.expectEqual(@as(?u32, null), state.lookupBorn(h101));
+    try std.testing.expectEqual(@as(?u32, idx1), state.registry.free_head);
+}
+
+test "stale socket events drop without touching the pending op" {
+    // The use-after-free guard for a closed-and-reused fd: an event whose
+    // generation predates the current occupant, whose slot is unoccupied,
+    // whose chunk was never published, or whose index is past the chunk
+    // ceiling must drop before any access to the caller's node or socket.
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    try state.registryInit();
+    defer state.registryDeinit();
+
+    const index = try state.sockAllocLocked();
+    const s = state.sockAt(index).?;
+    s.generation = 7;
+    s.occupied = true;
+    s.index = index;
+    s.handle = testHandle(100);
+    var op: NetOp = .{ .kind = .read, .sock_index = index, .payload = .{ .read = .{ .data = &.{} } } };
+    s.pending_read = &op;
+
+    // Stale generation: the fd was closed and reused for a newer socket.
+    state.socketEvent(.{ .udata = slotUdata(index, 6), .readable = true });
+    try std.testing.expectEqual(@as(u32, 0), op.state.load(.monotonic));
+    try std.testing.expectEqual(&op, s.pending_read.?);
+    // Unoccupied slot: retirement already freed it.
+    s.occupied = false;
+    state.socketEvent(.{ .udata = slotUdata(index, 7), .readable = true });
+    try std.testing.expectEqual(@as(u32, 0), op.state.load(.monotonic));
+    s.occupied = true;
+    // Unpublished chunk (index 99 lives in chunk 6, never grown).
+    state.socketEvent(.{ .udata = slotUdata(99, 7), .readable = true });
+    try std.testing.expectEqual(@as(u32, 0), op.state.load(.monotonic));
+    // Index past the chunk ceiling (sockAt's bounds guard drops it).
+    state.socketEvent(.{ .udata = slotUdata(max_sock_chunks * sock_per_chunk, 7), .readable = true });
+    try std.testing.expectEqual(@as(u32, 0), op.state.load(.monotonic));
+    // The live op is still pending and untouched throughout.
+    try std.testing.expectEqual(&op, s.pending_read.?);
+}
+
+test "connect deadline fire retires Timeout and frees the socket (POSIX)" {
+    // Windows timeout is an explicit completion drain (5.2), covered by the
+    // Windows drain unit below; this unit covers the POSIX purge-before-deinit
+    // retire on a real unconnected socket.
+    if (is_windows) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    state.port = &port;
+    try testNetGrow(&state, 1);
+    defer state.netFreeChunks();
+    try state.registryInit();
+    defer state.registryDeinit();
+
+    // A real unconnected non-blocking socket: sockRetire purges and closes it.
+    const fd = try compat.socket(compat.AF.INET, compat.SOCK.STREAM | compat.SOCK.NONBLOCK | compat.SOCK.CLOEXEC, 0);
+    const index = try state.sockAllocLocked();
+    const s = state.sockAt(index).?;
+    s.generation +%= 1;
+    s.occupied = true;
+    s.index = index;
+    s.handle = fd;
+    s.plain.sock = fd;
+    try state.registerHandle(fd, index);
+
+    var op: NetOp = .{ .kind = .connect, .sock_index = index, .payload = .{ .connect = .{ .target = .{ .ip = .{ .in = .{ .port = 0, .addr = 0 } } } } } };
+    op.slot_index = try state.netAllocSlotLocked();
+    state.netSlotAt(op.slot_index).op = &op;
+    s.pending_connect = &op;
+    // Arm a real far-future deadline timer so the retire path cancels it.
+    try port.addTimer(net_timer_id_base + op.slot_index, netTimerUdata(index, s.generation), 60_000, .once);
+    s.deadline_armed = true;
+
+    // The deadline fires: Timeout retire (not canceled), socket closed and
+    // unregistered, slot freed, deadline disarmed.
+    try std.testing.expect(state.connectDeadlineFired(netTimerUdata(index, s.generation)));
+    try std.testing.expectEqual(@as(?NetError, .timeout), op.result.err);
+    try std.testing.expectEqual(@as(u32, 1), op.state.load(.acquire));
+    try std.testing.expect(!op.outcome_canceled);
+    try std.testing.expect(!s.occupied);
+    try std.testing.expectEqual(@as(?u32, null), state.lookupBorn(fd));
+    try std.testing.expectEqual(@as(compat.fd_t, -1), s.plain.sock);
+    try std.testing.expectEqual(@as(?*NetOp, null), s.pending_connect);
+    try std.testing.expect(!s.deadline_armed);
+
+    // A stale deadline fire for the freed slot is dropped by the network path:
+    // the tag bit is decisive, so loopMain never forwards it to timerFired.
+    try std.testing.expect(!state.connectDeadlineFired(netTimerUdata(index, s.generation)));
+}
+
+test "connect deadline fire drains the pending ConnectEx before freeing (Windows)" {
+    // Windows timeout is an explicit completion drain (5.2): cancelAndClose
+    // aborts the in-flight ConnectEx, but the stable SocketState must stay
+    // occupied until that completion is absorbed. No loop thread runs here, so
+    // the completion waits in the IOCP queue and the drain is driven manually
+    // through socketEvent. Freeing the slot unconditionally (the should-fix 2
+    // mutation) leaves the aborted completion unabsorbed and fails the
+    // occupied assertion below.
+    if (!is_windows) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    state.port = &port;
+    try testNetGrow(&state, 1);
+    defer state.netFreeChunks();
+    try state.registryInit();
+    defer state.registryDeinit();
+
+    // A real loopback listener: ConnectEx posts (pending or inline) and its
+    // completion stays queued because nothing dequeues it before the deadline.
+    const fio = state.threaded_io;
+    const listen: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try listen.listen(fio, .{});
+    defer server.deinit(fio);
+    const target_std: Io.net.IpAddress = .{ .ip4 = .loopback(server.socket.address.ip4.port) };
+    const target = ipToBorn(&target_std);
+
+    const index = try state.sockAllocLocked();
+    const s = state.sockAt(index).?;
+    s.generation +%= 1;
+    s.occupied = true;
+    s.closing = false;
+    s.index = index;
+    s.pending_connect = null;
+    s.pending_read = null;
+    s.pending_write = null;
+    s.read_armed = false;
+    s.write_armed = false;
+    s.deadline_armed = false;
+    s.plain = .{};
+    const udata = slotUdata(index, s.generation);
+    try s.plain.startConnectAddrInto(target, &port, udata);
+    s.handle = s.plain.handle();
+    try state.registerHandle(s.handle, index);
+    try std.testing.expectEqual(@as(usize, 1), s.plain.pendingOps());
+
+    var op: NetOp = .{ .kind = .connect, .sock_index = index, .payload = .{ .connect = .{ .target = .{ .ip = target } } } };
+    op.slot_index = try state.netAllocSlotLocked();
+    state.netSlotAt(op.slot_index).op = &op;
+    s.pending_connect = &op;
+    try port.addTimer(net_timer_id_base + op.slot_index, netTimerUdata(index, s.generation), 60_000, .once);
+    s.deadline_armed = true;
+
+    // The deadline fires while ConnectEx is pending: Timeout retire (not
+    // canceled), cancel/close, deadline disarmed, but the slot stays occupied
+    // until the completion drains.
+    try std.testing.expect(state.connectDeadlineFired(netTimerUdata(index, s.generation)));
+    try std.testing.expectEqual(@as(?NetError, .timeout), op.result.err);
+    try std.testing.expectEqual(@as(u32, 1), op.state.load(.acquire));
+    try std.testing.expect(!op.outcome_canceled);
+    try std.testing.expect(s.closing);
+    try std.testing.expectEqual(@as(?*NetOp, null), s.pending_connect);
+    try std.testing.expect(!s.deadline_armed);
+    try std.testing.expect(s.occupied);
+    try std.testing.expectEqual(@as(usize, 1), s.plain.pendingOps());
+    // Required 1: the handle mapping is dropped BEFORE the drain completes, so
+    // a reused SOCKET value opened by another thread never resolves to this
+    // dying slot even while it is still occupied/closing.
+    try std.testing.expectEqual(@as(?u32, null), state.lookupBorn(s.handle));
+
+    // Drain the aborted completion through the real event path; the slot is
+    // freed only once pendingOps() reaches zero.
+    var events: [8]born.Event = undefined;
+    var guard: u32 = 0;
+    while (s.occupied and guard < 100) : (guard += 1) {
+        const n = try port.wait(&events, 100);
+        for (events[0..n]) |ev| {
+            if (ev.timer or ev.wake) continue;
+            state.socketEvent(ev);
+        }
+    }
+    try std.testing.expect(!s.occupied);
+    try std.testing.expectEqual(@as(usize, 0), s.plain.pendingOps());
+    try std.testing.expectEqual(@as(?u32, null), state.lookupBorn(s.handle));
+}
+
+test "registryCloseAll drains two sockets' completions to their owners (Windows)" {
+    // Required 2: the exit drain must route each completion to its OWN socket.
+    // Socket B has a completed recv queued (the peer sent a byte) while socket
+    // A's recv is still pending. The old per-socket polled drain fed every
+    // completion to one socket's absorbCompletion, dropping B's, so B freed with
+    // pendingOps != 0 after a 100 s guard. The two-phase drain (cancel all, then
+    // dispatch through socketEvent with no timeout) frees both promptly.
+    if (!is_windows) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    state.port = &port;
+    try testNetGrow(&state, 1);
+    defer state.netFreeChunks();
+    try state.registryInit();
+    defer state.registryDeinit();
+
+    const fio = state.threaded_io;
+    const listen: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try listen.listen(fio, .{});
+    defer server.deinit(fio);
+    const target_std: Io.net.IpAddress = .{ .ip4 = .loopback(server.socket.address.ip4.port) };
+    const target = ipToBorn(&target_std);
+
+    var idx: [2]u32 = undefined;
+    var peers: [2]Io.net.Stream = undefined;
+    for (&idx, 0..) |*index, i| {
+        index.* = try state.sockAllocLocked();
+        const s = state.sockAt(index.*).?;
+        s.generation +%= 1;
+        s.occupied = true;
+        s.closing = false;
+        s.index = index.*;
+        s.pending_connect = null;
+        s.pending_read = null;
+        s.pending_write = null;
+        s.read_armed = false;
+        s.write_armed = false;
+        s.deadline_armed = false;
+        try s.plain.startConnectAddrInto(target, &port, slotUdata(index.*, s.generation));
+        s.handle = s.plain.handle();
+        try state.registerHandle(s.handle, index.*);
+        peers[i] = try server.accept(fio);
+        // Absorb the connect completion (no loop thread runs), confirm, then
+        // post a WSARecv that stays pending until data or cancellation.
+        var events: [8]born.Event = undefined;
+        var guard: u32 = 0;
+        while (!s.plain.connect_done and guard < 100) : (guard += 1) {
+            const n = try port.wait(&events, 100);
+            for (events[0..n]) |ev| {
+                if (ev.timer or ev.wake) continue;
+                state.socketEvent(ev);
+            }
+        }
+        try s.plain.connectDone();
+        var buf: [1]u8 = undefined;
+        _ = try s.plain.readNb(&buf); // posts WSARecv into the internal buffer
+        try std.testing.expectEqual(@as(usize, 1), s.plain.pendingOps());
+    }
+    defer peers[0].close(fio);
+    defer peers[1].close(fio);
+
+    // Send a byte to socket B's peer: its recv completes into the IOCP queue,
+    // undrained. Socket A's recv stays pending. Use the Threaded peer's writer
+    // (a Threaded handle is not a born.Handle, so compatSock would mis-cast it).
+    var pbuf: [8]u8 = undefined;
+    var pwriter = peers[1].writer(fio, &pbuf);
+    try pwriter.interface.writeAll("x");
+    try pwriter.interface.flush();
+    try Io.sleep(fio, .fromMilliseconds(50), .awake);
+
+    const t0 = try born.nowNs();
+    state.registryCloseAll();
+    const elapsed = (try born.nowNs()) - t0;
+    // Prompt drain: the old code waited out a 100 s guard on socket B.
+    try std.testing.expect(elapsed < 2 * std.time.ns_per_s);
+    for (idx) |index| {
+        const s = state.sockAt(index).?;
+        try std.testing.expect(!s.occupied);
+        try std.testing.expectEqual(@as(usize, 0), s.plain.pendingOps());
+        try std.testing.expectEqual(@as(?u32, null), state.lookupBorn(s.handle));
+    }
+}
+
+test "net submit refusal and loop-exit retirement distinguish route_dead from canceled" {
+    // Required 3: a dead route is not the caller's cancellation. A submit
+    // refusal completes the op with route_dead, and a failure exit retires
+    // queued ops as route_dead (both map to Unexpected); a stop request or an
+    // op whose submitter requested cancellation stays canceled.
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    try testNetGrow(&state, 1);
+    defer state.netFreeChunks();
+    try state.registryInit();
+    defer state.registryDeinit();
+
+    // Submit refusal (dead queue): netWait returns normally with route_dead.
+    state.net_queue.dead = true;
+    var refused: NetOp = .{ .kind = .read, .payload = .{ .read = .{ .data = &.{} } } };
+    try state.netWait(&refused);
+    try std.testing.expectEqual(@as(?NetError, .route_dead), refused.result.err);
+    try std.testing.expect(!refused.outcome_canceled);
+    try std.testing.expectEqual(error.Unexpected, mapIoError(.route_dead));
+    try std.testing.expectEqual(error.Unexpected, mapConnectIpError(.route_dead));
+    try std.testing.expectEqual(error.Unexpected, mapConnectUnixError(.route_dead));
+
+    // Failure exit (stopped=false): a queued op retires as route_dead.
+    state.net_queue.dead = false;
+    var q1: NetOp = .{ .kind = .read, .payload = .{ .read = .{ .data = &.{} } } };
+    _ = state.netSubmit(&q1).?;
+    state.netRetireAll(false);
+    try std.testing.expectEqual(@as(?NetError, .route_dead), q1.result.err);
+    try std.testing.expect(!q1.outcome_canceled);
+    try std.testing.expectEqual(@as(u32, 1), q1.state.load(.acquire));
+
+    // Stop request (stopped=true): a queued op retires as canceled.
+    state.net_queue.dead = false;
+    var q2: NetOp = .{ .kind = .read, .payload = .{ .read = .{ .data = &.{} } } };
+    _ = state.netSubmit(&q2).?;
+    state.netRetireAll(true);
+    try std.testing.expect(q2.outcome_canceled);
+    try std.testing.expectEqual(@as(?NetError, null), q2.result.err);
+
+    // A submitter-requested cancellation stays canceled even on a failure exit.
+    state.net_queue.dead = false;
+    var q3: NetOp = .{ .kind = .read, .payload = .{ .read = .{ .data = &.{} } } };
+    _ = state.netSubmit(&q3).?;
+    q3.cancel_requested.store(true, .release);
+    state.netRetireAll(false);
+    try std.testing.expect(q3.outcome_canceled);
+    try std.testing.expectEqual(@as(?NetError, null), q3.result.err);
+}
+
+test "concurrent read or write on a parked op is rejected busy, not orphaned" {
+    // Minor 8: a second concurrent read/write must not overwrite the parked
+    // pending pointer (which would orphan the first op and hang its submitter).
+    // It retires busy (mapped to Unexpected); the parked op stays pending.
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    try testNetGrow(&state, 1);
+    defer state.netFreeChunks();
+    try state.registryInit();
+    defer state.registryDeinit();
+
+    const index = try state.sockAllocLocked();
+    const s = state.sockAt(index).?;
+    s.generation +%= 1;
+    s.occupied = true;
+    s.index = index;
+    s.handle = testHandle(100);
+
+    var parked: NetOp = .{ .kind = .read, .sock_index = index, .payload = .{ .read = .{ .data = &.{} } } };
+    parked.slot_index = try state.netAllocSlotLocked();
+    state.netSlotAt(parked.slot_index).op = &parked;
+    s.pending_read = &parked;
+
+    var second: NetOp = .{ .kind = .read, .sock_index = index, .payload = .{ .read = .{ .data = &.{} } } };
+    second.slot_index = try state.netAllocSlotLocked();
+    state.netSlotAt(second.slot_index).op = &second;
+    state.readDrive(&second);
+    try std.testing.expectEqual(@as(?NetError, .busy), second.result.err);
+    try std.testing.expectEqual(@as(u32, 1), second.state.load(.acquire));
+    try std.testing.expectEqual(error.Unexpected, mapIoError(.busy));
+    // The parked read is untouched: still pending, not retired.
+    try std.testing.expectEqual(&parked, s.pending_read.?);
+    try std.testing.expectEqual(@as(u32, 0), parked.state.load(.monotonic));
+
+    // Same guard for a concurrent write.
+    s.pending_read = null;
+    var wparked: NetOp = .{ .kind = .write, .sock_index = index, .payload = .{ .write = .{ .header = &.{}, .data = &.{}, .splat = 0 } } };
+    wparked.slot_index = try state.netAllocSlotLocked();
+    state.netSlotAt(wparked.slot_index).op = &wparked;
+    s.pending_write = &wparked;
+    var wsecond: NetOp = .{ .kind = .write, .sock_index = index, .payload = .{ .write = .{ .header = &.{}, .data = &.{}, .splat = 0 } } };
+    wsecond.slot_index = try state.netAllocSlotLocked();
+    state.netSlotAt(wsecond.slot_index).op = &wsecond;
+    state.writeDrive(&wsecond);
+    try std.testing.expectEqual(@as(?NetError, .busy), wsecond.result.err);
+    try std.testing.expectEqual(&wparked, s.pending_write.?);
+    try std.testing.expectEqual(@as(u32, 0), wparked.state.load(.monotonic));
+}
+
+test "batch partition detaches Born members with tag Unexpected, keeps Threaded" {
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    try state.registryInit();
+    defer state.registryDeinit();
+
+    // Register a Born-owned handle; the peer handle stays Threaded-owned.
+    // batchPartitionBorn only does a registry lookup and builds the tag result,
+    // so the handles need not be live sockets.
+    const born_h = testHandle(200);
+    const peer_h = testHandle(201);
+    const bi = try state.sockAllocLocked();
+    const bs = state.sockAt(bi).?;
+    bs.occupied = true;
+    bs.handle = born_h;
+    bs.index = bi;
+    try state.registerHandle(born_h, bi);
+    try std.testing.expect(state.lookupBorn(born_h) != null);
+    try std.testing.expectEqual(@as(?u32, null), state.lookupBorn(peer_h));
+
+    var storage: [2]Io.Operation.Storage = undefined;
+    var batch: Io.Batch = .init(&storage);
+    var bbuf: [4]u8 = undefined;
+    var pbuf: [4]u8 = undefined;
+    var biov = [_][]u8{bbuf[0..]};
+    var piov = [_][]u8{pbuf[0..]};
+    const born_idx = batch.add(if (is_017)
+        .{ .net_read = .{ .socket_handle = born_h, .data = &biov } }
+    else
+        .{ .net_receive = .{ .socket_handle = born_h, .message_buffer = &.{}, .data_buffer = &.{}, .flags = .{} } });
+    const peer_idx = batch.add(if (is_017)
+        .{ .net_read = .{ .socket_handle = peer_h, .data = &piov } }
+    else
+        .{ .net_receive = .{ .socket_handle = peer_h, .message_buffer = &.{}, .data_buffer = &.{}, .flags = .{} } });
+
+    try std.testing.expect(state.batchPartitionBorn(&batch));
+    // The Born member moved to completed with its tag Unexpected; the peer
+    // member alone remains submitted for the forwarded Threaded await.
+    try std.testing.expectEqual(peer_idx, batch.submitted.head.toIndex());
+    try std.testing.expect(batch.storage[peer_idx].submission.node.next == .none);
+    try std.testing.expectEqual(born_idx, batch.completed.head.toIndex());
+    try std.testing.expect(batch.storage[born_idx].completion.node.next == .none);
+    if (is_017) {
+        try std.testing.expectError(error.Unexpected, batch.storage[born_idx].completion.result.net_read);
+    } else {
+        try std.testing.expectEqual(@as(?Io.net.Socket.ReceiveError, error.Unexpected), batch.storage[born_idx].completion.result.net_receive[0]);
+    }
+    // A second pass finds no Born member and leaves the batch unchanged.
+    try std.testing.expect(!state.batchPartitionBorn(&batch));
+    try std.testing.expectEqual(peer_idx, batch.submitted.head.toIndex());
+}
+
+test "coarse error maps cover every section 8 row" {
+    const IoMapErr = error{ ConnectionResetByPeer, Unexpected };
+    const IpErr = Io.net.IpAddress.ConnectError;
+    const UnixErr = Io.net.UnixAddress.ConnectError;
+    const ShErr = Io.net.ShutdownError;
+
+    // Read/write map: a failed read/write becomes ConnectionResetByPeer;
+    // anything else (including the synthetic cancel/route-dead tags) Unexpected.
+    try std.testing.expectEqual(@as(IoMapErr, error.ConnectionResetByPeer), mapIoError(.read_failed));
+    try std.testing.expectEqual(@as(IoMapErr, error.ConnectionResetByPeer), mapIoError(.write_failed));
+    try std.testing.expectEqual(@as(IoMapErr, error.Unexpected), mapIoError(.canceled));
+    try std.testing.expectEqual(@as(IoMapErr, error.Unexpected), mapIoError(.route_dead));
+    try std.testing.expectEqual(@as(IoMapErr, error.Unexpected), mapIoError(.timeout));
+
+    // IP connect map.
+    try std.testing.expectEqual(@as(IpErr, error.ConnectionRefused), mapConnectIpError(.connect_refused));
+    try std.testing.expectEqual(@as(IpErr, error.SystemResources), mapConnectIpError(.connect_setup));
+    try std.testing.expectEqual(@as(IpErr, error.Unexpected), mapConnectIpError(.connect_state));
+    try std.testing.expectEqual(@as(IpErr, error.Timeout), mapConnectIpError(.timeout));
+    try std.testing.expectEqual(@as(IpErr, error.Unexpected), mapConnectIpError(.route_dead));
+
+    // Unix connect map: 0.16's ConnectError lacks ConnectionRefused, so a
+    // refusal degrades to Unexpected there (mirrors Threaded 0.16); 0.17 has it.
+    if (is_017) {
+        try std.testing.expectEqual(@as(UnixErr, error.ConnectionRefused), mapConnectUnixError(.unix_refused));
+    } else {
+        try std.testing.expectEqual(@as(UnixErr, error.Unexpected), mapConnectUnixError(.unix_refused));
+    }
+    try std.testing.expectEqual(@as(UnixErr, error.SystemResources), mapConnectUnixError(.unix_setup));
+    try std.testing.expectEqual(@as(UnixErr, error.FileNotFound), mapConnectUnixError(.unix_name_too_long));
+    try std.testing.expectEqual(@as(UnixErr, error.WouldBlock), mapConnectUnixError(.unix_backlog_full));
+    try std.testing.expectEqual(@as(UnixErr, error.AddressFamilyUnsupported), mapConnectUnixError(.unix_unsupported));
+    try std.testing.expectEqual(@as(UnixErr, error.Unexpected), mapConnectUnixError(.connect_refused));
+
+    // Shutdown map: compat's richer set folded into std ShutdownError.
+    try std.testing.expectEqual(@as(ShErr, error.ConnectionAborted), mapShutdownError(error.ConnectionAborted));
+    try std.testing.expectEqual(@as(ShErr, error.ConnectionResetByPeer), mapShutdownError(error.ConnectionResetByPeer));
+    try std.testing.expectEqual(@as(ShErr, error.SocketUnconnected), mapShutdownError(error.SocketNotConnected));
+    try std.testing.expectEqual(@as(ShErr, error.NetworkDown), mapShutdownError(error.NetworkSubsystemFailed));
+    try std.testing.expectEqual(@as(ShErr, error.SystemResources), mapShutdownError(error.SystemResources));
+    try std.testing.expectEqual(@as(ShErr, error.Unexpected), mapShutdownError(error.BlockingOperationInProgress));
+    try std.testing.expectEqual(@as(ShErr, error.Unexpected), mapShutdownError(error.Unexpected));
 }

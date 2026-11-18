@@ -29,12 +29,9 @@ test "io rejects an unimplemented Born route at construction" {
     defer port.deinit();
 
     // No silent fallback: a Born route that is not implemented is a
-    // construction error, not a delegation to Threaded. The time route is
-    // implemented (P5.2) and exercised in time_test.zig.
-    try std.testing.expectError(error.CapabilityUnsupported, born_io.io(&port, .{
-        .allocator = std.testing.allocator,
-        .capabilities = .{ .network = .born_evented },
-    }));
+    // construction error, not a delegation to Threaded. The time route (P5.2)
+    // and the network client route (P5.3) are implemented and exercised in
+    // time_test.zig / net_test.zig; file and process remain rejected.
     try std.testing.expectError(error.CapabilityUnsupported, born_io.io(&port, .{
         .allocator = std.testing.allocator,
         .capabilities = .{ .file = .born_evented },
@@ -43,6 +40,30 @@ test "io rejects an unimplemented Born route at construction" {
         .allocator = std.testing.allocator,
         .capabilities = .{ .process = .born_evented },
     }));
+}
+
+test "network Born route constructs with the network vtable and deinits" {
+    if (@import("builtin").single_threaded) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+
+    const interface = try born_io.io(&port, .{
+        .allocator = std.testing.allocator,
+        .capabilities = .{ .network = .born_evented },
+    });
+    defer born_io.deinit(interface);
+    try std.testing.expect(std.meta.eql(interface.vtable.*, born_io.network_vtable));
+
+    // Both routes active select the combined vtable. A second port is required:
+    // each Born interface owns the loop thread driving its port.
+    var port2 = try born.EvPort.init(std.testing.allocator);
+    defer port2.deinit();
+    const both = try born_io.io(&port2, .{
+        .allocator = std.testing.allocator,
+        .capabilities = .{ .time = .born_evented, .network = .born_evented },
+    });
+    defer born_io.deinit(both);
+    try std.testing.expect(std.meta.eql(both.vtable.*, born_io.time_network_vtable));
 }
 
 test "baseline io constructs, delegates to Threaded, and deinits" {
