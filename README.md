@@ -81,6 +81,15 @@ OS per primitive, and lists real runs only.
 | kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io network route, route_dead vs canceled retirement (mutation proof) | the retirement unit and loop-death integration test pass clean; forcing a failure exit to report canceled fails both (75 passed, 5 skipped, 2 failed); reverted, green again | 2026-11-17 | [068212d](https://pacyworld.dev/pacyworld/born/commit/068212d7e73ee0bb4e8c02bdee15ac8c86f314eb) |
 | IOCP, Windows 11 build 26100.6901 (manual host) | born.io network route, two-socket exit drain (mutation proof) | the two-socket drain unit passes clean; reverting registryCloseAll to the per-socket polled drain fails its prompt-drain bound (73 passed, 8 skipped, 1 failed); reverted, green again | 2026-11-17 | [068212d](https://pacyworld.dev/pacyworld/born/commit/068212d7e73ee0bb4e8c02bdee15ac8c86f314eb) |
 | IOCP, Windows 11 build 26100.6901 (manual host) | born.io network route, connect-deadline drain (mutation proof) | the Windows drain unit passes clean; the unconditional slot-free mutation in connectDeadlineFired fails exactly that unit (67 passed, 6 skipped, 1 failed); reverted, green again | 2026-11-17 | [cfe247d](https://pacyworld.dev/pacyworld/born/commit/cfe247d2d92b3442e1262ba2235d458fcdc718bc) |
+| kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io process route (spawn, wait, kill, PATH, stdio pipes) | born-io-tests Debug and ReleaseSafe on Zig 0.16.0 and 0.17.1: 121 passed, 6 skipped, 0 failed each; includes the late-arm NOTE_EXIT flush delivery and dead-loop wait6 reap units | 2026-11-18 | [cdb973c](https://pacyworld.dev/pacyworld/born/commit/cdb973c6859c76e1c5c2488823eeac4ee801f04c) |
+| kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io process route, default config (stats off) | born-io-tests-default Debug and ReleaseSafe on Zig 0.16.0: 121 passed, 6 skipped, 0 failed each; the counters test skips and the zero-contract test passes | 2026-11-18 | [cdb973c](https://pacyworld.dev/pacyworld/born/commit/cdb973c6859c76e1c5c2488823eeac4ee801f04c) |
+| epoll, Linux 7.0.0-34-generic x86_64 (manual host) | born.io process route (spawn, wait, kill, PATH, stdio pipes) | born-io-tests Debug and ReleaseSafe on Zig 0.16.0 and 0.17.1: 120 passed, 7 skipped, 0 failed each; the half-duplex pipe orientation tests run here | 2026-11-18 | [cdb973c](https://pacyworld.dev/pacyworld/born/commit/cdb973c6859c76e1c5c2488823eeac4ee801f04c) |
+| kqueue, macOS 26.1 arm64 (manual host) | born.io process route construction rejection, all-Threaded baseline | born-io-tests ReleaseSafe on Zig 0.16.0: 77 passed, 50 skipped, 0 failed; on 0.17.1: 77 passed, 48 skipped, 0 failed; capabilities.process = .born_evented rejects at construction, the process tests skip, the P5.3 baseline is unchanged | 2026-11-18 | [cdb973c](https://pacyworld.dev/pacyworld/born/commit/cdb973c6859c76e1c5c2488823eeac4ee801f04c) |
+| kqueue, NetBSD 10.1 amd64 (manual host) | born.io process route construction rejection, all-Threaded baseline (pipe wake) | born-io-tests ReleaseSafe on Zig 0.16.0: 77 passed, 50 skipped, 0 failed; capabilities.process = .born_evented rejects at construction, the process tests skip, the P5.3 baseline is unchanged | 2026-11-18 | [cdb973c](https://pacyworld.dev/pacyworld/born/commit/cdb973c6859c76e1c5c2488823eeac4ee801f04c) |
+| IOCP, Windows 11 build 26100.6901 (manual host) | born.io process route construction rejection, all-Threaded baseline | born-io-tests.exe ReleaseSafe on Zig 0.16.0 and 0.17.1 over OpenSSH: 74 passed, 53 skipped, 0 failed each; capabilities.process = .born_evented rejects at construction, the process tests skip, the P5.3 baseline is unchanged | 2026-11-18 | [cdb973c](https://pacyworld.dev/pacyworld/born/commit/cdb973c6859c76e1c5c2488823eeac4ee801f04c) |
+| kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io process route, process tag attribution (mutation proof) | the tag-attribution units pass clean; stripping proc_udata_bit from procUdata fails the udata round-trip unit (null udata crash), cross-route attribution, arm-refusal and stolen-reap units (117 passed, 6 skipped, 3 failed, 1 crashed); reverted, green again | 2026-11-18 | [cdb973c](https://pacyworld.dev/pacyworld/born/commit/cdb973c6859c76e1c5c2488823eeac4ee801f04c) |
+| kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io process route, abandon-on-cancel (mutation proof) | the abandon unit and contract tests pass clean; kill-on-cancel (SIGKILL plus blocking reap in abandonWait) fails the abandon unit and both abandon contract tests (118 passed, 6 skipped, 3 failed); reverted, green again | 2026-11-18 | [cdb973c](https://pacyworld.dev/pacyworld/born/commit/cdb973c6859c76e1c5c2488823eeac4ee801f04c) |
+| kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io process route, synchronous arm confirmation (mutation proof) | the arm-refusal unit passes clean; retiring arms before the flush confirmation fails exactly that unit (120 passed, 6 skipped, 1 failed); reverted, green again | 2026-11-18 | [cdb973c](https://pacyworld.dev/pacyworld/born/commit/cdb973c6859c76e1c5c2488823eeac4ee801f04c) |
 
 Commit 3ed3785 changes only the CI workflow; its library and tests are
 those of master d1017b8. Skips identify platform exclusions or primitives
@@ -114,6 +123,27 @@ exit drain (Windows) at 068212d, and the connect-deadline drain at
 cfe247d; each mutant fails only its targeted tests and the reverted tree
 is green again. The CI rows record run 314 at 068212d; the commit adding
 these rows changes only this README.
+
+The born.io process rows record the P5.4 process route: spawn, wait and
+kill through born.process process descriptors (FreeBSD) and pidfds (Linux)
+watched on Born's EvPort, shim-side PATH resolution, the stdio pipe hybrid,
+the chunked child registry, abandon-on-cancel, the recycled-pid guard,
+cross-route error attribution, synchronous arm confirmation, the late-arm
+flush delivery and the dead-loop wait6/waitid reap. The route is FreeBSD
+and Linux only; macOS, NetBSD and Windows reject capabilities.process =
+.born_evented at construction (CapabilityUnsupported), and their rows
+record the unchanged all-Threaded baseline: the 45 process tests (20
+mechanism units, 25 contract tests) skip there, leaving the P5.3 pass
+counts (77 on macOS and NetBSD, 74 on Windows). FreeBSD and Linux skip the
+zero-contract test when stats are on; the default-config run skips the
+counters test and passes the zero-contract test instead. Linux also skips
+the kqueue-only time loop-death test. Child piped stdio is an explicit
+Threaded hybrid: the parent pipe ends are Threaded-serviced file I/O and
+are not claimed by the per-route counters. The mutation rows record three
+revert experiments at cdb973c: the process tag strip, kill-on-cancel and
+the arm retire-before-flush-confirm; each mutant fails only its targeted
+tests and the reverted tree is green again. The commit adding these rows
+changes only this README; its library, tests and CI are those of cdb973c.
 
 ## Programming model
 
