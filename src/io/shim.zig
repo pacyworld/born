@@ -108,8 +108,11 @@
 //! confirmation (spawn parks it until the loop confirms the exit watch), a
 //! cancelable exit wait (cancellation abandons the wait; the child stays
 //! registered and shim-owned until kill or deinit), and an uncancelable kill
-//! drain (caller SIGTERM, then watch teardown, platform reap, descriptor and
-//! pipe close, slot release, all on the loop). One `proc_queue` mutex
+//! drain (caller SIGTERM, then watch teardown, platform reap, descriptor
+//! close and slot release on the loop). The caller's `Child` fields are the
+//! sole owners of the parent pipe ends after spawn returns (review R1); the
+//! wait/kill thunks close and null them on the caller thread, never the
+//! loop. One `proc_queue` mutex
 //! protects the submission queue, the proc-op slot table and the child
 //! registry (pid map plus non-moving chunks). `proc_udata_bit` (bit 16) tags
 //! child-registry udata so a failed registration (no filter information)
@@ -582,7 +585,9 @@ const ProcSlotChunk = struct {
 /// pid map are proc queue mutex protected; the pending-op pointers, the
 /// exit latch and the watch flags are loop-only. `generation` is bumped
 /// when the slot is handed to a new child so a stale exit event for a
-/// closed-and-reused descriptor is dropped.
+/// closed-and-reused descriptor is dropped. The std `Child` fields returned
+/// to the caller are the sole owners of the parent pipe ends (review R1);
+/// the registry holds only the descriptor and pid, never the stdio ends.
 const ChildState = struct {
     // The handle sentinel is platform-typed: -1 on the process-supported
     // POSIX targets, undefined elsewhere (the field is dead storage there and
@@ -593,10 +598,6 @@ const ChildState = struct {
     next_free: ?u32 = null,
     /// Registry index of this slot, set at reservation.
     index: u32 = 0,
-    /// Parent-side pipe ends the shim created (null = inherit/ignore/file).
-    stdin_pipe: ?compat.fd_t = null,
-    stdout_pipe: ?compat.fd_t = null,
-    stderr_pipe: ?compat.fd_t = null,
     /// Parked uncancelable arm confirmation (at most one).
     pending_arm: ?*ProcOp = null,
     /// Parked cancelable exit wait (at most one).
@@ -936,6 +937,11 @@ pub const Shim = struct {
     /// FreeBSD staged-arm confirmation list: arm ops whose EV_ADD is staged
     /// and awaits the zero-timeout flush. Loop-only.
     proc_arm_head: ?*ProcOp = null,
+
+    /// Test-only fault injection: when true, the next arm flush reports a
+    /// wait failure without touching the port (review R2 flush-failure
+    /// unit). Reset by the flush; never set outside tests.
+    test_flush_fault: bool = false,
 
     /// Per-route process counters, fed by the loop on Born-route completions
     /// and by the thunks on Threaded forwards; read via `processStats`.
@@ -2364,10 +2370,12 @@ pub const Shim = struct {
     /// child on both OSes and reaps per platform (Linux hands a still-exiting
     /// child to the background reaper, so this does not block on exits). The
     /// loop is dead, so no next submission can apply a staged entry; purgeFd
-    /// only drops changelist state and is safe without a driver.
+    /// only drops changelist state and is safe without a driver. The caller's
+    /// `Child` still owns any parent pipe ends (review R1); deinit never
+    /// closes them.
     fn childRegistryCloseAll(self: *Shim) void {
         // Dead on targets without the process route: no child is ever
-        // registered there, and the POSIX-only pipe close would not compile.
+        // registered there.
         if (comptime !process_supported) return;
         var ci: usize = 0;
         while (ci < self.child_registry.chunk_count) : (ci += 1) {
@@ -2377,18 +2385,12 @@ pub const Shim = struct {
                 self.proc_queue.mutex.lockUncancelable(self.threaded_io);
                 const handle = child.child.handle;
                 const pid = child.child.pid;
-                const stdin_pipe = child.stdin_pipe;
-                const stdout_pipe = child.stdout_pipe;
-                const stderr_pipe = child.stderr_pipe;
                 if (!child.abandoned) _ = self.child_registry.map.fetchRemove(pid);
                 self.childFreeLocked(child.index);
                 self.proc_queue.mutex.unlock(self.threaded_io);
                 self.port.purgeFd(handle);
                 var dead: born.process.Child = .{ .handle = handle, .pid = pid };
                 dead.close();
-                if (stdin_pipe) |fd| compat.close(fd);
-                if (stdout_pipe) |fd| compat.close(fd);
-                if (stderr_pipe) |fd| compat.close(fd);
             }
         }
     }
@@ -2406,9 +2408,6 @@ pub const Shim = struct {
         child.occupied = true;
         child.index = index;
         child.child = .{ .handle = -1, .pid = 0 };
-        child.stdin_pipe = null;
-        child.stdout_pipe = null;
-        child.stderr_pipe = null;
         child.pending_arm = null;
         child.pending_wait = null;
         child.pending_kill = null;
@@ -2420,18 +2419,16 @@ pub const Shim = struct {
         return .{ .index = index, .generation = child.generation };
     }
 
-    /// Publish a spawned child into its reserved slot: store the descriptor,
-    /// pid and shim-owned pipe ends, and insert the pid mapping. Proc queue
-    /// mutex. An OOM inserting the mapping leaves the slot occupied; the
-    /// caller kills, closes and releases it.
-    fn childPublish(self: *Shim, index: u32, child: born.process.Child, stdin_pipe: ?compat.fd_t, stdout_pipe: ?compat.fd_t, stderr_pipe: ?compat.fd_t) error{OutOfMemory}!void {
+    /// Publish a spawned child into its reserved slot: store the descriptor
+    /// and pid, and insert the pid mapping. The parent pipe ends stay with
+    /// the caller's `Child` (review R1); the registry never holds them. Proc
+    /// queue mutex. An OOM inserting the mapping leaves the slot occupied;
+    /// the caller kills, closes and releases it.
+    fn childPublish(self: *Shim, index: u32, child: born.process.Child) error{OutOfMemory}!void {
         self.proc_queue.mutex.lockUncancelable(self.threaded_io);
         defer self.proc_queue.mutex.unlock(self.threaded_io);
         const slot = self.childAt(index).?;
         slot.child = child;
-        slot.stdin_pipe = stdin_pipe;
-        slot.stdout_pipe = stdout_pipe;
-        slot.stderr_pipe = stderr_pipe;
         self.child_registry.map.put(child.pid, index) catch return error.OutOfMemory;
     }
 
@@ -2592,7 +2589,20 @@ pub const Shim = struct {
             var events: [64]born.Event = undefined;
             var flush_failed = false;
             var saw_wake = false;
+            // Coupled to the port's staging buffer (N1): the loop drains
+            // exactly the changelist `watchProcess` accumulated, and each
+            // `wait` consumes the prefix it submits. A refused wait leaves
+            // the remainder staged for the next submission; cleanup purges
+            // it before closing the descriptor.
             while (self.port.changes.items.len != 0) {
+                if (self.test_flush_fault) {
+                    // Test-only refusal (R2): report a failed flush without
+                    // touching the port, leaving the staged EV_ADD in place.
+                    self.test_flush_fault = false;
+                    self.latch(error.Unexpected);
+                    flush_failed = true;
+                    break;
+                }
                 const n = self.port.wait(&events, 0) catch |err| {
                     self.latch(err);
                     flush_failed = true;
@@ -2617,6 +2627,11 @@ pub const Shim = struct {
                 const child = self.childAt(op.child_index).?;
                 child.pending_arm = null;
                 if (flush_failed or child.arm_failed) {
+                    // R2: a failed flush must mark the child arm_failed, not
+                    // just retire the op: the spawn thunk's cleanup kill op
+                    // then drives armFailedCleanup instead of parking on an
+                    // exit that can never arrive (the watch never registered).
+                    if (flush_failed) child.arm_failed = true;
                     self.procRetireErr(op, .arm_failed);
                 } else {
                     child.watch_armed = true;
@@ -2663,9 +2678,9 @@ pub const Shim = struct {
     }
 
     /// Park an uncancelable kill drain, or finish immediately from the
-    /// latched exit. An arm-failed child (never published) is cleaned up
-    /// without waiting for an exit: the spawn thunk already SIGKILLed it
-    /// and Child.close reaps per platform. Loop thread.
+    /// latched exit. An arm-failed child (never returned to the caller) is
+    /// cleaned up without waiting for an exit: the spawn thunk already
+    /// SIGKILLed it and Child.close reaps per platform. Loop thread.
     fn killDrive(self: *Shim, op: *ProcOp) void {
         const child = self.childAt(op.child_index).?;
         if (child.arm_failed) return self.armFailedCleanup(op, child);
@@ -2723,14 +2738,15 @@ pub const Shim = struct {
 
     /// Finish a kill drain: the exit is collected (or latched failed), so
     /// end the watch, remove the pid entry before the reaping close, close
-    /// the descriptor and shim-owned stdio, release the slot. Loop thread.
+    /// the descriptor, release the slot. The caller's stdio ends are closed
+    /// by the kill thunk, not here (review R1). Loop thread.
     fn killFinish(self: *Shim, op: *ProcOp, child: *ChildState) void {
         self.childCleanup(child);
         self.procRetireOk(op);
     }
 
     /// Clean up an arm-failed child on the loop: the spawn thunk SIGKILLed
-    /// it and never published it, so no exit collection is needed.
+    /// it and never returned it, so no exit collection is needed.
     /// Child.close reaps an exited child and SIGKILLs a running one per
     /// platform (non-blocking: Linux hands a still-exiting child to the
     /// background reaper). Loop thread.
@@ -2743,24 +2759,31 @@ pub const Shim = struct {
     /// end the watch, drop the pid mapping BEFORE the reaping close so a
     /// recycled pid never resolves to this dying slot, close the descriptor
     /// (FreeBSD reaps the exited child on the spot; Linux harvest already
-    /// reaped, so close just ends it) and the shim-owned pipe ends, release
-    /// the slot. The caller invalidates `child.id` and the stdio fields.
+    /// reaped, so close just ends it), release the slot. The parent pipe
+    /// ends belong to the caller's `Child` (review R1); the wait/kill thunk
+    /// closes and nulls them on the caller thread.
     fn childCleanup(self: *Shim, child: *ChildState) void {
-        self.port.unwatchProcess(child.child.handle);
-        self.port.purgeFd(child.child.handle);
+        // A unit test may close the descriptor itself and invalidate the
+        // handle to -1 (N3); skip the port teardown then, since purgeFd casts
+        // the handle to usize. A published child always holds a valid handle
+        // here, so this guard is inert in normal operation.
+        if (child.child.handle >= 0) {
+            self.port.unwatchProcess(child.child.handle);
+            self.port.purgeFd(child.child.handle);
+        }
         self.proc_queue.mutex.lockUncancelable(self.threaded_io);
         if (!child.abandoned) _ = self.child_registry.map.fetchRemove(child.child.pid);
         self.childFreeLocked(child.index);
         self.proc_queue.mutex.unlock(self.threaded_io);
         child.child.close();
-        self.closeShimPipes(child);
     }
 
-    /// Abandon a canceled wait (6.3): close the shim-owned stdio ends and
-    /// unpublish the pid, but keep the descriptor open and watched. The loop
-    /// reaps the child when its exit arrives; only deinit kills it if still
-    /// running. If the exit already latched, clean up fully instead. Loop
-    /// thread; the submitter drains uncancelably until the op retires.
+    /// Abandon a canceled wait (6.3): unpublish the pid, but keep the
+    /// descriptor open and watched. The loop reaps the child when its exit
+    /// arrives; only deinit kills it if still running. If the exit already
+    /// latched, clean up fully instead. The caller's stdio ends are closed
+    /// by the wait thunk's cancel path, not here (review R1). Loop thread;
+    /// the submitter drains uncancelably until the op retires.
     fn abandonWait(self: *Shim, op: *ProcOp) void {
         const child = self.childAt(op.child_index).?;
         if (child.exit != null or child.exit_failed) {
@@ -2773,7 +2796,6 @@ pub const Shim = struct {
             }
             if (child.pending_wait == op) child.pending_wait = null;
             self.proc_queue.mutex.unlock(self.threaded_io);
-            self.closeShimPipes(child);
         }
         self.procRetireOp(op, true);
     }
@@ -2783,18 +2805,6 @@ pub const Shim = struct {
     fn procCancelOp(self: *Shim, op: *ProcOp) void {
         if (op.kind == .wait) return self.abandonWait(op);
         self.procRetireOp(op, true);
-    }
-
-    /// Close the shim-created parent pipe ends (null = inherit/ignore/file,
-    /// caller-owned). Idempotent: the fields are nulled after closing.
-    fn closeShimPipes(self: *Shim, child: *ChildState) void {
-        _ = self;
-        if (child.stdin_pipe) |fd| compat.close(fd);
-        if (child.stdout_pipe) |fd| compat.close(fd);
-        if (child.stderr_pipe) |fd| compat.close(fd);
-        child.stdin_pipe = null;
-        child.stdout_pipe = null;
-        child.stderr_pipe = null;
     }
 
     /// Clear the child pending pointer for a retiring op. Loop-only fields,
@@ -2929,11 +2939,12 @@ pub const Shim = struct {
     }
 
     /// Dead-loop fallback (sections 5.5, 7): claim an occupied child under
-    /// the proc queue mutex (remove the pid entry, copy the descriptor, pid
-    /// and pipe ends to locals, release the slot), then SIGKILL/SIGTERM and
-    /// blocking reap on the caller thread. No port calls: the loop is dead,
-    /// so no next submission can apply a staged entry to a recycled fd
-    /// (synchronous arm already flushed every published watch live).
+    /// the proc queue mutex (remove the pid entry, copy the descriptor and
+    /// pid to locals, release the slot), then SIGKILL/SIGTERM and blocking
+    /// reap on the caller thread. No port calls: the loop is dead, so no
+    /// next submission can apply a staged entry to a recycled fd
+    /// (synchronous arm already flushed every published watch live). The
+    /// caller's stdio ends are closed by the thunk, not here (review R1).
     /// Returns false if the slot was already cleaned up (deinit raced).
     fn childDeadClaim(self: *Shim, op: *ProcOp, sig: u8) bool {
         if (comptime process_supported) {
@@ -2948,9 +2959,6 @@ pub const Shim = struct {
             }
             const handle = child.child.handle;
             const pid = child.child.pid;
-            const stdin_pipe = child.stdin_pipe;
-            const stdout_pipe = child.stdout_pipe;
-            const stderr_pipe = child.stderr_pipe;
             if (!child.abandoned) _ = self.child_registry.map.fetchRemove(pid);
             self.childFreeLocked(child.index);
             self.proc_queue.mutex.unlock(self.threaded_io);
@@ -2970,9 +2978,6 @@ pub const Shim = struct {
                 }
             }
             compat.close(handle);
-            if (stdin_pipe) |fd| compat.close(fd);
-            if (stdout_pipe) |fd| compat.close(fd);
-            if (stderr_pipe) |fd| compat.close(fd);
             return true;
         } else return false;
     }
@@ -3081,15 +3086,19 @@ pub fn deinit(interface: Io) void {
     allocator.destroy(shim);
 }
 
-/// The first route-level failure latched by the time route: a port `wait`
-/// refusal, a timer-arm refusal (`born.TimerError`), or a slot-table growth
-/// refusal. `sleep` surfaces these as `error.Canceled` (its declared set
-/// admits no resource error); this accessor exposes the cause so an
-/// application can tell a failed or dead time route from ordinary
-/// cancellation. Returns null while no failure has occurred. The loop exits
-/// after `wait_fail_limit` consecutive wait failures; once it has, every
-/// later `sleep` returns `Canceled` immediately. The baseline route never
-/// latches and always returns null.
+/// The first route-level failure latched by any Born route: a port `wait`
+/// refusal, a timer-arm refusal (`born.TimerError`), a slot-table growth
+/// refusal, or a process-route refusal (arm failure, failed arm flush).
+/// `sleep` surfaces these as `error.Canceled` (its declared set admits no
+/// resource error); this accessor exposes the cause so an application can
+/// tell a failed or dead route from ordinary cancellation. Returns null
+/// while no failure has occurred. The latch is instance-wide: a per-child
+/// refusal (one child's arm or flush failing) latches the whole instance,
+/// the same scope as the network route's per-socket refusal latch (P5.3
+/// `sockRetire`, accepted as-is); it does not by itself stop the loop or
+/// other children. The loop exits after `wait_fail_limit` consecutive wait
+/// failures; once it has, every later `sleep` returns `Canceled`
+/// immediately. The baseline route never latches and always returns null.
 pub fn loopError(interface: Io) ?anyerror {
     return shimFrom(interface.userdata).latchedError();
 }
@@ -4078,8 +4087,12 @@ const process_route = struct {
             }
 
             var pipes = try makePipes(options);
+            // The shim owns every pipe end until spawn returns the Child
+            // (review R1). Any failure before return destroys the remaining
+            // ends; the success path nulls `pipes` to transfer ownership to
+            // the caller's Child fields, which then own them alone.
+            errdefer destroyPipes(&pipes);
             var published = false;
-            errdefer if (!published) destroyPipes(&pipes);
 
             // Reserve the slot BEFORE the fork (S1): a ceiling/OOM refusal
             // creates no child. The generation guards stale exit events.
@@ -4107,17 +4120,16 @@ const process_route = struct {
             const stdout_parent = parentPipe(pipes[1]);
             const stderr_parent = parentPipe(pipes[2]);
 
-            self.childPublish(reserved.index, born_child, stdin_parent, stdout_parent, stderr_parent) catch {
-                // OOM inserting the pid mapping: the child is killed and
-                // closed, the reserved slot released, the parent ends closed.
+            self.childPublish(reserved.index, born_child) catch {
+                // OOM inserting the pid mapping: kill and close the child.
+                // The errdefers release the reserved slot and destroy the
+                // pipes; the catch must not also release (a double free-list
+                // push would corrupt the registry).
                 born_child.kill(compat.signalNumber(std.posix.SIG.KILL)) catch {};
                 born_child.close();
-                self.childRelease(reserved.index);
-                destroyPipes(&pipes);
                 return error.OutOfMemory;
             };
             published = true;
-            pipes = .{ null, null, null }; // ownership transferred to the slot
 
             // Synchronous arm (4.3): park the uncancelable arm confirmation
             // and wait for the loop to confirm the exit watch live. Any
@@ -4134,6 +4146,10 @@ const process_route = struct {
             }
 
             if (process_stats_enabled) _ = self.proc_stats.spawn.fetchAdd(1, .monotonic);
+            // Ownership of the parent ends transfers to the returned Child
+            // (review R1); the shim keeps no copy. Null `pipes` so the
+            // errdefer destroyPipes is a no-op on this success path.
+            pipes = .{ null, null, null };
             return .{
                 .id = born_child.pid,
                 .thread_handle = {},
@@ -4161,21 +4177,22 @@ const process_route = struct {
             var op: ProcOp = .{ .kind = .wait, .child_index = found.index, .child_gen = found.generation };
             self.procWait(&op) catch |err| switch (err) {
                 error.Canceled => {
-                    // Abandon (6.3): the loop closed the shim stdio and kept
-                    // the descriptor watched; invalidate the caller's fields.
+                    // Abandon (6.3): the loop kept the descriptor watched and
+                    // unpublished the pid. Close the caller's remaining stdio
+                    // ends on the caller thread (review R1) and invalidate.
+                    closeChildStdio(child);
                     child.id = null;
-                    child.stdin = null;
-                    child.stdout = null;
-                    child.stderr = null;
                     return error.Canceled;
                 },
             };
+            // A completed wait tears the slot down on the loop; a dead-loop
+            // refusal leaves the child registered for deinit. Either way the
+            // caller's stdio ends close here and the fields invalidate, so a
+            // stale id never reaches a later wait or kill (review R1).
+            closeChildStdio(child);
+            child.id = null;
             if (op.result.err != null) return error.Unexpected;
             const exit = op.result.exit orelse return error.Unexpected;
-            child.id = null;
-            child.stdin = null;
-            child.stdout = null;
-            child.stderr = null;
             if (process_stats_enabled) _ = self.proc_stats.wait.fetchAdd(1, .monotonic);
             return termFromExit(exit);
         } else return error.Unexpected;
@@ -4204,10 +4221,10 @@ const process_route = struct {
             self.procWaitUncancelable(&op);
             if (op.result.err == .route_dead)
                 _ = self.childDeadClaim(&op, compat.signalNumber(std.posix.SIG.TERM));
+            // Close the caller's remaining stdio ends on the caller thread
+            // (review R1); the loop never touched them.
+            closeChildStdio(child);
             child.id = null;
-            child.stdin = null;
-            child.stdout = null;
-            child.stderr = null;
             if (process_stats_enabled) _ = self.proc_stats.kill.fetchAdd(1, .monotonic);
         }
     }
@@ -4302,6 +4319,27 @@ fn parentPipe(p: ?ProcPipe) ?compat.fd_t {
 /// Threaded file slots expect blocking ends. Null for inherit/ignore/file.
 fn filePipe(fd: ?compat.fd_t) ?Io.File {
     return if (fd) |f| .{ .handle = f, .flags = .{ .nonblocking = false } } else null;
+}
+
+/// Close the parent pipe ends still held by the caller's `Child` and null
+/// the fields (review R1): after spawn returns, the std `Child` fields are
+/// the sole owners of the shim-created ends. The wait/kill thunks and the
+/// cancel path call this on the caller thread; the loop never closes them.
+/// Only shim-created pipe ends ever appear here (inherit/ignore/file leave
+/// the fields null), so this never closes a caller-owned descriptor.
+fn closeChildStdio(child: *std.process.Child) void {
+    if (child.stdin) |f| {
+        compat.close(f.handle);
+        child.stdin = null;
+    }
+    if (child.stdout) |f| {
+        compat.close(f.handle);
+        child.stdout = null;
+    }
+    if (child.stderr) |f| {
+        compat.close(f.handle);
+        child.stderr = null;
+    }
 }
 
 /// Map a std stdio mode to a `born.process.Stdio` (5.1). `.pipe` uses the
@@ -5670,6 +5708,21 @@ fn testSpawnSh(comptime cmd: [:0]const u8) born.process.SpawnError!born.process.
     return born.process.spawn(&argv, &envp, .{ .stdin = .devnull, .stdout = .devnull, .stderr = .devnull });
 }
 
+/// Poll until `pid` is gone (killed and reaped). born's FreeBSD procdesc close
+/// SIGKILLs a running child and leaves the reap to init (async zombie); a
+/// child that was never killed would still run `sleep 30` and keep answering
+/// kill(pid, 0). Referenced only from FreeBSD-only test bodies.
+fn expectPidGone(pid: std.posix.pid_t) !void {
+    var tries: usize = 0;
+    while (tries < 200) : (tries += 1) {
+        std.posix.kill(pid, @enumFromInt(0)) catch |err| {
+            if (err == error.ProcessNotFound) return;
+        };
+        compat.sleepNs(10 * std.time.ns_per_ms);
+    }
+    return error.TestUnexpectedResult;
+}
+
 /// Refuses only the registry chunk allocation (size == ChildChunk), forwarding
 /// every other request to the backing allocator. Targets registry-growth OOM
 /// deterministically, independent of how many backing allocations the spawn
@@ -5878,7 +5931,7 @@ test "child provenance lookup hits a published child and misses once unpublished
     // Unregistered pid: Threaded-owned (lookup miss).
     try std.testing.expect(state.lookupChild(424242) == null);
     const r = try state.childReserve();
-    try state.childPublish(r.index, .{ .handle = -1, .pid = 424242 }, null, null, null);
+    try state.childPublish(r.index, .{ .handle = -1, .pid = 424242 });
     const found = state.lookupChild(424242).?;
     try std.testing.expectEqual(r.index, found.index);
     try std.testing.expectEqual(r.generation, found.generation);
@@ -5930,14 +5983,14 @@ test "cross-route error attribution: the process tag decides the registry" {
     defer state.childRegistryDeinit();
 
     const r = try state.childReserve();
-    try state.childPublish(r.index, .{ .handle = -1, .pid = 555555 }, null, null, null);
+    try state.childPublish(r.index, .{ .handle = -1, .pid = 555555 });
     // Tagged error: latches the child's exit failure (childEvent path).
     state.dispatchEvent(.{ .err = true, .udata = procUdata(r.index, r.generation) });
     try std.testing.expect(state.childAt(r.index).?.exit_failed);
     // Untagged error with a socket-style udata: socketEvent (a registry miss
     // here), leaving a fresh child untouched.
     const r2 = try state.childReserve();
-    try state.childPublish(r2.index, .{ .handle = -1, .pid = 666666 }, null, null, null);
+    try state.childPublish(r2.index, .{ .handle = -1, .pid = 666666 });
     state.dispatchEvent(.{ .err = true, .udata = slotUdata(0, 1) });
     try std.testing.expect(!state.childAt(r2.index).?.exit_failed);
     try std.testing.expectEqual(@as(?born.ProcessExit, null), state.childAt(r2.index).?.exit);
@@ -5976,7 +6029,7 @@ test "synchronous arm confirms the exit watch and a fast exit latches for the wa
 
     const bc = try testSpawnSh("exit 5");
     const r = try state.childReserve();
-    try state.childPublish(r.index, bc, null, null, null);
+    try state.childPublish(r.index, bc);
 
     var arm: ProcOp = .{ .kind = .arm, .child_index = r.index, .child_gen = r.generation };
     arm.slot_index = try state.procAllocSlotLocked();
@@ -6027,10 +6080,18 @@ test "arm watchProcess refusal retires arm_failed and the kill drain cleans up" 
 
     const bc = try testSpawnSh("sleep 30");
     const r = try state.childReserve();
-    try state.childPublish(r.index, bc, null, null, null);
-    // Inject the refusal: close the descriptor so watchProcess fails. The
-    // close kills/reaps the child; the slot still holds the stale descriptor.
+    try state.childPublish(r.index, bc);
+    // Inject the refusal: close the descriptor so watchProcess fails. On
+    // FreeBSD the procdesc close SIGKILLs the running child (init reaps) and
+    // the stale descriptor stages EV_ADD, answered EV_ERROR at the flush. On
+    // Linux a pidfd close does NOT kill the child, so SIGKILL by pid and reap
+    // here (N3) to leak no sleep; epoll_ctl refuses the closed fd synchronously.
     compat.close(bc.handle);
+    if (comptime is_linux) {
+        std.posix.kill(bc.pid, .KILL) catch {};
+        var info: std.os.linux.siginfo_t = undefined;
+        while (compat.linuxErrno(compat.waitid(.PID, bc.pid, &info, std.os.linux.W.EXITED)) == .INTR) {}
+    }
 
     var arm: ProcOp = .{ .kind = .arm, .child_index = r.index, .child_gen = r.generation };
     arm.slot_index = try state.procAllocSlotLocked();
@@ -6039,6 +6100,119 @@ test "arm watchProcess refusal retires arm_failed and the kill drain cleans up" 
     if (comptime is_freebsd) state.procFlushArms();
     const child = state.childAt(r.index).?;
     try std.testing.expect(child.arm_failed);
+    try std.testing.expectEqual(@as(?ProcError, .arm_failed), arm.result.err);
+    try std.testing.expectEqual(@as(u32, 1), arm.state.load(.acquire));
+
+    // The descriptor is already closed; null the slot's handle so the
+    // cleanup close is a no-op, not a double-close of the same fd (N3).
+    child.child.handle = -1;
+
+    // The cleanup kill op finishes without waiting for an exit.
+    var k: ProcOp = .{ .kind = .kill, .child_index = r.index, .child_gen = r.generation };
+    k.slot_index = try state.procAllocSlotLocked();
+    state.procSlotAt(k.slot_index).?.op = &k;
+    state.killDrive(&k);
+    try std.testing.expectEqual(@as(u32, 1), k.state.load(.acquire));
+    try std.testing.expectEqual(@as(?ProcError, null), k.result.err);
+    try std.testing.expect(!state.childAt(r.index).?.occupied);
+    try std.testing.expect(state.lookupChild(bc.pid) == null);
+}
+
+test "arm flush wait failure marks arm_failed and the kill drain cleans up" {
+    // R2: a failed arm-confirming flush (port.wait refusal) must mark the
+    // child arm_failed, not just retire the arm op: the spawn thunk's cleanup
+    // kill op then drives armFailedCleanup instead of parking pending_kill on
+    // an exit that can never arrive (the watch was never registered). The
+    // test_flush_fault hook injects the refusal without touching the port.
+    // Mutation: retiring .arm_failed without setting child.arm_failed must
+    // fail (the kill op would park forever).
+    if (comptime !process_supported or !is_freebsd) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    state.port = &port;
+    try state.childRegistryInit();
+    defer state.childRegistryDeinit();
+    defer state.procFreeChunks();
+
+    const bc = try testSpawnSh("sleep 30");
+    const r = try state.childReserve();
+    try state.childPublish(r.index, bc);
+
+    var arm: ProcOp = .{ .kind = .arm, .child_index = r.index, .child_gen = r.generation };
+    arm.slot_index = try state.procAllocSlotLocked();
+    state.procSlotAt(arm.slot_index).?.op = &arm;
+    state.armDrive(&arm);
+    // Staged, not yet confirmed: the watch is not live, arm_failed is clear.
+    try std.testing.expect(!state.childAt(r.index).?.watch_armed);
+    try std.testing.expect(!state.childAt(r.index).?.arm_failed);
+    try std.testing.expectEqual(&arm, state.childAt(r.index).?.pending_arm.?);
+
+    state.test_flush_fault = true;
+    state.procFlushArms();
+    const child = state.childAt(r.index).?;
+    try std.testing.expect(child.arm_failed);
+    try std.testing.expect(!child.watch_armed);
+    try std.testing.expectEqual(@as(?*ProcOp, null), child.pending_arm);
+    try std.testing.expectEqual(@as(?ProcError, .arm_failed), arm.result.err);
+    try std.testing.expectEqual(@as(u32, 1), arm.state.load(.acquire));
+    try std.testing.expectEqual(@as(?anyerror, error.Unexpected), state.latchedError());
+    try std.testing.expect(!state.test_flush_fault); // hook reset
+
+    // The cleanup kill op finishes without waiting for an exit (armFailedCleanup).
+    var k: ProcOp = .{ .kind = .kill, .child_index = r.index, .child_gen = r.generation };
+    k.slot_index = try state.procAllocSlotLocked();
+    state.procSlotAt(k.slot_index).?.op = &k;
+    state.killDrive(&k);
+    try std.testing.expectEqual(@as(u32, 1), k.state.load(.acquire));
+    try std.testing.expectEqual(@as(?ProcError, null), k.result.err);
+    try std.testing.expect(!state.childAt(r.index).?.occupied);
+    try std.testing.expect(state.lookupChild(bc.pid) == null);
+    // childCleanup's procdesc close SIGKILLed the running child; init reaps.
+    try expectPidGone(bc.pid);
+}
+
+test "synthetic EV_ERROR while arming marks arm_failed; flush retires failed" {
+    // R2: a tagged EV_ERROR delivered while the arm is pending (the kernel
+    // refusing the staged EV_ADD) marks the child arm_failed via childEvent;
+    // the flush then retires the arm .arm_failed even though the flush wait
+    // itself succeeded, and the cleanup kill op drives armFailedCleanup.
+    // Synthetic event injection mirrors the stolen-reap unit's dispatchEvent.
+    if (comptime !process_supported or !is_freebsd) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    state.port = &port;
+    try state.childRegistryInit();
+    defer state.childRegistryDeinit();
+    defer state.procFreeChunks();
+
+    const bc = try testSpawnSh("sleep 30");
+    const r = try state.childReserve();
+    try state.childPublish(r.index, bc);
+
+    var arm: ProcOp = .{ .kind = .arm, .child_index = r.index, .child_gen = r.generation };
+    arm.slot_index = try state.procAllocSlotLocked();
+    state.procSlotAt(arm.slot_index).?.op = &arm;
+    state.armDrive(&arm);
+    try std.testing.expectEqual(&arm, state.childAt(r.index).?.pending_arm.?);
+
+    // Synthetic tagged EV_ERROR for this child while the arm is pending and
+    // the watch is not yet live: childEvent marks arm_failed.
+    state.dispatchEvent(.{ .err = true, .udata = procUdata(r.index, r.generation) });
+    try std.testing.expect(state.childAt(r.index).?.arm_failed);
+    try std.testing.expect(!state.childAt(r.index).?.watch_armed);
+
+    // The flush wait succeeds (valid descriptor), but the retire loop sees
+    // arm_failed and retires .arm_failed; it must not confirm the watch.
+    state.procFlushArms();
+    const child = state.childAt(r.index).?;
+    try std.testing.expect(child.arm_failed);
+    try std.testing.expect(!child.watch_armed);
     try std.testing.expectEqual(@as(?ProcError, .arm_failed), arm.result.err);
     try std.testing.expectEqual(@as(u32, 1), arm.state.load(.acquire));
 
@@ -6051,6 +6225,7 @@ test "arm watchProcess refusal retires arm_failed and the kill drain cleans up" 
     try std.testing.expectEqual(@as(?ProcError, null), k.result.err);
     try std.testing.expect(!state.childAt(r.index).?.occupied);
     try std.testing.expect(state.lookupChild(bc.pid) == null);
+    try expectPidGone(bc.pid);
 }
 
 test "dead-loop kill reaps a running child via wait6/waitid with no zombie" {
@@ -6068,7 +6243,7 @@ test "dead-loop kill reaps a running child via wait6/waitid with no zombie" {
 
     const bc = try testSpawnSh("sleep 30");
     const r = try state.childReserve();
-    try state.childPublish(r.index, bc, null, null, null);
+    try state.childPublish(r.index, bc);
 
     var op: ProcOp = .{ .kind = .kill, .child_index = r.index, .child_gen = r.generation };
     op.slot_index = try state.procAllocSlotLocked();
@@ -6082,8 +6257,9 @@ test "dead-loop kill reaps a running child via wait6/waitid with no zombie" {
 }
 
 test "abandoned wait keeps the child running; the loop reaps it on exit" {
-    // R2: canceling a wait abandons the child (stdio closed, pid unpublished,
-    // descriptor still watched) rather than killing it. The loop reaps it when
+    // R2: canceling a wait abandons the child (pid unpublished, descriptor
+    // still watched) rather than killing it; the cancel thunk closes the
+    // caller's stdio ends (review R1), not the loop. The loop reaps it when
     // its exit arrives. Mutation: reverting to kill-on-cancel must fail the
     // "still running after the canceled wait" assertion.
     if (comptime !process_supported) return error.SkipZigTest;
@@ -6099,7 +6275,7 @@ test "abandoned wait keeps the child running; the loop reaps it on exit" {
 
     const bc = try testSpawnSh("sleep 30");
     const r = try state.childReserve();
-    try state.childPublish(r.index, bc, null, null, null);
+    try state.childPublish(r.index, bc);
 
     // Arm the watch so the exit event arrives after abandon.
     var arm: ProcOp = .{ .kind = .arm, .child_index = r.index, .child_gen = r.generation };
@@ -6152,7 +6328,7 @@ test "deinit kills a still-running abandoned child" {
 
     const bc = try testSpawnSh("sleep 30");
     const r = try state.childReserve();
-    try state.childPublish(r.index, bc, null, null, null);
+    try state.childPublish(r.index, bc);
     var arm: ProcOp = .{ .kind = .arm, .child_index = r.index, .child_gen = r.generation };
     arm.slot_index = try state.procAllocSlotLocked();
     state.procSlotAt(arm.slot_index).?.op = &arm;
@@ -6204,7 +6380,7 @@ test "a stolen reap latches wait_failed, completing a parked wait with Unexpecte
     // event simulates a stolen reap rather than a genuine exit.
     const bc = try testSpawnSh("sleep 30");
     const r = try state.childReserve();
-    try state.childPublish(r.index, bc, null, null, null);
+    try state.childPublish(r.index, bc);
     var w: ProcOp = .{ .kind = .wait, .child_index = r.index, .child_gen = r.generation };
     w.slot_index = try state.procAllocSlotLocked();
     state.procSlotAt(w.slot_index).?.op = &w;
@@ -6235,7 +6411,7 @@ test "kill drain collects the exit and releases the slot" {
 
     const bc = try testSpawnSh("sleep 30");
     const r = try state.childReserve();
-    try state.childPublish(r.index, bc, null, null, null);
+    try state.childPublish(r.index, bc);
     var arm: ProcOp = .{ .kind = .arm, .child_index = r.index, .child_gen = r.generation };
     arm.slot_index = try state.procAllocSlotLocked();
     state.procSlotAt(arm.slot_index).?.op = &arm;

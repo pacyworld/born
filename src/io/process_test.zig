@@ -283,6 +283,86 @@ test "spawn with stdin and stdout pipes: parent writes stdin, reads stdout" {
     try expectEqual(@as(?Io.File, null), child.stdout);
 }
 
+test "caller-closed stdin end is not closed again by wait (fd-reuse guard)" {
+    if (skip_unsupported) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const io = try initProcIo(&port);
+    defer born_io.deinit(io);
+
+    // R1: the std EOF pattern closes child.stdin and nulls the field before
+    // waiting. The shim must not close a stale copy of the same end: a fresh
+    // pipe opened in between reuses the fd number, and a double close would
+    // destroy the fresh pipe's end. The wait thunk owns the close now.
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/sh", "-c", "read line; exit 0" },
+        .stdin = .pipe,
+        .stdout = .ignore,
+        .stderr = .ignore,
+    });
+    const stdin_fd = child.stdin.?.handle;
+    child.stdin.?.close(io);
+    child.stdin = null;
+
+    // The freed number is reusable: a fresh pipe takes it. The child's stdin
+    // read end (closed after the fork) is lower than the parent write end, so
+    // either fresh end may land on stdin_fd.
+    const ends = try compat.pipe2(.{ .CLOEXEC = true });
+    defer compat.close(ends[0]);
+    defer compat.close(ends[1]);
+    try expect(ends[0] == stdin_fd or ends[1] == stdin_fd);
+
+    const term = try std.process.Child.wait(&child, io);
+    try expectEqual(@as(u8, 0), term.exited);
+    try expectEqual(@as(?Io.File, null), child.stdin);
+    // Both fresh ends survived the wait: still open descriptors.
+    try expect(std.c.fcntl(ends[0], std.c.F.GETFD) != -1);
+    try expect(std.c.fcntl(ends[1], std.c.F.GETFD) != -1);
+}
+
+test "caller-closed stdout/stderr ends are not closed again by kill (fd-reuse guard)" {
+    if (skip_unsupported) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const io = try initProcIo(&port);
+    defer born_io.deinit(io);
+
+    // R1 kill variant: the caller closes stdout/stderr and nulls the fields
+    // before killing. The kill thunk must not double-close the stale ends;
+    // fresh pipes reuse the numbers and must survive the kill.
+    var child = try std.process.spawn(io, .{
+        .argv = &.{ "/bin/sh", "-c", "sleep 30" },
+        .stdin = .ignore,
+        .stdout = .pipe,
+        .stderr = .pipe,
+    });
+    const stdout_fd = child.stdout.?.handle;
+    const stderr_fd = child.stderr.?.handle;
+    child.stdout.?.close(io);
+    child.stdout = null;
+    child.stderr.?.close(io);
+    child.stderr = null;
+
+    const p1 = try compat.pipe2(.{ .CLOEXEC = true });
+    defer compat.close(p1[0]);
+    defer compat.close(p1[1]);
+    const p2 = try compat.pipe2(.{ .CLOEXEC = true });
+    defer compat.close(p2[0]);
+    defer compat.close(p2[1]);
+    try expect(p1[0] == stdout_fd or p1[1] == stdout_fd or p2[0] == stdout_fd or p2[1] == stdout_fd);
+    try expect(p1[0] == stderr_fd or p1[1] == stderr_fd or p2[0] == stderr_fd or p2[1] == stderr_fd);
+
+    std.process.Child.kill(&child, io);
+    try expectEqual(@as(?std.process.Child.Id, null), child.id);
+    try expectEqual(@as(?Io.File, null), child.stdout);
+    try expectEqual(@as(?Io.File, null), child.stderr);
+    // All four fresh ends survived the kill.
+    try expect(std.c.fcntl(p1[0], std.c.F.GETFD) != -1);
+    try expect(std.c.fcntl(p1[1], std.c.F.GETFD) != -1);
+    try expect(std.c.fcntl(p2[0], std.c.F.GETFD) != -1);
+    try expect(std.c.fcntl(p2[1], std.c.F.GETFD) != -1);
+}
+
 test "spawn resolves argv[0] against PATH when it has no slash" {
     if (skip_unsupported) return error.SkipZigTest;
     var port = try born.EvPort.init(std.testing.allocator);
@@ -734,7 +814,8 @@ test "canceled wait abandons the child: running, stdio closed, id null, Canceled
     try expectEqual(@as(?Io.File, null), child.stdout);
     try expectEqual(@as(?Io.File, null), child.stderr);
     try std.posix.kill(pid, @enumFromInt(0));
-    // The shim closed the pipe parent end: the descriptor is no longer open.
+    // The wait thunk's cancel path closed the pipe parent end (review R1):
+    // the descriptor is no longer open.
     try expect(std.c.fcntl(stdout_fd, std.c.F.GETFD) == -1);
 
     // The loop reaps the abandoned child when its exit arrives (still watched).
