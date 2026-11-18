@@ -1054,3 +1054,253 @@ test "steady-state Born read and write perform no shim allocations" {
     }
     try expectEqual(baseline_count, counting.count.load(.monotonic));
 }
+
+test "loop death retires network ops as Unexpected, not Canceled" {
+    // Required 3: a persistently broken port kills the loop; a driven connect
+    // is retired as route_dead (Unexpected), and a later connect's submit
+    // refusal also surfaces Unexpected, never the caller's Canceled. kqueue
+    // and epoll: the port descriptor is closed BEFORE the loop starts, so its
+    // first waits fail deterministically (closing a descriptor behind an
+    // already-blocked kqueue wait would not wake it, since the wait holds a
+    // reference). No event is ever delivered, so the connect cannot complete;
+    // the failure exit retires it route_dead. Parked-read retirement on a
+    // failure exit is asserted by the shim unit (netRetireAll stopped=false).
+    if (builtin.single_threaded) return error.SkipZigTest;
+    const has_kq = @hasField(born.EvPort, "kq");
+    const has_ep = @hasField(born.EvPort, "ep");
+    if (!has_kq and !has_ep) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    if (has_kq) {
+        _ = std.c.close(port.kq);
+        port.kq = -1;
+    } else {
+        _ = std.c.close(port.ep);
+        port.ep = -1;
+    }
+    const io = try initNetIo(&port);
+    defer born_io.deinit(io);
+    var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer fixture.deinit();
+    const fio = fixture.io();
+    const addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try addr.listen(fio, .{});
+    defer server.deinit(fio);
+
+    // The connect is driven then retired at the failure exit (or refused at
+    // the dead queue); both map route_dead to Unexpected.
+    try expectError(error.Unexpected, server.socket.address.connect(io, .{ .mode = .stream }));
+    try expect(born_io.loopError(io) != null);
+    // The queue is dead: a second connect's submit is refused, also Unexpected.
+    try expectError(error.Unexpected, server.socket.address.connect(io, .{ .mode = .stream }));
+}
+
+test "handle reuse after close routes a Threaded socket away from Born (POSIX)" {
+    // Required 1: after a Born socket closes, its fd number can be reused by a
+    // Threaded socket in the same process. The provenance gate must forward that
+    // handle to Threaded, not route it to the dying Born slot. dup2 a fixture
+    // socket onto the closed Born fd number and read through the shim. (The
+    // unregister-before-close ordering itself is asserted by the Windows drain
+    // unit, where the drain window makes it observable.)
+    if (is_windows or builtin.single_threaded) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const io = try initNetIo(&port);
+    defer born_io.deinit(io);
+    var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer fixture.deinit();
+    const fio = fixture.io();
+    var server: Io.net.Server = undefined;
+    var client: Io.net.Stream = undefined;
+    var peer: Io.net.Stream = undefined;
+    try setupPair(io, &fixture, &server, &client, &peer);
+    defer peer.close(fio);
+    defer server.deinit(fio);
+
+    const born_fd = client.socket.handle;
+    const before = born_io.networkStats(io);
+    client.close(io); // closes born_fd and unregisters it
+
+    // Reuse the fd number for a Threaded socket: a fresh Threaded connection
+    // whose client end is forced onto the closed Born fd number via dup2.
+    const c2 = try server.socket.address.connect(fio, .{ .mode = .stream });
+    var p2 = try server.accept(fio);
+    defer p2.close(fio);
+    const c2fd = c2.socket.handle;
+    if (c2fd != born_fd) {
+        try compat.dup2(c2fd, born_fd);
+        compat.close(c2fd); // born_fd now holds this Threaded end
+    }
+    defer compat.close(born_fd);
+    _ = try compat.write(p2.socket.handle, "Z");
+
+    // A read through the shim at the reused fd must go to Threaded and succeed.
+    var buf: [1]u8 = undefined;
+    var iov = [_][]u8{buf[0..]};
+    try expectEqual(@as(usize, 1), try rawRead(io, born_fd, &iov));
+    try expectEqualSlices(u8, "Z", &buf);
+    if (born_io.network_stats_enabled) {
+        const after = born_io.networkStats(io);
+        try expect(after.threaded_read > before.threaded_read);
+        try expectEqual(before.read, after.read); // no Born read completion
+    }
+}
+
+test "deinit with two parked Born reads retires them and drains promptly" {
+    // Required 2 (the Windows multi-socket deinit drain): two Born sockets with
+    // parked reads open at deinit. deinit stops the loop, retires the reads as
+    // canceled, and drains every completion before freeing the socket state.
+    // On Windows the old polled drain could swallow a sibling's completion; the
+    // two-phase exit drain frees both promptly. All platforms: deinit returns
+    // promptly and both readers observe cancellation.
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const io = try initNetIo(&port);
+    var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer fixture.deinit();
+    const fio = fixture.io();
+    const addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try addr.listen(fio, .{});
+    defer server.deinit(fio);
+    const bound = server.socket.address;
+    var clients: [2]Io.net.Stream = undefined;
+    var peers: [2]Io.net.Stream = undefined;
+    for (&clients, &peers) |*c, *p| {
+        c.* = try bound.connect(io, .{ .mode = .stream });
+        p.* = try server.accept(fio);
+    }
+    defer peers[0].close(fio);
+    defer peers[1].close(fio);
+
+    var results: [2]std.atomic.Value(u32) = .{ .init(0), .init(0) }; // 0 pending, 1 canceled, 2 other
+    var threads: [2]std.Thread = undefined;
+    for (&clients, &results, &threads) |*c, *r, *t| {
+        t.* = try std.Thread.spawn(.{}, struct {
+            fn run(ioc: Io, h: Io.net.Socket.Handle, out: *std.atomic.Value(u32)) void {
+                var buf: [1]u8 = undefined;
+                var iov = [_][]u8{buf[0..]};
+                _ = rawRead(ioc, h, &iov) catch |err| {
+                    out.store(if (err == error.Canceled) 1 else 2, .release);
+                    return;
+                };
+                out.store(2, .release);
+            }
+        }.run, .{ io, c.socket.handle, r });
+    }
+    try Io.sleep(fio, .fromMilliseconds(50), .awake); // let both reads park
+
+    const t0 = try born.nowNs();
+    born_io.deinit(io);
+    const elapsed = (try born.nowNs()) - t0;
+    try expect(elapsed < 2 * std.time.ns_per_s);
+    for (&threads, &results) |*t, *r| {
+        t.join();
+        try expectEqual(@as(u32, 1), r.load(.acquire)); // canceled (stop path)
+    }
+}
+
+test "connect timeouts on non-awake clocks stay on the Born route" {
+    // Should-fix 5: a .real/.boot timeout is converted to a Born deadline, not
+    // forwarded to Threaded. A past deadline expires without connecting; a
+    // refused connect with a future .real deadline and a successful connect with
+    // a .boot duration both run on Born (the Threaded-forward counter stays zero).
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const io = try initNetIo(&port);
+    defer born_io.deinit(io);
+    var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer fixture.deinit();
+    const fio = fixture.io();
+    const target: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+
+    // A past .real deadline (the Unix epoch) expires before any socket is made.
+    try expectError(error.Timeout, target.connect(io, .{
+        .mode = .stream,
+        .timeout = .{ .deadline = .{ .clock = .real, .raw = .{ .nanoseconds = 1 } } },
+    }));
+    // A zero .boot duration is already expired.
+    try expectError(error.Timeout, target.connect(io, .{
+        .mode = .stream,
+        .timeout = .{ .duration = .{ .clock = .boot, .raw = .{ .nanoseconds = 0 } } },
+    }));
+
+    // A refused connect with a future .real deadline runs on Born (refused
+    // before the deadline), never forwarded to Threaded.
+    const closed_port = blk: {
+        var s = try target.listen(fio, .{});
+        const p = s.socket.address.ip4.port;
+        s.deinit(fio);
+        break :blk p;
+    };
+    const refused: Io.net.IpAddress = .{ .ip4 = .loopback(closed_port) };
+    const real_now = fio.vtable.now(fio.userdata, .real);
+    try expectError(error.ConnectionRefused, refused.connect(io, .{
+        .mode = .stream,
+        .timeout = .{ .deadline = .{ .clock = .real, .raw = .{ .nanoseconds = real_now.nanoseconds + 5 * std.time.ns_per_s } } },
+    }));
+
+    // A successful connect with a generous .boot duration stays on Born.
+    var server = try target.listen(fio, .{});
+    defer server.deinit(fio);
+    var client = try server.socket.address.connect(io, .{
+        .mode = .stream,
+        .timeout = .{ .duration = .{ .clock = .boot, .raw = .{ .nanoseconds = 5 * std.time.ns_per_s } } },
+    });
+    defer client.close(io);
+    var peer = try server.accept(fio);
+    defer peer.close(fio);
+    if (born_io.network_stats_enabled) {
+        const st = born_io.networkStats(io);
+        try expect(st.connect > 0);
+        try expectEqual(@as(u64, 0), st.threaded_connect);
+    }
+}
+
+test "a concurrent read on a parked Born read returns Unexpected" {
+    // Minor 8 end-to-end: a second read while one is parked is rejected
+    // (Unexpected), not orphaned; the parked read still completes when data
+    // arrives.
+    if (builtin.single_threaded) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const io = try initNetIo(&port);
+    defer born_io.deinit(io);
+    var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer fixture.deinit();
+    const fio = fixture.io();
+    var server: Io.net.Server = undefined;
+    var client: Io.net.Stream = undefined;
+    var peer: Io.net.Stream = undefined;
+    try setupPair(io, &fixture, &server, &client, &peer);
+    defer peer.close(fio);
+    defer client.close(io);
+    defer server.deinit(fio);
+
+    var result: std.atomic.Value(u32) = .init(0); // 0 pending, 1 got byte, 2 error
+    var got: [1]u8 = undefined;
+    const thread = try std.Thread.spawn(.{}, struct {
+        fn run(ioc: Io, h: Io.net.Socket.Handle, buf: []u8, out: *std.atomic.Value(u32)) void {
+            var iov = [_][]u8{buf};
+            const n = rawRead(ioc, h, &iov) catch {
+                out.store(2, .release);
+                return;
+            };
+            out.store(if (n == 1) 1 else 2, .release);
+        }
+    }.run, .{ io, client.socket.handle, got[0..], &result });
+    try Io.sleep(fio, .fromMilliseconds(50), .awake); // let the first read park
+
+    // A second concurrent read is rejected with Unexpected.
+    var buf2: [1]u8 = undefined;
+    var iov2 = [_][]u8{buf2[0..]};
+    try expectError(error.Unexpected, rawRead(io, client.socket.handle, &iov2));
+
+    // The parked read still completes when the peer sends a byte.
+    var msg = [_][]const u8{"Z"};
+    try expectEqual(@as(usize, 1), try rawWrite(fio, peer.socket.handle, &.{}, &msg, 1));
+    thread.join();
+    try expectEqual(@as(u32, 1), result.load(.acquire));
+    try expectEqualSlices(u8, "Z", &got);
+}

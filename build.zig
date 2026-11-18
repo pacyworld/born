@@ -130,6 +130,23 @@ pub fn build(b: *std.Build) void {
         });
         const time_bench_exe = b.addExecutable(.{ .name = "born-time-bench", .root_module = time_bench_mod });
         b.step("bench-time", "Build the born-time-bench time-route benchmark (bench/time.sh)").dependOn(&b.addInstallArtifact(time_bench_exe, .{}).step);
+
+        // On request only: the network-client echo benchmark (P5.3, review 619
+        // should-fix 6), installed as zig-out/bin/born-net-bench. It measures
+        // the parked-read hot path, so it uses the stats-on module to report
+        // the per-route counters regardless of -Dnetwork-stats.
+        const net_bench_mod = b.createModule(.{
+            .root_source_file = b.path("bench/net.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "born", .module = mod },
+                .{ .name = "born.io", .module = io_test_mod },
+                .{ .name = "compat", .module = compat_mod },
+            },
+        });
+        const net_bench_exe = b.addExecutable(.{ .name = "born-net-bench", .root_module = net_bench_mod });
+        b.step("bench-net", "Build the born-net-bench network-client benchmark (bench/net.zig)").dependOn(&b.addInstallArtifact(net_bench_exe, .{}).step);
     }
 
     const docs_obj = b.addObject(.{

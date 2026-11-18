@@ -549,23 +549,40 @@ stream client path on Born's reactor: IP and pathname Unix connect (with
 connect deadlines), stream reads and writes, close and shutdown. Listen,
 accept and DNS resolution stay on Threaded. A handle registry tracks only
 Born-owned sockets; a handle it does not know is forwarded to Threaded, so a
-Threaded listener and a Born connect compose in one interface. Socket event
-identity carries a generation, so an event for a closed-and-reused handle is
-dropped without touching caller storage. Every submitted op attempts its
-operation once when the loop swaps it in and arms interest only on a
-not-ready result, so edge-triggered readiness cannot strand already-buffered
-data. Born outcomes map coarsely onto the declared std error sets (a failed
-read or write becomes `ConnectionResetByPeer`); `Canceled` is reserved for
-real cancellation. Out-of-profile requests are declared errors, never silent
-fallbacks: bind and non-stream/non-TCP connect options return
+Threaded listener and a Born connect compose in one interface. A socket is
+unregistered from the registry before its descriptor closes, so an fd or
+SOCKET value reused by another thread never resolves to a dying slot. Socket
+event identity carries a generation, so an event for a closed-and-reused
+handle is dropped without touching caller storage. Read interest is
+persistent: armed once when the connect completes and removed only at close,
+with a readable event that has no pending read recording the kernel hint, so
+a completed parked read does not unmonitor and re-arm on the hot path. Every
+submitted op attempts its operation once when the loop swaps it in and arms
+interest only on a not-ready result, so edge-triggered readiness cannot
+strand already-buffered data. A second concurrent read or write on a parked
+op is rejected rather than orphaning it.
+
+Born outcomes map coarsely onto the declared std error sets (a failed read or
+write becomes `ConnectionResetByPeer`); `Canceled` is reserved for real
+cancellation and the deinit stop request. A dead route (a failure loop exit,
+or a submit refused after the queue dies) surfaces as `Unexpected`, never as
+the caller's cancellation. Out-of-profile requests are declared errors, never
+silent fallbacks: bind and non-stream/non-TCP connect options return
 `OptionUnsupported`, socket pairs `OperationUnsupported`, message and
 control-buffer I/O on a Born-owned handle complete with their tag result
 `Unexpected` (a batch with Born members completes those members per-op and
 awaits the rest normally), and `netWriteFile` is a read/copy loop through the
-Born write path on 0.16 and declared `Unimplemented` on 0.17. On Windows,
+Born write path on 0.16 and declared `Unimplemented` on 0.17.
+
+Connect timeouts stay on the Born route for every clock: a `.duration` is
+relative, and a `.deadline` on `.real` or `.boot` is converted to a Born
+monotonic deadline using that clock's now; a clock read refusal fails the
+connect with `Unexpected` rather than dropping the timeout. On Windows,
 connect timeout and close drain pending IOCP completions before the socket
-state is freed; `shutdown()` does not complete pending overlapped ops, so a
-recv/send shutdown also cancels the in-flight `WSARecv`/`WSASend` and the
+state is freed, and at loop exit every socket is canceled first, then
+completions are dispatched to their owning socket until the outstanding op
+count reaches zero. `shutdown()` does not complete pending overlapped ops, so
+a recv/send shutdown also cancels the in-flight `WSARecv`/`WSASend` and the
 loop completes a parked read with EOF. Per-route counters (connect, read
 and write completions serviced by Born, and Threaded-forward counts) are
 readable via `born_io.networkStats(io)` when the `network_stats` build
