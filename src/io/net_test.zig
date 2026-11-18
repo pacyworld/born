@@ -637,7 +637,7 @@ test "shutdown(.recv) drains buffered bytes then EOF (Windows)" {
     try expectEqual(@as(usize, 0), try rawRead(io, client.socket.handle, &iov_c));
 }
 
-test "close cancels a pending Born read" {
+test "close retires a pending Born read as Unexpected, not Canceled" {
     if (builtin.single_threaded) return error.SkipZigTest;
     var port = try born.EvPort.init(std.testing.allocator);
     defer port.deinit();
@@ -652,15 +652,17 @@ test "close cancels a pending Born read" {
     defer peer.close(fixture.io());
     defer server.deinit(fixture.io());
 
-    // Park a Born read, then close the socket from another thread: the pending
-    // read retires as Canceled and close itself completes (infallible).
-    var outcome: std.atomic.Value(u32) = .init(0); // 0 pending, 1 canceled, 2 other
+    // Park a Born read, then close the socket from another thread: the close
+    // kills the socket's route, so the pending read retires route_dead and
+    // surfaces Unexpected, never the caller's Canceled (#106, section 4.5).
+    // Close itself completes (infallible).
+    var outcome: std.atomic.Value(u32) = .init(0); // 0 pending, 1 unexpected, 2 other
     const thread = try std.Thread.spawn(.{}, struct {
         fn run(ioc: Io, h: Io.net.Socket.Handle, out: *std.atomic.Value(u32)) void {
             var buf: [8]u8 = undefined;
             var iov = [_][]u8{buf[0..]};
             _ = rawRead(ioc, h, &iov) catch |err| {
-                out.store(if (err == error.Canceled) 1 else 2, .release);
+                out.store(if (err == error.Unexpected) 1 else 2, .release);
                 return;
             };
             out.store(2, .release);
