@@ -68,6 +68,7 @@ pub fn build(b: *std.Build) void {
         const io_options = b.addOptions();
         io_options.addOption(bool, "time_stats", b.option(bool, "time-stats", "Enable born.io time-route latency stats (default off)") orelse false);
         io_options.addOption(bool, "network_stats", b.option(bool, "network-stats", "Enable born.io network-route per-route counters (default off)") orelse false);
+        io_options.addOption(bool, "process_stats", b.option(bool, "process-stats", "Enable born.io process-route per-route counters (default off)") orelse false);
         break :blk io_options.createModule();
     } else undefined;
 
@@ -91,6 +92,7 @@ pub fn build(b: *std.Build) void {
         const io_stats_options = b.addOptions();
         io_stats_options.addOption(bool, "time_stats", true);
         io_stats_options.addOption(bool, "network_stats", true);
+        io_stats_options.addOption(bool, "process_stats", true);
         const io_test_mod = b.createModule(.{
             .root_source_file = b.path("src/io/root.zig"),
             .target = target,
@@ -147,6 +149,24 @@ pub fn build(b: *std.Build) void {
         });
         const net_bench_exe = b.addExecutable(.{ .name = "born-net-bench", .root_module = net_bench_mod });
         b.step("bench-net", "Build the born-net-bench network-client benchmark (bench/net.zig)").dependOn(&b.addInstallArtifact(net_bench_exe, .{}).step);
+
+        // On request only: the process-route benchmark (P5.4), installed as
+        // zig-out/bin/born-process-bench. It measures spawn/wait/kill throughput
+        // and latency, so it uses the stats-on module to report the per-route
+        // counters regardless of -Dprocess-stats. FreeBSD/Linux only (the
+        // process route); the source comptime-rejects other targets.
+        const process_bench_mod = b.createModule(.{
+            .root_source_file = b.path("bench/process.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "born", .module = mod },
+                .{ .name = "born.io", .module = io_test_mod },
+                .{ .name = "compat", .module = compat_mod },
+            },
+        });
+        const process_bench_exe = b.addExecutable(.{ .name = "born-process-bench", .root_module = process_bench_mod });
+        b.step("bench-process", "Build the born-process-bench process-route benchmark (bench/process.zig)").dependOn(&b.addInstallArtifact(process_bench_exe, .{}).step);
     }
 
     const docs_obj = b.addObject(.{

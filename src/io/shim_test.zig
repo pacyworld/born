@@ -29,17 +29,21 @@ test "io rejects an unimplemented Born route at construction" {
     defer port.deinit();
 
     // No silent fallback: a Born route that is not implemented is a
-    // construction error, not a delegation to Threaded. The time route (P5.2)
-    // and the network client route (P5.3) are implemented and exercised in
-    // time_test.zig / net_test.zig; file and process remain rejected.
+    // construction error, not a delegation to Threaded. The time route (P5.2),
+    // the network client route (P5.3) and, on FreeBSD/Linux, the process route
+    // (P5.4) are implemented and exercised in time_test.zig / net_test.zig /
+    // process_test.zig; file remains rejected everywhere, and process is
+    // rejected on targets without process descriptors / pidfds.
     try std.testing.expectError(error.CapabilityUnsupported, born_io.io(&port, .{
         .allocator = std.testing.allocator,
         .capabilities = .{ .file = .born_evented },
     }));
-    try std.testing.expectError(error.CapabilityUnsupported, born_io.io(&port, .{
-        .allocator = std.testing.allocator,
-        .capabilities = .{ .process = .born_evented },
-    }));
+    if (!born_io.process_supported) {
+        try std.testing.expectError(error.CapabilityUnsupported, born_io.io(&port, .{
+            .allocator = std.testing.allocator,
+            .capabilities = .{ .process = .born_evented },
+        }));
+    }
 }
 
 test "network Born route constructs with the network vtable and deinits" {
