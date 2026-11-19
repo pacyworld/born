@@ -18,6 +18,10 @@ pub const std_options = std.Options{
         .{ .scope = .websocket, .level = .warn },
     },
     .logFn = customLogFn,
+    // The HTTP contract suite is plain-HTTP only (design 7.3), consistent
+    // with nats use_tls = false; compiling TLS out keeps the client's
+    // TLS-only fields void on both toolchains.
+    .http_disable_tls = true,
 };
 
 const std = @import("std");

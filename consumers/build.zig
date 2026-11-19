@@ -138,6 +138,34 @@ pub fn build(b: *std.Build) void {
     b.step("test-e2e", "Run the nats e2e suite on born.io against native nats-server v2.15.0 (-Dborn-network=false for the all-Threaded baseline)").dependOn(&run_e2e.step);
     const install_e2e = b.addInstallArtifact(e2e_tests, .{});
     b.step("test-e2e-bin", "Install the nats e2e test executable without running it").dependOn(&install_e2e.step);
+
+    // HTTP contract suite (design 7.3, Q2): born-owned std.http.Client
+    // contracts against a plain-Threaded fixture server; carries the 0.17.1
+    // born.io proof. -Dborn-network=false runs the all-Threaded control leg.
+    const http_options = b.addOptions();
+    http_options.addOption(bool, "born_network", born_network);
+    http_options.addOption([]const u8, "suite", "http");
+    const http_mod = b.createModule(.{
+        .root_source_file = b.path("http/contract.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "std", .module = facade.std_mod },
+            .{ .name = "born_io", .module = io_mod },
+            .{ .name = "born", .module = core_mod },
+            .{ .name = "consumer_options", .module = http_options.createModule() },
+        },
+    });
+    linkPlatform(http_mod, target);
+    const http_tests = b.addTest(.{
+        .name = "http-contract",
+        .root_module = http_mod,
+        .test_runner = .{ .path = b.path("runner.zig"), .mode = .simple },
+    });
+    const run_http = b.addRunArtifact(http_tests);
+    b.step("test-http", "Run the std.http.Client contract suite on born.io (-Dborn-network=false for the all-Threaded control leg)").dependOn(&run_http.step);
+    const install_http = b.addInstallArtifact(http_tests, .{});
+    b.step("test-http-bin", "Install the HTTP contract test executable without running it").dependOn(&install_http.step);
 }
 
 fn linkPlatform(mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
