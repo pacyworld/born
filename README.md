@@ -610,9 +610,9 @@ op is rejected rather than orphaning it.
 
 Born outcomes map coarsely onto the declared std error sets (a failed read or
 write becomes `ConnectionResetByPeer`); `Canceled` is reserved for real
-cancellation and the deinit stop request. A dead route (a failure loop exit,
-or a submit refused after the queue dies) surfaces as `Unexpected`, never as
-the caller's cancellation. Out-of-profile requests are declared errors, never
+cancellation and the deinit stop request. A dead route (a close of the op's
+socket, a failure loop exit, or a submit refused after the queue dies)
+surfaces as `Unexpected`, never as the caller's cancellation. Out-of-profile requests are declared errors, never
 silent fallbacks: bind and non-stream/non-TCP connect options return
 `OptionUnsupported`, socket pairs `OperationUnsupported`, message and
 control-buffer I/O on a Born-owned handle complete with their tag result
