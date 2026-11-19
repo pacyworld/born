@@ -683,7 +683,7 @@ const Env = struct {
 
     fn readEnvBool(environ_map: *std.process.Environ.Map, key: []const u8, deflt: bool) bool {
         const value = environ_map.get(key) orelse return deflt;
-        return std.ascii.eqlIgnoreCase(value, "true");
+        return std.ascii.eqlIgnoreCase(value, "true") or std.ascii.eqlIgnoreCase(value, "1");
     }
 
     fn readEnvVerbose(environ_map: *std.process.Environ.Map) Verbose {
