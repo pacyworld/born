@@ -266,7 +266,7 @@ jobs:
             rm -f "$cache/nats-server.tar.gz"
           fi
           test "$("$cache/nats-server" --version)" = "nats-server: v2.15.0"
-          echo "PATH=$cache:$PATH" >> "$GITHUB_ENV"
+          echo "$cache" >> "$GITHUB_PATH"
 
       - name: Run nats unit suite
         if: matrix.zig == '0.16.0'
@@ -380,7 +380,7 @@ jobs:
             rm -f "$cache/nats-server.tar.gz"
           fi
           test "$("$cache/nats-server" --version)" = "nats-server: v2.15.0"
-          echo "PATH=$cache:$PATH" >> "$GITHUB_ENV"
+          echo "$cache" >> "$GITHUB_PATH"
 
       - name: Run nats unit suite
         if: matrix.zig == '0.16.0'
@@ -480,6 +480,58 @@ jobs:
           name: consumer-http-${{ matrix.zig }}-${{ matrix.optimize }}-${{ matrix.route }}
           path: consumer-http
 
+      - name: Diagnose Windows TLS trust failure (temporary, W2)
+        if: matrix.zig == '0.16.0' && matrix.optimize == 'Debug' && matrix.route == 'born'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          "=== identity / clock ==="
+          whoami
+          [System.DateTime]::UtcNow.ToString('o')
+          (Get-CimInstance Win32_OperatingSystem).Caption
+          "=== machine root store: relevant CAs ==="
+          Get-ChildItem Cert:\LocalMachine\Root | Where-Object { $_.Subject -match 'ISRG|USERTrust|Sectigo|DigiCert' } | ForEach-Object { "$($_.Subject) | NotAfter=$($_.NotAfter.ToString('o'))" }
+          "=== user root store: relevant CAs ==="
+          Get-ChildItem Cert:\CurrentUser\Root | Where-Object { $_.Subject -match 'ISRG|USERTrust|Sectigo|DigiCert' } | ForEach-Object { "$($_.Subject) | NotAfter=$($_.NotAfter.ToString('o'))" }
+          "=== .NET default TLS protocols ==="
+          [Net.ServicePointManager]::SecurityProtocol
+          "=== AIA / CRL / OCSP reachability ==="
+          foreach ($u in @('http://yr1.i.lencr.org/', 'http://yr1.c.lencr.org/57.crl', 'http://ocsp.sectigo.com/', 'http://crt.sectigo.com/SectigoPublicServerAuthenticationCADVE36.crt')) {
+            try { $r = Invoke-WebRequest -Uri $u -UseBasicParsing -TimeoutSec 10; "$u -> $($r.StatusCode)" } catch { "$u -> FAIL: $($_.Exception.Message)" }
+          }
+          "=== chain capture for the release URL (callback returns false; validation stays strict) ==="
+          $url = 'https://github.com/nats-io/nats-server/releases/download/v2.15.0/nats-server-v2.15.0-windows-amd64.zip'
+          $script:captured = @()
+          $cb = [System.Net.Security.RemoteCertificateValidationCallback]{
+            param($sender, $cert, $chain, $errors)
+            $script:captured += "SslPolicyErrors: $errors"
+            if ($cert) { $script:captured += "Leaf: $($cert.Subject) | issuer=$($cert.Issuer) | NotBefore=$($cert.GetEffectiveDateString()) | NotAfter=$($cert.GetExpirationDateString())" }
+            if ($chain) {
+              $script:captured += "RevocationMode: $($chain.ChainPolicy.RevocationMode) | UrlRetrievalTimeout: $($chain.ChainPolicy.UrlRetrievalTimeout)"
+              foreach ($s in $chain.ChainStatus) { $script:captured += "ChainStatus: $($s.Status) - $($s.StatusInformation.Trim())" }
+              foreach ($e in $chain.ChainElements) {
+                $st = ($e.ChainElementStatus | ForEach-Object { $_.Status }) -join ','
+                $script:captured += "Element: $($e.Certificate.Subject) | status=[$st]"
+              }
+            }
+            return $false
+          }
+          [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $cb
+          try {
+            Invoke-WebRequest -Uri $url -OutFile "$env:RUNNER_TEMP\diag.zip" -UseBasicParsing
+            "request unexpectedly succeeded"
+          } catch {
+            "Request failed (expected): $($_.Exception.Message)"
+            $inner = $_.Exception.InnerException
+            while ($inner) { "Inner: $($inner.Message)"; $inner = $inner.InnerException }
+          }
+          [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
+          $script:captured | ForEach-Object { $_ }
+          "=== curl.exe (Schannel) comparison ==="
+          & curl.exe -fsSL -o "$env:RUNNER_TEMP\diag-curl.zip" $url 2>&1 | ForEach-Object { "$_" }
+          "curl.exe exit: $LASTEXITCODE"
+          if ($LASTEXITCODE -eq 0) { (Get-FileHash "$env:RUNNER_TEMP\diag-curl.zip" -Algorithm SHA256).Hash.ToLowerInvariant() }
+          throw "W2 diagnostic complete - see chain capture above"
+
       - name: Provision nats-server v2.15.0 (pinned sha256, cached)
         if: matrix.zig == '0.16.0'
         run: |
@@ -498,7 +550,7 @@ jobs:
           }
           $version = (& $exe --version | Out-String).Trim()
           if ($version -ne 'nats-server: v2.15.0') { throw "nats-server pin mismatch: $version" }
-          Add-Content -Path $env:GITHUB_ENV -Value "PATH=$bin;$env:PATH" -Encoding ascii
+          Add-Content -Path $env:GITHUB_PATH -Value $bin -Encoding ascii
 
       - name: Run nats unit suite
         if: matrix.zig == '0.16.0'
