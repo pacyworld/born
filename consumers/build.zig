@@ -166,6 +166,24 @@ pub fn build(b: *std.Build) void {
     b.step("test-http", "Run the std.http.Client contract suite on born.io (-Dborn-network=false for the all-Threaded control leg)").dependOn(&run_http.step);
     const install_http = b.addInstallArtifact(http_tests, .{});
     b.step("test-http-bin", "Install the HTTP contract test executable without running it").dependOn(&install_http.step);
+
+    // On request only: the HTTP consumer benchmark (design section 9),
+    // installed as zig-out/bin/born-http-bench. Driver and quiet-host rule:
+    // bench/http.sh. No std facade: the benchmark runs on the real std and
+    // injects born.io into the client explicitly. Never part of a test step.
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("bench/http.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "born_io", .module = io_mod },
+            .{ .name = "born", .module = core_mod },
+            .{ .name = "compat", .module = compat_mod },
+        },
+    });
+    linkPlatform(bench_mod, target);
+    const bench_exe = b.addExecutable(.{ .name = "born-http-bench", .root_module = bench_mod });
+    b.step("bench-http", "Build the born-http-bench HTTP consumer benchmark (bench/http.sh)").dependOn(&b.addInstallArtifact(bench_exe, .{}).step);
 }
 
 fn linkPlatform(mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {

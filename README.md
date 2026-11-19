@@ -96,6 +96,9 @@ OS per primitive, and lists real runs only.
 | kqueue, FreeBSD 15 (CI FreeBSD runner) | born.io network route, close is route death (#106) | [run 330, FreeBSD job (zig 0.16.0)](https://pacyworld.dev/pacyworld/born/actions/runs/330/jobs/2) and [zig 0.17.1 job](https://pacyworld.dev/pacyworld/born/actions/runs/330/jobs/3): Debug and ReleaseSafe, born-io-tests 128 passed, 6 skipped, 0 failed each; the close-retirement unit and the Unexpected close contract run here | 2026-11-19 | [cdc2b58](https://pacyworld.dev/pacyworld/born/commit/cdc2b58b383eb4d697b18ea0a349c3aa0f1eea04) |
 | epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | born.io network route, close is route death (#106) | [run 330, Linux job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/330/jobs/8): Debug and ReleaseSafe on 0.16.0 and 0.17.1, born-io-tests 125 passed, 9 skipped, 0 failed each; the close-retirement unit and the Unexpected close contract run here | 2026-11-19 | [cdc2b58](https://pacyworld.dev/pacyworld/born/commit/cdc2b58b383eb4d697b18ea0a349c3aa0f1eea04) |
 | IOCP, Windows Server 2022 build 20348 (CI Windows runner) | born.io network route, close retirement and failed exit drain leak guard (#106) | [run 330, Windows job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/330/jobs/14): Debug and ReleaseSafe on 0.16.0 and 0.17.1, born-io-tests.exe 76 passed, 58 skipped, 0 failed each; the leak path is tested at the deinit-decision level only (a synthetic drain failure), not by a real GetQueuedCompletionStatusEx failure | 2026-11-19 | [cdc2b58](https://pacyworld.dev/pacyworld/born/commit/cdc2b58b383eb4d697b18ea0a349c3aa0f1eea04) |
+| kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io network route, nats.zig consumer unit suite | nats-unit Debug and ReleaseSafe on Zig 0.16.0: 119 passed, 2 skipped, 0 failed each; born connect=2 with threaded connect=0, route proof PASS | 2026-11-19 | [2f1d67a](https://pacyworld.dev/pacyworld/born/commit/2f1d67afda7665169f3cd2d8ed56b376067d9550) |
+| kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io network route, nats.zig consumer e2e suite (native nats-server v2.15.0) | nats-e2e Debug and ReleaseSafe on Zig 0.16.0, born and all-Threaded baseline: 177 passed, 0 skipped, 0 failed each; born legs connect=192 with threaded connect=0 (fixture-side threaded r=5 w=4), baseline legs all counters zero with identical results, route proof PASS x4 | 2026-11-19 | [2f1d67a](https://pacyworld.dev/pacyworld/born/commit/2f1d67afda7665169f3cd2d8ed56b376067d9550) |
+| kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io network route, std.http.Client contract suite | http-contract Debug and ReleaseSafe on Zig 0.16.0 and 0.17.1, born and all-Threaded control: 8 passed, 0 skipped, 0 failed each; born legs connect=8 with all threaded counters zero, control legs identical results, route proof PASS x8 | 2026-11-19 | [f8470e2](https://pacyworld.dev/pacyworld/born/commit/f8470e27b3f5b31944b9ab1252472c74e8d5fcbc) |
 
 Commit 3ed3785 changes only the CI workflow; its library and tests are
 those of master d1017b8. Skips identify platform exclusions or primitives
@@ -696,6 +699,59 @@ The all-Threaded baseline (every slot delegated, no loop thread) remains
 available and is the default. The shim is isolated: the core never imports
 it, and the build enforces that boundary on every toolchain. Removal is
 `git rm -r src/io` plus the conditional export lines in `build.zig`.
+
+### Proof consumers
+
+The `consumers/` package proves the born.io network client route against
+real upstream consumers: the nats.zig client (unit and e2e suites) and
+std.http.Client (a born-owned contract suite). It is a separate package
+with its own build graph; born's root build and shipped module set are
+unchanged, and nothing in `consumers/` ships downstream. A generated std
+facade redirects `std.testing.io` to a fresh born-backed Io per test, so
+the vendored consumer tests run on the shim without source changes.
+
+- nats unit + e2e (Zig 0.16.0): the upstream tests tree is vendored
+  byte-identical at pin b8ffdd9 and hash-verified against
+  `consumers/nats/manifest.sha256` at configure time. The only permitted
+  difference is tests/utils.zig, a born-owned facade that provisions
+  native nats-server v2.15.0 child processes (sha256-pinned per OS in CI)
+  in place of docker-compose, on the vendored fixed loopback ports.
+- std.http.Client contracts (Zig 0.16.0 and 0.17.1): eight born-owned
+  tests over plain HTTP against a plain-Threaded fixture server. This
+  suite carries the 0.17.1 consumer proof.
+- Gap note: upstream nats.zig tip does not build on 0.17.1, so the nats
+  legs are 0.16.0-only; #109 tracks the port. On 0.17.1 the consumer
+  proof is the HTTP suite plus the born.io shim suite.
+
+Every suite runs on born.io (`capabilities.network = .born_evented`) and,
+as a permanent control leg, on the all-Threaded baseline
+(`-Dborn-network=false`) with identical results required. The shared test
+runner asserts route proof from the shim's network counters: no consumer
+connect may be delegated to Threaded (`threaded_connect == 0` on every
+born leg) and born connect > 0; e2e and HTTP also require born read and
+write > 0. The nats-e2e leg additionally shows fixture-side threaded
+read/write: the vendored keepalive and reconnect tests run fake servers
+whose listen/accept handles are Threaded-owned under the shim's
+client-only profile, so their reads/writes forward by design. That is
+fixture traffic, not consumer traffic.
+
+CI (`.forgejo/workflows/consumers.yml`) builds every leg on each push and
+pull request (FreeBSD native plus Linux and Windows cross-builds, with
+sha256) and runs the suites on all three kernels weekly and on
+workflow_dispatch (the release gate). The HTTP consumer benchmark
+(`zig build bench-http`, driver `consumers/bench/http.sh`) is a
+per-release recording step under the same quiet-host guard as
+`bench/time.sh`, not a gate.
+
+Run locally from `consumers/` with Zig >= 0.16 (the e2e suite needs
+nats-server v2.15.0 on PATH):
+
+```
+zig build test-unit
+zig build test-e2e
+zig build test-http
+zig build test-unit -Dborn-network=false
+```
 
 ## Use
 

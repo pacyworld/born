@@ -14,5 +14,5 @@
             .hash = "xsync-1.0.0-CcXcL3DCAQA0FPLdBPhtTB182kN-COorlMw_cabmgHJm",
         },
     },
-    .paths = .{ "build.zig", "build.zig.zon", "runner.zig", "nats", "http" },
+    .paths = .{ "build.zig", "build.zig.zon", "runner.zig", "nats", "http", "bench" },
 }
