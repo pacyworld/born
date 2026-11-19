@@ -276,8 +276,11 @@ jobs:
           sha256sum -c nats-unit.sha256
           chmod +x nats-unit
           echo "host: $(uname -srm), commit $GITHUB_SHA, zig ${{ matrix.zig }} ${{ matrix.optimize }} ${{ matrix.route }}"
-          ./nats-unit 2>&1 | tee nats-unit.log
+          if ./nats-unit > nats-unit.log 2>&1; then rc=0; else rc=$?; fi
+          cat nats-unit.log
+          if [ "$rc" -ne 0 ]; then echo "nats-unit exited $rc"; exit "$rc"; fi
           summary=$(grep -E '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$' nats-unit.log) || { echo "nats-unit printed no passing summary line"; exit 1; }
+          grep -q '^route proof: PASS$' nats-unit.log || { echo "nats-unit printed no route proof PASS line"; exit 1; }
           echo "runtime evidence (x86_64-freebsd, kqueue, nats-unit, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $summary"
 
       - name: Run nats e2e suite
@@ -291,8 +294,11 @@ jobs:
           mkdir -p tests
           cp -R "$ws/nats-configs" tests/configs
           echo "host: $(uname -srm), commit $GITHUB_SHA, zig ${{ matrix.zig }} ${{ matrix.optimize }} ${{ matrix.route }}"
-          ./nats-e2e 2>&1 | tee nats-e2e.log
+          if ./nats-e2e > nats-e2e.log 2>&1; then rc=0; else rc=$?; fi
+          cat nats-e2e.log
+          if [ "$rc" -ne 0 ]; then echo "nats-e2e exited $rc"; exit "$rc"; fi
           summary=$(grep -E '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$' nats-e2e.log) || { echo "nats-e2e printed no passing summary line"; exit 1; }
+          grep -q '^route proof: PASS$' nats-e2e.log || { echo "nats-e2e printed no route proof PASS line"; exit 1; }
           echo "runtime evidence (x86_64-freebsd, kqueue, nats-e2e, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $summary"
 
       - name: Run HTTP contract suite
@@ -302,8 +308,11 @@ jobs:
           sha256sum -c http-contract.sha256
           chmod +x http-contract
           echo "host: $(uname -srm), commit $GITHUB_SHA, zig ${{ matrix.zig }} ${{ matrix.optimize }} ${{ matrix.route }}"
-          ./http-contract 2>&1 | tee http-contract.log
+          if ./http-contract > http-contract.log 2>&1; then rc=0; else rc=$?; fi
+          cat http-contract.log
+          if [ "$rc" -ne 0 ]; then echo "http-contract exited $rc"; exit "$rc"; fi
           summary=$(grep -E '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$' http-contract.log) || { echo "http-contract printed no passing summary line"; exit 1; }
+          grep -q '^route proof: PASS$' http-contract.log || { echo "http-contract printed no route proof PASS line"; exit 1; }
           echo "runtime evidence (x86_64-freebsd, kqueue, http, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $summary"
 
   # Linux runner (Ubuntu 24.04): epoll. The job container shares the runner's
@@ -381,8 +390,11 @@ jobs:
           sha256sum -c nats-unit.sha256
           chmod +x nats-unit
           echo "host: $(uname -srm), $(. /etc/os-release && echo "$PRETTY_NAME") container, commit $GITHUB_SHA, zig ${{ matrix.zig }} ${{ matrix.optimize }} ${{ matrix.route }}"
-          ./nats-unit 2>&1 | tee nats-unit.log
+          if ./nats-unit > nats-unit.log 2>&1; then rc=0; else rc=$?; fi
+          cat nats-unit.log
+          if [ "$rc" -ne 0 ]; then echo "nats-unit exited $rc"; exit "$rc"; fi
           summary=$(grep -E '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$' nats-unit.log) || { echo "nats-unit printed no passing summary line"; exit 1; }
+          grep -q '^route proof: PASS$' nats-unit.log || { echo "nats-unit printed no route proof PASS line"; exit 1; }
           echo "runtime evidence (x86_64-linux-gnu, epoll, nats-unit, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $summary"
 
       - name: Run nats e2e suite
@@ -396,8 +408,11 @@ jobs:
           mkdir -p tests
           cp -R "$ws/nats-configs" tests/configs
           echo "host: $(uname -srm), $(. /etc/os-release && echo "$PRETTY_NAME") container, commit $GITHUB_SHA, zig ${{ matrix.zig }} ${{ matrix.optimize }} ${{ matrix.route }}"
-          ./nats-e2e 2>&1 | tee nats-e2e.log
+          if ./nats-e2e > nats-e2e.log 2>&1; then rc=0; else rc=$?; fi
+          cat nats-e2e.log
+          if [ "$rc" -ne 0 ]; then echo "nats-e2e exited $rc"; exit "$rc"; fi
           summary=$(grep -E '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$' nats-e2e.log) || { echo "nats-e2e printed no passing summary line"; exit 1; }
+          grep -q '^route proof: PASS$' nats-e2e.log || { echo "nats-e2e printed no route proof PASS line"; exit 1; }
           echo "runtime evidence (x86_64-linux-gnu, epoll, nats-e2e, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $summary"
 
       - name: Run HTTP contract suite
@@ -407,8 +422,11 @@ jobs:
           sha256sum -c http-contract.sha256
           chmod +x http-contract
           echo "host: $(uname -srm), $(. /etc/os-release && echo "$PRETTY_NAME") container, commit $GITHUB_SHA, zig ${{ matrix.zig }} ${{ matrix.optimize }} ${{ matrix.route }}"
-          ./http-contract 2>&1 | tee http-contract.log
+          if ./http-contract > http-contract.log 2>&1; then rc=0; else rc=$?; fi
+          cat http-contract.log
+          if [ "$rc" -ne 0 ]; then echo "http-contract exited $rc"; exit "$rc"; fi
           summary=$(grep -E '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$' http-contract.log) || { echo "http-contract printed no passing summary line"; exit 1; }
+          grep -q '^route proof: PASS$' http-contract.log || { echo "http-contract printed no route proof PASS line"; exit 1; }
           echo "runtime evidence (x86_64-linux-gnu, epoll, http, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $summary"
 
   # Windows runner (Windows Server 2022, host mode): IOCP. No Zig is needed.
@@ -498,6 +516,8 @@ jobs:
           if ($rc -ne 0) { throw "nats-unit.exe exited with $rc" }
           $summary = Select-String -Path nats-unit.log -Pattern '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$'
           if (-not $summary) { throw "nats-unit.exe printed no passing summary line" }
+          $proof = Select-String -Path nats-unit.log -Pattern '^route proof: PASS$'
+          if (-not $proof) { throw "nats-unit.exe printed no route proof PASS line" }
           "runtime evidence (x86_64-windows-gnu, IOCP, nats-unit, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $($summary.Line)"
 
       - name: Run nats e2e suite
@@ -517,6 +537,8 @@ jobs:
           if ($rc -ne 0) { throw "nats-e2e.exe exited with $rc" }
           $summary = Select-String -Path nats-e2e.log -Pattern '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$'
           if (-not $summary) { throw "nats-e2e.exe printed no passing summary line" }
+          $proof = Select-String -Path nats-e2e.log -Pattern '^route proof: PASS$'
+          if (-not $proof) { throw "nats-e2e.exe printed no route proof PASS line" }
           "runtime evidence (x86_64-windows-gnu, IOCP, nats-e2e, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $($summary.Line)"
 
       - name: Run HTTP contract suite
@@ -533,4 +555,6 @@ jobs:
           if ($rc -ne 0) { throw "http-contract.exe exited with $rc" }
           $summary = Select-String -Path http-contract.log -Pattern '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$'
           if (-not $summary) { throw "http-contract.exe printed no passing summary line" }
+          $proof = Select-String -Path http-contract.log -Pattern '^route proof: PASS$'
+          if (-not $proof) { throw "http-contract.exe printed no route proof PASS line" }
           "runtime evidence (x86_64-windows-gnu, IOCP, http, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $($summary.Line)"

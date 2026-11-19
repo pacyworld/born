@@ -5,7 +5,9 @@
 // reinit with a FRESH born-backed Io assigned to the facade's writable
 // std.testing.io, for setup/teardown tests too (review 192 carry-in 6).
 // Prints the born-format summary CI greps for, a networkStats route-evidence
-// line, and enforces the route-proof pass/fail gate (review 192 carry-in 1).
+// line, and enforces the route-proof pass/fail gate (review 192 carry-in 1)
+// both suite-wide and per test: threaded read/write is attributed to the
+// named vendored fixture-server tests only (review 665 R3).
 //
 // In your build.zig, specify this custom test runner:
 // const tests = b.addTest(.{
@@ -147,6 +149,41 @@ const Totals = struct {
     }
 };
 
+// Vendored e2e tests that run fake servers via listen/accept on
+// std.testing.io (keepalive_test's SilentServer, reconnect_limits_test's
+// FlakyServer). The shim's adjudicated client-only profile (P5.3 Option B)
+// routes listen/accept to Threaded, so reads/writes on those Threaded-owned
+// fixture handles forward and count. Only these tests may move threaded
+// read/write on a born e2e leg; any other test doing so is a consumer
+// delegation and fails (review 665 R3). Names as builtin.test_functions
+// reports them.
+const fixture_threaded_tests = [_][]const u8{
+    "keepalive_test.test.stale connection detected on unresponsive server",
+    "reconnect_limits_test.test.handshake failures count against max_reconnect",
+};
+
+fn fixtureThreadedAllowed(name: []const u8) bool {
+    if (!std.mem.eql(u8, consumer_options.suite, "nats-e2e")) return false;
+    for (fixture_threaded_tests) |allowed| {
+        if (std.mem.eql(u8, allowed, name)) return true;
+    }
+    return false;
+}
+
+/// Per-test route attribution (review 665 R3). Each test runs on a fresh
+/// born reactor, so its networkStats are exactly its own traffic (plus its
+/// per-test setup, which shares the io). threaded_connect is never allowed;
+/// threaded read/write only in the named fixture-server tests. Returns the
+/// failure reason, or null.
+fn testRouteProof(s: born_io.NetworkStats, name: []const u8) ?[]const u8 {
+    if (!consumer_options.born_network) return null;
+    if (s.threaded_connect != 0)
+        return "threaded connect nonzero: a consumer connect was delegated";
+    if (s.threaded_read == 0 and s.threaded_write == 0) return null;
+    if (fixtureThreadedAllowed(name)) return null;
+    return "threaded read/write nonzero outside the fixture-server tests";
+}
+
 /// Route-proof gate (review 192 carry-in 1, design section 6). Born counters
 /// increment only on Born-route completions; the baseline-vtable forwards do
 /// not increment threaded counters, so born connect > 0 is positive proof
@@ -162,6 +199,8 @@ const Totals = struct {
 /// Option B) routes listen/accept to Threaded, so reads/writes on those
 /// Threaded-owned handles forward and count. That is fixture traffic, not
 /// consumer traffic; the vendored bytes cannot be changed (carry-in 4).
+/// testRouteProof attributes that allowance per test, so a consumer
+/// read/write delegation in any other e2e test still fails the leg.
 fn routeProof(t: *const Totals) ?[]const u8 {
     if (consumer_options.born_network) {
         if (t.threaded_connect != 0)
@@ -246,7 +285,12 @@ pub fn main(init: std.process.Init) !void {
                 Printer.status(.fail, "\nsetup \"{s}\" failed: {}\n", .{ t.name, err });
                 return err;
             };
-            totals.add(born_io.networkStats(test_io.tio));
+            const stats = born_io.networkStats(test_io.tio);
+            if (testRouteProof(stats, t.name)) |reason| {
+                Printer.status(.fail, "\nsetup \"{s}\" route proof: {s}\n", .{ t.name, reason });
+                return error.RouteProofFailed;
+            }
+            totals.add(stats);
         }
     }
 
@@ -362,22 +406,44 @@ pub fn main(init: std.process.Init) !void {
 
         const ns_taken = slowest.endTiming(io, gpa, friendly_name);
 
-        totals.add(born_io.networkStats(test_io.tio));
+        const stats = born_io.networkStats(test_io.tio);
+        if (env.route_trace and (stats.threaded_connect != 0 or stats.threaded_read != 0 or stats.threaded_write != 0)) {
+            Printer.fmt("route trace: {s}: threaded connect={d} read={d} write={d}\n", .{ friendly_name, stats.threaded_connect, stats.threaded_read, stats.threaded_write });
+        }
+        const delegation = testRouteProof(stats, friendly_name);
+        totals.add(stats);
         // test_io deinits via defer at iteration end; its internals allocate
         // from gpa, so the per-test allocator verdict is independent.
-        if (testAllocatorLeaked()) {
-            fail += 1;
-            failed_tests.append(gpa, friendly_name) catch {};
+        const leaked = testAllocatorLeaked();
+        if (leaked) {
             Printer.status(.fail, "\n{s}\n\"{s}\" - Memory Leak\n{s}\n", .{ BORDER, friendly_name, BORDER });
         }
+        if (delegation) |reason| {
+            Printer.status(.fail, "\n{s}\n\"{s}\" - route proof: {s}\n{s}\n", .{ BORDER, friendly_name, reason, BORDER });
+        }
+        // A leaking or delegating test counts once, as a failure, never also
+        // as a pass or skip (review 665 N2/R3).
+        const runner_fail = leaked or delegation != null;
 
         var fail_err: ?anyerror = null;
         if (result) |_| {
-            pass += 1;
+            if (runner_fail) {
+                status = .fail;
+                fail += 1;
+                failed_tests.append(gpa, friendly_name) catch {};
+            } else {
+                pass += 1;
+            }
         } else |err| switch (err) {
             error.SkipZigTest => {
-                skip += 1;
-                status = .skip;
+                if (runner_fail) {
+                    status = .fail;
+                    fail += 1;
+                    failed_tests.append(gpa, friendly_name) catch {};
+                } else {
+                    skip += 1;
+                    status = .skip;
+                }
             },
             else => {
                 status = .fail;
@@ -438,7 +504,12 @@ pub fn main(init: std.process.Init) !void {
                 Printer.status(.fail, "\nteardown \"{s}\" failed: {}\n", .{ t.name, err });
                 return err;
             };
-            totals.add(born_io.networkStats(test_io.tio));
+            const stats = born_io.networkStats(test_io.tio);
+            if (testRouteProof(stats, t.name)) |reason| {
+                Printer.status(.fail, "\nteardown \"{s}\" route proof: {s}\n", .{ t.name, reason });
+                return error.RouteProofFailed;
+            }
+            totals.add(stats);
         }
     }
 
@@ -447,9 +518,13 @@ pub fn main(init: std.process.Init) !void {
         root_node.end();
     }
 
-    // Born-format summary: the CI runtime jobs grep for this line.
-    const status = if (fail == 0) Status.pass else Status.fail;
-    Printer.status(status, "\n{d} passed; {d} skipped; {d} failed.\n", .{ pass, skip, fail });
+    // Evaluate the route gate before the summary so the printed verdict
+    // covers the whole leg (review 665 R4). The summary, networkStats and
+    // route-proof lines are plain text (no ANSI): the CI jobs grep them
+    // anchored.
+    const gate = routeProof(&totals);
+    const leg_ok = fail == 0 and gate == null;
+    Printer.fmt("\n{d} passed; {d} skipped; {d} failed.\n", .{ pass, skip, fail });
     if (failed_tests.items.len > 0) {
         Printer.fmt("\n", .{});
         Printer.fmt("Failed tests:\n", .{});
@@ -464,13 +539,12 @@ pub fn main(init: std.process.Init) !void {
         totals.born_connect,     totals.born_read,     totals.born_write,
         totals.threaded_connect, totals.threaded_read, totals.threaded_write,
     });
-    const gate = routeProof(&totals);
     if (gate) |reason| {
-        Printer.status(.fail, "route proof: FAIL: {s}\n", .{reason});
+        Printer.fmt("route proof: FAIL: {s}\n", .{reason});
     } else {
-        Printer.status(.pass, "route proof: PASS\n", .{});
+        Printer.fmt("route proof: PASS\n", .{});
     }
-    std.process.exit(if (fail == 0 and gate == null) 0 else 1);
+    std.process.exit(if (leg_ok) 0 else 1);
 }
 
 const Printer = struct {
@@ -575,6 +649,7 @@ const Env = struct {
     fail_first: bool,
     filters: std.ArrayList([]const u8),
     do_log_capture: bool,
+    route_trace: bool,
 
     fn init(allocator: Allocator, environ_map: *std.process.Environ.Map) Env {
         var filters: std.ArrayList([]const u8) = .empty;
@@ -595,6 +670,7 @@ const Env = struct {
             .fail_first = readEnvBool(environ_map, "TEST_FAIL_FIRST", false),
             .filters = filters,
             .do_log_capture = readEnvBool(environ_map, "TEST_LOG_CAPTURE", true),
+            .route_trace = readEnvBool(environ_map, "TEST_ROUTE_TRACE", false),
         };
     }
 

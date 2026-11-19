@@ -344,6 +344,9 @@ fn buildRootPath(b: *std.Build) []const u8 {
 const VendoredEntry = struct {
     path: []const u8,
     hash: [64]u8,
+    /// The verified bytes themselves (build-arena allocated): the generated
+    /// tree is written from these, not re-read at make time (review 665 N3).
+    bytes: []const u8,
 };
 
 /// Hash-verify the vendored nats tests tree against the committed upstream
@@ -381,7 +384,7 @@ fn verifyVendoredTests(b: *std.Build) []const VendoredEntry {
         if (!std.mem.eql(u8, &actual, hex))
             std.debug.panic("consumers: vendored file '{s}' does not match the upstream pin hash (manifest {s}, actual {s}); aborting rather than running drifted tests", .{ rel, hex, actual });
         if (entry_count == entries.len) @panic("consumers: vendored manifest exceeds 128 entries");
-        entries[entry_count] = .{ .path = rel, .hash = actual };
+        entries[entry_count] = .{ .path = rel, .hash = actual, .bytes = bytes };
         entry_count += 1;
     }
     if (entry_count == 0) @panic("consumers: empty vendored manifest");
@@ -423,17 +426,18 @@ fn walkVerify(b: *std.Build, dir: std.Io.Dir, prefix: []const u8, entries: []con
     return count;
 }
 
-/// Generate the e2e tests tree: verified vendored bytes plus the born-owned
-/// utils.zig facade, the only permitted difference (carry-in 4). Non-zig
-/// entries (configs) are verified but not copied: they are runtime reads
-/// relative to the CWD, which the run step sets to consumers/nats.
+/// Generate the e2e tests tree from the verified bytes (review 665 N3: the
+/// tree that ran is the tree that was verified, by construction) plus the
+/// born-owned utils.zig facade, the only permitted difference (carry-in 4).
+/// Non-zig entries (configs) are verified but not copied: they are runtime
+/// reads relative to the CWD, which the run step sets to consumers/nats.
 fn generateE2eTree(b: *std.Build, entries: []const VendoredEntry) std.Build.LazyPath {
     const wf = b.addWriteFiles();
     var all_tests: ?std.Build.LazyPath = null;
     for (entries) |e| {
         if (!std.mem.endsWith(u8, e.path, ".zig")) continue;
         if (std.mem.eql(u8, e.path, "tests/utils.zig")) continue; // replaced by the facade
-        const lp = wf.addCopyFile(b.path(b.pathJoin(&.{ "nats", e.path })), e.path);
+        const lp = wf.add(e.path, e.bytes);
         if (std.mem.eql(u8, e.path, "tests/all_tests.zig")) all_tests = lp;
     }
     const root = buildRootPath(b);

@@ -100,7 +100,12 @@ fn fixtureMainInner(f: *Fixture, io: Io) !void {
         _ = f.accepts.fetchAdd(1, .monotonic);
         var rbuf: [64]u8 = undefined;
         var r = first.reader(io, &rbuf);
-        _ = r.interface.readSliceShort(&rbuf) catch {};
+        // readSliceShort fills the destination or reads to end of stream.
+        // 16 bytes are guaranteed within the request head, so this returns
+        // promptly without waiting for the client to close. The destination
+        // must not alias the reader's own buffer.
+        var head: [16]u8 = undefined;
+        _ = r.interface.readSliceShort(&head) catch {};
         first.close(io);
     }
 
@@ -212,26 +217,45 @@ fn checkPattern(buf: []const u8) bool {
 }
 
 /// The first request must fail with a DECLARED peer-close error: EOF
-/// (HttpConnectionClosing / HttpRequestTruncated / EndOfStream), a reset
-/// (ConnectionResetByPeer, or the ReadFailed/WriteFailed wrappers), never
-/// Unexpected and never a hang. Any other error propagates and fails the
+/// (HttpConnectionClosing / HttpRequestTruncated / EndOfStream) or a reset
+/// (ConnectionResetByPeer), never Unexpected and never a hang. The
+/// ReadFailed/WriteFailed wrappers are resolved to the underlying stream
+/// error and held to the same set, so a Born route death cannot hide behind
+/// them (design correction C1). Any other error propagates and fails the
 /// test; a successful response fails the contract.
 fn expectPeerClose(client: *http.Client, uri: std.Uri) !void {
     var req = try client.request(.GET, uri, .{});
     defer req.deinit();
-    req.sendBodiless() catch |err| return checkPeerCloseError(err);
+    req.sendBodiless() catch |err| return checkPeerCloseError(&req, err);
     var redirect_buf: [1024]u8 = undefined;
-    const resp = req.receiveHead(&redirect_buf) catch |err| return checkPeerCloseError(err);
+    const resp = req.receiveHead(&redirect_buf) catch |err| return checkPeerCloseError(&req, err);
     _ = resp;
     return error.ContractExpectedPeerClose;
 }
 
-fn checkPeerCloseError(err: anyerror) !void {
+fn checkPeerCloseError(req: *http.Client.Request, err: anyerror) !void {
     switch (err) {
         error.HttpConnectionClosing,
         error.HttpRequestTruncated,
-        error.ReadFailed,
-        error.WriteFailed,
+        error.ConnectionResetByPeer,
+        error.EndOfStream,
+        => {},
+        error.ReadFailed => {
+            const conn = req.connection orelse return err;
+            try checkDeclaredPeerClose(conn.getReadError() orelse return err);
+        },
+        error.WriteFailed => {
+            const conn = req.connection orelse return err;
+            try checkDeclaredPeerClose(conn.stream_writer.err orelse return err);
+        },
+        else => return err,
+    }
+}
+
+fn checkDeclaredPeerClose(err: anyerror) !void {
+    switch (err) {
+        error.HttpConnectionClosing,
+        error.HttpRequestTruncated,
         error.ConnectionResetByPeer,
         error.EndOfStream,
         => {},

@@ -221,6 +221,8 @@ const Service = struct {
     name: []const u8,
     client_port: u16,
     monitor_port: u16,
+    /// Cluster route port, when the service joins the NATS_TEST cluster.
+    cluster_port: ?u16 = null,
     /// Flags after argv[0], in docker-compose.test.yml order.
     argv: []const []const u8,
     /// JetStream node: append a per-node -sd store directory.
@@ -232,6 +234,7 @@ const services = [_]Service{
         .name = "nats-1",
         .client_port = 14222,
         .monitor_port = 18222,
+        .cluster_port = 16222,
         .argv = &.{
             "--cluster_name", "NATS_TEST",
             "--cluster",      "nats://127.0.0.1:16222",
@@ -248,6 +251,7 @@ const services = [_]Service{
         .name = "nats-2",
         .client_port = 14223,
         .monitor_port = 18223,
+        .cluster_port = 16223,
         .argv = &.{
             "--cluster_name", "NATS_TEST",
             "--cluster",      "nats://127.0.0.1:16223",
@@ -264,6 +268,7 @@ const services = [_]Service{
         .name = "nats-3",
         .client_port = 14224,
         .monitor_port = 18224,
+        .cluster_port = 16224,
         .argv = &.{
             "--cluster_name", "NATS_TEST",
             "--cluster",      "nats://127.0.0.1:16224",
@@ -451,10 +456,20 @@ fn restartService(allocator: std.mem.Allocator, name: []const u8) !void {
 fn spawnService(allocator: std.mem.Allocator, idx: usize) !void {
     const svc = services[idx];
     const io = blockingIo();
-    // Ports must be free before a (re)spawn is reported healthy (carry-in 5).
-    if (!portFree(io, svc.client_port)) {
-        log.err("port {d} ({s}) is not free before spawn", .{ svc.client_port, svc.name });
-        return error.PortNotFree;
+    // Every port the service binds (client, monitor, cluster) must be free
+    // before a (re)spawn is reported healthy (carry-in 5): a stale instance
+    // can still hold the monitor or cluster port after the client port frees.
+    var ports_buf: [3]u16 = .{ svc.client_port, svc.monitor_port, 0 };
+    var port_count: usize = 2;
+    if (svc.cluster_port) |port| {
+        ports_buf[2] = port;
+        port_count = 3;
+    }
+    for (ports_buf[0..port_count]) |port| {
+        if (!portFree(io, port)) {
+            log.err("port {d} ({s}) is not free before spawn", .{ port, svc.name });
+            return error.PortNotFree;
+        }
     }
 
     var argv_buf: [32][]const u8 = undefined;
@@ -478,7 +493,22 @@ fn spawnService(allocator: std.mem.Allocator, idx: usize) !void {
 
     const log_path = try std.fmt.allocPrint(allocator, "{s}/{s}.log", .{ store_root, svc.name });
     defer allocator.free(log_path);
+    // Append across (re)spawns so a restart keeps the whole server sequence
+    // for post-mortem. The Io file API has no O_APPEND or seek: rewrite the
+    // previous bytes, then the child's stderr continues after them (the
+    // spawned stderr dup shares this handle's file offset).
+    const previous = std.Io.Dir.cwd().readFileAlloc(io, log_path, allocator, .unlimited) catch |err| switch (err) {
+        error.FileNotFound => null,
+        else => return err,
+    };
+    defer if (previous) |bytes| allocator.free(bytes);
     const log_file = try std.Io.Dir.cwd().createFile(io, log_path, .{});
+    if (previous) |bytes| {
+        var wbuf: [4096]u8 = undefined;
+        var writer = log_file.writer(io, &wbuf);
+        try writer.interface.writeAll(bytes);
+        try writer.interface.flush();
+    }
     const child = try std.process.spawn(io, .{
         .argv = argv_buf[0..argc],
         .stdin = .ignore,
@@ -521,11 +551,14 @@ fn healthzOk(port: u16) bool {
     writer.interface.writeAll("GET /healthz HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n") catch return false;
     writer.interface.flush() catch return false;
 
-    // The monitor answers the status line immediately; readSliceShort
-    // returns the first available bytes without waiting for a full buffer.
+    // readSliceShort fills the destination or reads to end of stream; it
+    // does not return early on the first available bytes. The monitor
+    // answers the HTTP/1.0 request and closes, so this returns the response
+    // head at EOF. The destination must not alias the reader's own buffer.
     var rbuf: [512]u8 = undefined;
     var reader = stream.reader(io, &rbuf);
-    const n = reader.interface.readSliceShort(&rbuf) catch return false;
-    const head = rbuf[0..n];
+    var head_buf: [512]u8 = undefined;
+    const n = reader.interface.readSliceShort(&head_buf) catch return false;
+    const head = head_buf[0..n];
     return std.mem.startsWith(u8, head, "HTTP/1.0 200") or std.mem.startsWith(u8, head, "HTTP/1.1 200");
 }
