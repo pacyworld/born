@@ -1,0 +1,18 @@
+.{
+    .name = .born_consumers,
+    .version = "0.0.0",
+    .fingerprint = 0x4f3a7741f87aa01c,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        .born = .{ .path = ".." },
+        .nats = .{
+            .url = "git+https://github.com/lalinsky/nats.zig?ref=b8ffdd9285a30b0251123122a4fa9e3a12a74fb9#b8ffdd9285a30b0251123122a4fa9e3a12a74fb9",
+            .hash = "nats-0.0.0-JvIiUIwaCQCE7yHS3yixxwz0Ni6YNXqWV2jqT96ikpoW",
+        },
+        .xsync = .{
+            .url = "git+https://github.com/lalinsky/xsync.zig?ref=v1.0.0",
+            .hash = "xsync-1.0.0-CcXcL3DCAQA0FPLdBPhtTB182kN-COorlMw_cabmgHJm",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "runner.zig" },
+}
