@@ -951,6 +951,13 @@ pub const Shim = struct {
     /// `builtin.is_test`, so the hook is comptime-dead outside test builds.
     test_flush_fault: bool = false,
 
+    /// Test-only fault injection: when non-null, procRetireOp overwrites the
+    /// retiring node's slot_index with this value right after the terminal
+    /// store, simulating a submitter that returned and reused its frame
+    /// (born#111). Reset by the retirement. The check is guarded by
+    /// `builtin.is_test`, so the hook is comptime-dead outside test builds.
+    test_proc_frame_reuse: ?u32 = null,
+
     /// Per-route process counters, fed by the loop on Born-route completions
     /// and by the thunks on Threaded forwards; read via `processStats`.
     proc_stats: struct {
@@ -2853,15 +2860,25 @@ pub const Shim = struct {
     }
 
     /// Disarm, publish the terminal state and free the proc-op slot under
-    /// the proc queue mutex, then wake the submitter outside it.
+    /// the proc queue mutex, then wake the submitter outside it. The slot
+    /// index is snapshotted before the terminal store: the submitter may
+    /// return and reuse its frame past that point, so no field of the node
+    /// is read after it (the wake is address-keyed, see `retire`).
     fn procRetireOp(self: *Shim, op: *ProcOp, canceled: bool) void {
         self.procDisarmOp(op);
         self.proc_queue.mutex.lockUncancelable(self.threaded_io);
+        const index = op.slot_index;
         op.outcome_canceled = canceled;
         op.state.store(1, .release);
-        const slot = self.procSlotAt(op.slot_index).?;
+        if (builtin.is_test) {
+            if (self.test_proc_frame_reuse) |poison| {
+                self.test_proc_frame_reuse = null;
+                op.slot_index = poison;
+            }
+        }
+        const slot = self.procSlotAt(index).?;
         slot.op = null;
-        if (!slot.on_cancel_list) self.procFreeSlotLocked(op.slot_index);
+        if (!slot.on_cancel_list) self.procFreeSlotLocked(index);
         self.proc_queue.mutex.unlock(self.threaded_io);
         self.threaded_io.vtable.futexWake(self.threaded_io.userdata, &op.state.raw, 1);
     }
@@ -5958,6 +5975,63 @@ test "proc cancel request skips a retired slot and refuses a double push" {
     try std.testing.expectEqual(@as(?u32, index), state.proc_free_head);
     try std.testing.expectEqual(@as(?u32, null), state.proc_cancel_head);
     try std.testing.expect(!state.procSlotAt(index).?.on_cancel_list);
+}
+
+test "proc retirement snapshots the slot index before the terminal store" {
+    // born#111: the terminal store releases the submitter, which may return
+    // and reuse its frame; a read of op.slot_index past the store then sees
+    // garbage. The test_proc_frame_reuse hook overwrites the node's slot
+    // index right after the store, deterministically simulating the reuse.
+    // Out-of-range poison: a post-store read panics on the null slot (the
+    // CI run 349 crash shape).
+    // Mutation: reading op.slot_index after the store must fail.
+    if (comptime !process_supported) return error.SkipZigTest;
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    try testProcGrow(&state, 1);
+    defer state.procFreeChunks();
+
+    const index = try state.procAllocSlotLocked();
+    var op: ProcOp = .{ .kind = .wait, .slot_index = index };
+    state.procSlotAt(index).?.op = &op;
+
+    state.test_proc_frame_reuse = std.math.maxInt(u32);
+    state.procRetireOp(&op, false);
+    try std.testing.expectEqual(@as(?u32, null), state.test_proc_frame_reuse); // hook fired and reset
+    try std.testing.expectEqual(@as(u32, 1), op.state.load(.acquire));
+    // The op's own slot was released despite the frame overwrite.
+    try std.testing.expectEqual(@as(?*ProcOp, null), state.procSlotAt(index).?.op);
+    try std.testing.expectEqual(@as(?u32, index), state.proc_free_head);
+}
+
+test "proc retirement under frame reuse leaves other slots occupied" {
+    // The silent born#111 variant: a reused frame holding another live
+    // slot's index must not free that slot. Poison the retiring node with
+    // the victim's index; the victim keeps its occupant and only the
+    // retiring slot goes on the free list.
+    // Mutation: reading op.slot_index after the store must fail.
+    if (comptime !process_supported) return error.SkipZigTest;
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    try testProcGrow(&state, 1);
+    defer state.procFreeChunks();
+
+    const ia = try state.procAllocSlotLocked();
+    const ib = try state.procAllocSlotLocked();
+    var a: ProcOp = .{ .kind = .wait, .slot_index = ia };
+    var b: ProcOp = .{ .kind = .wait, .slot_index = ib };
+    state.procSlotAt(ia).?.op = &a;
+    state.procSlotAt(ib).?.op = &b;
+
+    state.test_proc_frame_reuse = ib;
+    state.procRetireOp(&a, false);
+    try std.testing.expectEqual(@as(?u32, null), state.test_proc_frame_reuse); // hook fired and reset
+    try std.testing.expectEqual(@as(u32, 1), a.state.load(.acquire));
+    try std.testing.expectEqual(@as(?*ProcOp, &b), state.procSlotAt(ib).?.op);
+    try std.testing.expectEqual(@as(?*ProcOp, null), state.procSlotAt(ia).?.op);
+    try std.testing.expectEqual(@as(?u32, ia), state.proc_free_head);
 }
 
 test "proc retired slot pending a cancel entry is not reallocated until drained" {
