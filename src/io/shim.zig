@@ -350,7 +350,9 @@ pub const NetOp = struct {
     state: std.atomic.Value(u32) = .init(0),
     /// Submitter sets this (release) when its wait observes cancellation.
     cancel_requested: std.atomic.Value(bool) = .init(false),
-    /// Loop sets this before the terminal store for a cancel/stop/close drain.
+    /// Loop sets this before the terminal store for a cancel or stop drain.
+    /// A close drain sets it only for an op whose submitter requested
+    /// cancellation; other parked ops retire route_dead (#106).
     outcome_canceled: bool = false,
     kind: Kind,
     payload: Payload,
@@ -890,6 +892,11 @@ pub const Shim = struct {
         chunk_count: usize = 0,
         free_head: ?u32 = null,
         initialized: bool = false,
+        /// Set when the Windows exit drain's wait fails (#106): completions
+        /// may still reference the chunk table's OVERLAPPED storage, so
+        /// registryDeinit leaks the table instead of freeing it. Loop-only
+        /// at exit.
+        exit_drain_failed: bool = false,
     } = .{},
 
     /// Per-route network counters, fed by the loop on Born-route completions
@@ -940,7 +947,8 @@ pub const Shim = struct {
 
     /// Test-only fault injection: when true, the next arm flush reports a
     /// wait failure without touching the port (review R2 flush-failure
-    /// unit). Reset by the flush; never set outside tests.
+    /// unit). Reset by the flush. The flush check is guarded by
+    /// `builtin.is_test`, so the hook is comptime-dead outside test builds.
     test_flush_fault: bool = false,
 
     /// Per-route process counters, fed by the loop on Born-route completions
@@ -1516,10 +1524,12 @@ pub const Shim = struct {
         self.registryCloseAll();
     }
 
-    /// Retire one op at loop exit: canceled for a stop request or an op whose
-    /// submitter already requested cancellation, route_dead otherwise. A
-    /// failure exit is not the caller's cancellation; the thunks map route_dead
-    /// to Unexpected so a consumer sees the dead route instead of a quiet stop.
+    /// Retire one op whose route died: a user close of its socket (stopped
+    /// false) or the loop's failure exit. Canceled only for a stop request or
+    /// an op whose submitter already requested cancellation; route_dead
+    /// otherwise. Route death is not the caller's cancellation (section 4.5);
+    /// the thunks map route_dead to Unexpected so a consumer sees the dead
+    /// route instead of a quiet stop.
     fn netRetireRoute(self: *Shim, op: *NetOp, stopped: bool) void {
         const canceled = stopped or op.cancel_requested.load(.acquire);
         if (!canceled) op.result.err = .route_dead;
@@ -1733,16 +1743,26 @@ pub const Shim = struct {
 
     fn sockFreeChunks(self: *Shim) void {
         for (&self.registry.chunks) |*c| {
-            if (c.load(.monotonic)) |chunk| self.allocator.destroy(chunk);
+            if (c.load(.monotonic)) |chunk| {
+                self.allocator.destroy(chunk);
+                // Null the published pointer so the table never references
+                // freed storage.
+                c.store(null, .monotonic);
+            }
         }
     }
 
     /// Release the registry map and socket chunks. Called at deinit after the
     /// loop has closed every remaining socket, and on construction failure.
+    /// If the Windows exit drain's wait failed (#106), completions may still
+    /// reference the chunk table's OVERLAPPED storage: leak the table rather
+    /// than free it (closing a handle does not make pending completion
+    /// storage safe to free). A bounded leak at instance teardown on a rare
+    /// double-failure path.
     fn registryDeinit(self: *Shim) void {
         if (!self.registry.initialized) return;
         self.registry.map.deinit();
-        self.sockFreeChunks();
+        if (!self.registry.exit_drain_failed) self.sockFreeChunks();
         self.registry.initialized = false;
     }
 
@@ -1830,6 +1850,9 @@ pub const Shim = struct {
     /// drained completions through socketEvent with no timeout until the total
     /// outstanding ops reach zero, so each completion reaches its OWN socket's
     /// absorbCompletion and no OVERLAPPED storage is freed with ops pending.
+    /// A failed phase-2 wait latches the error and marks the chunk table
+    /// leaked (registryDrainFailed): the drain cannot prove the completions
+    /// are done, so registryDeinit must not free the storage (#106).
     fn registryCloseAll(self: *Shim) void {
         if (!self.registry.initialized) return;
         const chunk_count = self.registry.chunk_count;
@@ -1846,13 +1869,24 @@ pub const Shim = struct {
         if (is_windows) {
             var events: [64]born.Event = undefined;
             while (self.registryPendingOps() != 0) {
-                const n = self.port.wait(&events, null) catch break;
+                const n = self.port.wait(&events, null) catch |err| {
+                    self.registryDrainFailed(err);
+                    break;
+                };
                 for (events[0..n]) |ev| {
                     if (ev.timer or ev.wake) continue;
                     self.socketEvent(ev);
                 }
             }
         }
+    }
+
+    /// The exit drain's wait failed (#106): completions may still be
+    /// outstanding, so latch the cause and mark the chunk table leaked.
+    /// registryDeinit then frees the map but keeps the OVERLAPPED storage.
+    fn registryDrainFailed(self: *Shim, err: anyerror) void {
+        self.latch(err);
+        self.registry.exit_drain_failed = true;
     }
 
     // ------------------------------------------------- connect path (5.x) ----
@@ -2138,23 +2172,17 @@ pub const Shim = struct {
         }
     }
 
-    /// Close a Born-owned socket: cancel and drain every pending op, then
-    /// retire the socket (unregister before close; Windows keeps the stable
-    /// SocketState alive until every completion is absorbed, 4.4).
+    /// Close a Born-owned socket: drain every pending op, then retire the
+    /// socket (unregister before close; Windows keeps the stable SocketState
+    /// alive until every completion is absorbed, 4.4). A close kills the
+    /// socket's route, so parked ops retire route_dead (Unexpected at the
+    /// thunk), never as the caller's Canceled (#106, section 4.5), unless the
+    /// submitter itself requested cancellation.
     fn closeDrive(self: *Shim, op: *NetOp) void {
         const state = self.sockSnapshot(op.sock_index) orelse return self.netRetireOk(op, 0, false);
-        if (state.pending_read) |rop| {
-            rop.result.err = .canceled;
-            self.netRetireOp(rop, true);
-        }
-        if (state.pending_write) |wop| {
-            wop.result.err = .canceled;
-            self.netRetireOp(wop, true);
-        }
-        if (state.pending_connect) |cop| {
-            cop.result.err = .canceled;
-            self.netRetireOp(cop, true);
-        }
+        if (state.pending_read) |rop| self.netRetireRoute(rop, false);
+        if (state.pending_write) |wop| self.netRetireRoute(wop, false);
+        if (state.pending_connect) |cop| self.netRetireRoute(cop, false);
         self.sockRetire(state, op.sock_index);
         self.netRetireOk(op, 0, false);
     }
@@ -2595,7 +2623,7 @@ pub const Shim = struct {
             // the remainder staged for the next submission; cleanup purges
             // it before closing the descriptor.
             while (self.port.changes.items.len != 0) {
-                if (self.test_flush_fault) {
+                if (builtin.is_test and self.test_flush_fault) {
                     // Test-only refusal (R2): report a failed flush without
                     // touching the port, leaving the staged EV_ADD in place.
                     self.test_flush_fault = false;
@@ -5533,6 +5561,121 @@ test "net submit refusal and loop-exit retirement distinguish route_dead from ca
     state.netRetireAll(false);
     try std.testing.expect(q3.outcome_canceled);
     try std.testing.expectEqual(@as(?NetError, null), q3.result.err);
+}
+
+test "close retires parked ops as route_dead, not the caller's Canceled (#106)" {
+    // A user close kills the socket's route: parked read/write/connect retire
+    // route_dead (Unexpected at the thunk), never as the caller's Canceled
+    // (section 4.5). An op whose submitter already requested cancellation
+    // stays canceled. POSIX unit: a real unconnected socket stands in for the
+    // connection; the full close path on every kernel is covered by the
+    // net_test close contract, and the Windows drain by registryCloseAll.
+    if (is_windows) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    state.port = &port;
+    try testNetGrow(&state, 1);
+    defer state.netFreeChunks();
+    try state.registryInit();
+    defer state.registryDeinit();
+
+    const fd = try compat.socket(compat.AF.UNIX, compat.SOCK.STREAM, 0);
+    const index = try state.sockAllocLocked();
+    const s = state.sockAt(index).?;
+    s.generation +%= 1;
+    s.occupied = true;
+    s.index = index;
+    s.handle = fd;
+    s.plain.sock = fd; // sockRetire's deinit closes it
+    try state.registerHandle(fd, index);
+
+    var rop: NetOp = .{ .kind = .read, .sock_index = index, .payload = .{ .read = .{ .data = &.{} } } };
+    rop.slot_index = try state.netAllocSlotLocked();
+    state.netSlotAt(rop.slot_index).op = &rop;
+    s.pending_read = &rop;
+    var wop: NetOp = .{ .kind = .write, .sock_index = index, .payload = .{ .write = .{ .header = &.{}, .data = &.{}, .splat = 0 } } };
+    wop.slot_index = try state.netAllocSlotLocked();
+    state.netSlotAt(wop.slot_index).op = &wop;
+    s.pending_write = &wop;
+    var cop: NetOp = .{ .kind = .connect, .sock_index = index, .payload = .{ .connect = .{ .target = .{ .ip = ipToBorn(&.{ .ip4 = .loopback(9) }) } } } };
+    cop.slot_index = try state.netAllocSlotLocked();
+    state.netSlotAt(cop.slot_index).op = &cop;
+    s.pending_connect = &cop;
+
+    var close_op: NetOp = .{ .kind = .close, .sock_index = index, .payload = .{ .close = {} } };
+    close_op.slot_index = try state.netAllocSlotLocked();
+    state.netSlotAt(close_op.slot_index).op = &close_op;
+    state.closeDrive(&close_op);
+
+    for ([_]*NetOp{ &rop, &wop, &cop }) |parked| {
+        try std.testing.expectEqual(@as(?NetError, .route_dead), parked.result.err);
+        try std.testing.expect(!parked.outcome_canceled);
+        try std.testing.expectEqual(@as(u32, 1), parked.state.load(.acquire));
+    }
+    try std.testing.expectEqual(@as(?NetError, null), close_op.result.err);
+    try std.testing.expectEqual(@as(u32, 1), close_op.state.load(.acquire));
+    try std.testing.expect(!s.occupied);
+    try std.testing.expectEqual(@as(?u32, null), state.lookupBorn(fd));
+
+    // A parked read whose submitter requested cancellation stays canceled.
+    const fd2 = try compat.socket(compat.AF.UNIX, compat.SOCK.STREAM, 0);
+    const index2 = try state.sockAllocLocked();
+    const s2 = state.sockAt(index2).?;
+    s2.generation +%= 1;
+    s2.occupied = true;
+    s2.index = index2;
+    s2.handle = fd2;
+    s2.plain.sock = fd2;
+    try state.registerHandle(fd2, index2);
+    var rop2: NetOp = .{ .kind = .read, .sock_index = index2, .payload = .{ .read = .{ .data = &.{} } } };
+    rop2.slot_index = try state.netAllocSlotLocked();
+    state.netSlotAt(rop2.slot_index).op = &rop2;
+    rop2.cancel_requested.store(true, .release);
+    s2.pending_read = &rop2;
+    var close2: NetOp = .{ .kind = .close, .sock_index = index2, .payload = .{ .close = {} } };
+    close2.slot_index = try state.netAllocSlotLocked();
+    state.netSlotAt(close2.slot_index).op = &close2;
+    state.closeDrive(&close2);
+    try std.testing.expect(rop2.outcome_canceled);
+    try std.testing.expectEqual(@as(?NetError, null), rop2.result.err);
+    try std.testing.expectEqual(@as(u32, 1), rop2.state.load(.acquire));
+}
+
+test "registryDeinit frees the chunk table on a clean drain" {
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    try state.registryInit();
+    try std.testing.expect(state.registry.chunks[0].load(.monotonic) != null);
+    state.registryDeinit();
+    try std.testing.expectEqual(@as(?*SockChunk, null), state.registry.chunks[0].load(.monotonic));
+    try std.testing.expect(!state.registry.initialized);
+}
+
+test "failed exit drain latches and leaks the chunk table (#106)" {
+    // A failed phase-2 wait cannot prove the completions are done: latch the
+    // cause and keep the chunk table (the port may still reference its
+    // OVERLAPPED storage). The decision is platform-independent; the wait
+    // itself only runs on Windows. Mutation: freeing the table despite the
+    // flag must fail (a freed chunk's published pointer is nulled).
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    try state.registryInit();
+    const chunk = state.registry.chunks[0].load(.monotonic).?;
+    const free_head = chunk.socks[0].next_free;
+    state.registryDrainFailed(error.WaitFailed);
+    try std.testing.expectEqual(@as(?anyerror, error.WaitFailed), state.latchedError());
+    try std.testing.expect(state.registry.exit_drain_failed);
+    state.registryDeinit();
+    const kept = state.registry.chunks[0].load(.monotonic).?;
+    try std.testing.expectEqual(chunk, kept);
+    try std.testing.expectEqual(free_head, kept.socks[0].next_free);
+    // The leak is deliberate; release it for the testing allocator.
+    state.allocator.destroy(kept);
 }
 
 test "concurrent read or write on a parked op is rejected busy, not orphaned" {

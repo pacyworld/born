@@ -93,6 +93,9 @@ OS per primitive, and lists real runs only.
 | kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io process route, process tag attribution (mutation proof) | the tag-attribution units pass clean; stripping proc_udata_bit from procUdata fails the udata round-trip unit (null udata crash), cross-route attribution, arm-refusal, synthetic EV_ERROR and stolen-reap units (120 passed, 6 skipped, 4 failed, 1 crashed); reverted, green again | 2026-11-18 | [8f57189](https://pacyworld.dev/pacyworld/born/commit/8f5718976e1f9034f1a7d8a5d13b03caeea2e899) |
 | kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io process route, abandon-on-cancel (mutation proof) | the abandon unit and contract tests pass clean; kill-on-cancel (SIGKILL plus blocking reap in abandonWait) fails the abandon unit and both abandon contract tests (122 passed, 6 skipped, 3 failed); reverted, green again | 2026-11-18 | [8f57189](https://pacyworld.dev/pacyworld/born/commit/8f5718976e1f9034f1a7d8a5d13b03caeea2e899) |
 | kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io process route, synchronous arm confirmation (mutation proof) | the arm-confirmation units pass clean; retiring arms before the flush confirmation fails the arm-refusal and arm-flush failure units and crashes the synthetic EV_ERROR unit (122 passed, 6 skipped, 2 failed, 1 crashed); reverted, green again | 2026-11-18 | [8f57189](https://pacyworld.dev/pacyworld/born/commit/8f5718976e1f9034f1a7d8a5d13b03caeea2e899) |
+| kqueue, FreeBSD 15 (CI FreeBSD runner) | born.io network route, close is route death (#106) | [run 330, FreeBSD job (zig 0.16.0)](https://pacyworld.dev/pacyworld/born/actions/runs/330/jobs/2) and [zig 0.17.1 job](https://pacyworld.dev/pacyworld/born/actions/runs/330/jobs/3): Debug and ReleaseSafe, born-io-tests 128 passed, 6 skipped, 0 failed each; the close-retirement unit and the Unexpected close contract run here | 2026-11-19 | [cdc2b58](https://pacyworld.dev/pacyworld/born/commit/cdc2b58b383eb4d697b18ea0a349c3aa0f1eea04) |
+| epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | born.io network route, close is route death (#106) | [run 330, Linux job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/330/jobs/8): Debug and ReleaseSafe on 0.16.0 and 0.17.1, born-io-tests 125 passed, 9 skipped, 0 failed each; the close-retirement unit and the Unexpected close contract run here | 2026-11-19 | [cdc2b58](https://pacyworld.dev/pacyworld/born/commit/cdc2b58b383eb4d697b18ea0a349c3aa0f1eea04) |
+| IOCP, Windows Server 2022 build 20348 (CI Windows runner) | born.io network route, close retirement and failed exit drain leak guard (#106) | [run 330, Windows job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/330/jobs/14): Debug and ReleaseSafe on 0.16.0 and 0.17.1, born-io-tests.exe 76 passed, 58 skipped, 0 failed each; the leak path is tested at the deinit-decision level only (a synthetic drain failure), not by a real GetQueuedCompletionStatusEx failure | 2026-11-19 | [cdc2b58](https://pacyworld.dev/pacyworld/born/commit/cdc2b58b383eb4d697b18ea0a349c3aa0f1eea04) |
 
 Commit 3ed3785 changes only the CI workflow; its library and tests are
 those of master d1017b8. Skips identify platform exclusions or primitives
@@ -151,6 +154,21 @@ the process tag strip, kill-on-cancel and the arm retire-before-flush-confirm;
 each mutant fails only its targeted tests and the reverted tree is green
 again. The CI rows record run 322 at
 0c036c8; the commit adding these rows changes only this README.
+
+The born.io hygiene rows record the #106 fixes: a close of the op's socket
+kills the route, so closeDrive retires parked read/write/connect as
+route_dead (Unexpected at the thunk), honoring cancel_requested, while the
+deinit stop path stays canceled; and a failed Windows exit-drain wait
+latches the cause and leaks the chunk table instead of freeing OVERLAPPED
+storage that completions may still reference. The POSIX close-retirement
+unit skips on Windows; the cross-kernel close contract (a parked Born read
+retires Unexpected, not Canceled) runs on all three kernels, as do the two
+registry deinit-decision units. The leak guard is tested at the
+deinit-decision level only: the unit drives registryDrainFailed with a
+synthetic wait failure and checks the latch and the kept table; no test
+injects a real GetQueuedCompletionStatusEx failure. The CI rows record run
+330 at cdc2b58; the commit adding these rows changes only this README, and
+its library, tests and CI are those of cdc2b58.
 
 ## Programming model
 
@@ -610,15 +628,16 @@ op is rejected rather than orphaning it.
 
 Born outcomes map coarsely onto the declared std error sets (a failed read or
 write becomes `ConnectionResetByPeer`); `Canceled` is reserved for real
-cancellation and the deinit stop request. A dead route (a failure loop exit,
-or a submit refused after the queue dies) surfaces as `Unexpected`, never as
-the caller's cancellation. Out-of-profile requests are declared errors, never
-silent fallbacks: bind and non-stream/non-TCP connect options return
-`OptionUnsupported`, socket pairs `OperationUnsupported`, message and
-control-buffer I/O on a Born-owned handle complete with their tag result
-`Unexpected` (a batch with Born members completes those members per-op and
-awaits the rest normally), and `netWriteFile` is a read/copy loop through the
-Born write path on 0.16 and declared `Unimplemented` on 0.17.
+cancellation and the deinit stop request. A dead route (a close of the op's
+socket, a failure loop exit, or a submit refused after the queue dies)
+surfaces as `Unexpected`, never as the caller's cancellation. Out-of-profile
+requests are declared errors, never silent fallbacks: bind and
+non-stream/non-TCP connect options return `OptionUnsupported`, socket pairs
+`OperationUnsupported`, message and control-buffer I/O on a Born-owned handle
+complete with their tag result `Unexpected` (a batch with Born members
+completes those members per-op and awaits the rest normally), and
+`netWriteFile` is a read/copy loop through the Born write path on 0.16 and
+declared `Unimplemented` on 0.17.
 
 Connect timeouts stay on the Born route for every clock: a `.duration` is
 relative, and a `.deadline` on `.real` or `.boot` is converted to a Born
