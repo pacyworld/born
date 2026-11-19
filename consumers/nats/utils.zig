@@ -10,16 +10,21 @@
 //
 // Provisioning runs on the fixture blockingIo (Threaded): it is environment,
 // not the consumer path under proof. nats client traffic stays on
-// std.testing.io (born). The nats-server binary is resolved from PATH by
-// std.process.spawn's argv[0] resolution and version-checked against the
-// v2.15.0 pin; CI prepends the pinned tarball's binary directory to PATH.
-// Server logs and per-node JetStream store directories live under
-// .zig-cache/nats-test-store relative to the CWD, which must contain
-// tests/configs (the same runtime contract as upstream). Store directories
-// survive restart/stop/start; down removes them (review 192 carry-in 5).
+// std.testing.io (born). The nats-server binary is the absolute path the
+// runner publishes from NATS_SERVER (consumer_env): the fixture Threaded io
+// has an empty environ, so a bare argv[0] would resolve only against
+// std.Io.Threaded.default_PATH and never see the step's PATH (born#110 W1).
+// Spawning the exact absolute path bypasses PATH search entirely and the
+// v2.15.0 pin check covers the binary that actually runs; an unset or
+// non-absolute NATS_SERVER fails loudly. Server logs and per-node JetStream
+// store directories live under .zig-cache/nats-test-store relative to the
+// CWD, which must contain tests/configs (the same runtime contract as
+// upstream). Store directories survive restart/stop/start; down removes them
+// (review 192 carry-in 5).
 
 const std = @import("std");
 const nats = @import("nats");
+const consumer_env = @import("consumer_env");
 
 const log = std.log.default;
 
@@ -353,14 +358,33 @@ fn serviceIndex(name: []const u8) !usize {
     return error.UnknownService;
 }
 
+/// The pinned nats-server binary as an absolute path (born#110 W1). The
+/// fixture Threaded io has an empty environ, so a bare name would resolve
+/// only against default_PATH; spawning the exact absolute path bypasses PATH
+/// search. Fail loudly when NATS_SERVER is unset or not absolute rather than
+/// silently picking up some other nats-server.
+fn serverBinary() ![]const u8 {
+    const path = consumer_env.natsServer() orelse {
+        log.err("NATS_SERVER is not set; export the absolute path of the pinned nats-server v2.15.0 binary (the fixture spawns it directly, no PATH search)", .{});
+        return error.NatsServerUnset;
+    };
+    if (!std.fs.path.isAbsolute(path)) {
+        log.err("NATS_SERVER must be an absolute path, got '{s}' (a relative or bare name could resolve to the wrong binary)", .{path});
+        return error.NatsServerNotAbsolute;
+    }
+    return path;
+}
+
 fn checkServerVersion(allocator: std.mem.Allocator) !void {
     if (version_checked) return;
+    const bin = try serverBinary();
+    const argv = [_][]const u8{ bin, "--version" };
     const result = std.process.run(allocator, blockingIo(), .{
-        .argv = &.{ "nats-server", "--version" },
+        .argv = &argv,
         .stdout_limit = .limited(4096),
         .stderr_limit = .limited(4096),
     }) catch |err| {
-        log.err("cannot run 'nats-server --version' ({s}); is the pinned v2.15.0 binary on PATH?", .{@errorName(err)});
+        log.err("cannot run '{s} --version' ({s}); is the pinned v2.15.0 binary present at NATS_SERVER?", .{ bin, @errorName(err) });
         return err;
     };
     defer allocator.free(result.stdout);
@@ -474,7 +498,7 @@ fn spawnService(allocator: std.mem.Allocator, idx: usize) !void {
 
     var argv_buf: [32][]const u8 = undefined;
     var argc: usize = 0;
-    argv_buf[argc] = "nats-server";
+    argv_buf[argc] = try serverBinary();
     argc += 1;
     for (svc.argv) |arg| {
         argv_buf[argc] = arg;

@@ -258,6 +258,15 @@ pub fn main(init: std.process.Init) !void {
     var env = Env.init(gpa, init.environ_map);
     defer env.deinit(gpa);
 
+    // e2e only: hand the pinned nats-server binary path to the fixture facade
+    // before any test runs (born#110 W1). The facade spawns this exact
+    // absolute path; unit and http never read it. The import is comptime-dead
+    // outside the e2e suite, so those roots need no consumer_env module.
+    if (comptime std.mem.eql(u8, consumer_options.suite, "nats-e2e")) {
+        const consumer_env = @import("consumer_env");
+        consumer_env.setNatsServer(init.environ_map.get("NATS_SERVER"));
+    }
+
     var slowest = SlowTracker.init(io, 5);
     defer slowest.deinit(gpa);
 

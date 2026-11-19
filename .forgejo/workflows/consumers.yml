@@ -208,10 +208,11 @@ jobs:
   # suite job runs the cross-built (or natively built) executables on its
   # actual kernel; no Zig is needed. The e2e legs provision the pinned
   # nats-server v2.15.0 first; unit and http legs need no server. The
-  # provision steps export NATS_SERVER_DIR through GITHUB_ENV and the e2e
-  # steps prepend it to PATH themselves: this runner does not apply
-  # cross-step PATH additions (GITHUB_ENV PATH or GITHUB_PATH) on every
-  # executor. GITHUB_PATH is kept for executors that do apply it.
+  # provision steps export the absolute binary path as NATS_SERVER through
+  # GITHUB_ENV; the runner hands it to the e2e fixture facade, which spawns
+  # that exact path (born#110 W1: the facade's Threaded io has an empty
+  # environ, so a bare name would resolve only against default_PATH, never
+  # the step's PATH). No PATH plumbing is needed.
 
   # FreeBSD runner: native kqueue. max-parallel keeps the legs sequential:
   # the e2e topology binds fixed loopback ports (14222-14229).
@@ -270,8 +271,7 @@ jobs:
             rm -f "$cache/nats-server.tar.gz"
           fi
           test "$("$cache/nats-server" --version)" = "nats-server: v2.15.0"
-          echo "NATS_SERVER_DIR=$cache" >> "$GITHUB_ENV"
-          echo "$cache" >> "$GITHUB_PATH"
+          echo "NATS_SERVER=$cache/nats-server" >> "$GITHUB_ENV"
 
       - name: Run nats unit suite
         if: matrix.zig == '0.16.0'
@@ -292,8 +292,6 @@ jobs:
         if: matrix.zig == '0.16.0'
         run: |
           set -eu
-          : "${NATS_SERVER_DIR:?provision step did not export NATS_SERVER_DIR}"
-          export PATH="$NATS_SERVER_DIR:$PATH"
           ws=$(pwd)
           cd "consumer-nats-e2e/freebsd-${{ matrix.optimize }}/bin"
           sha256sum -c nats-e2e.sha256
@@ -387,8 +385,7 @@ jobs:
             rm -f "$cache/nats-server.tar.gz"
           fi
           test "$("$cache/nats-server" --version)" = "nats-server: v2.15.0"
-          echo "NATS_SERVER_DIR=$cache" >> "$GITHUB_ENV"
-          echo "$cache" >> "$GITHUB_PATH"
+          echo "NATS_SERVER=$cache/nats-server" >> "$GITHUB_ENV"
 
       - name: Run nats unit suite
         if: matrix.zig == '0.16.0'
@@ -409,8 +406,6 @@ jobs:
         if: matrix.zig == '0.16.0'
         run: |
           set -eu
-          : "${NATS_SERVER_DIR:?provision step did not export NATS_SERVER_DIR}"
-          export PATH="$NATS_SERVER_DIR:$PATH"
           ws=$(pwd)
           cd "consumer-nats-e2e/linux-${{ matrix.optimize }}/bin"
           sha256sum -c nats-e2e.sha256
@@ -508,8 +503,7 @@ jobs:
           }
           $version = (& $exe --version | Out-String).Trim()
           if ($version -ne 'nats-server: v2.15.0') { throw "nats-server pin mismatch: $version" }
-          Add-Content -Path $env:GITHUB_ENV -Value "NATS_SERVER_DIR=$bin" -Encoding ascii
-          Add-Content -Path $env:GITHUB_PATH -Value $bin -Encoding ascii
+          Add-Content -Path $env:GITHUB_ENV -Value "NATS_SERVER=$exe" -Encoding ascii
 
       - name: Run nats unit suite
         if: matrix.zig == '0.16.0'
@@ -534,8 +528,6 @@ jobs:
       - name: Run nats e2e suite
         if: matrix.zig == '0.16.0'
         run: |
-          if (-not $env:NATS_SERVER_DIR) { throw 'provision step did not export NATS_SERVER_DIR' }
-          $env:PATH = "$env:NATS_SERVER_DIR;$env:PATH"
           cd "consumer-nats-e2e\windows-${{ matrix.optimize }}\bin"
           $expected = (Get-Content nats-e2e.exe.sha256 -Raw).Split(' ')[0].Trim().ToUpperInvariant()
           $actual = (Get-FileHash nats-e2e.exe -Algorithm SHA256).Hash

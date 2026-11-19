@@ -111,6 +111,14 @@ pub fn build(b: *std.Build) void {
     const e2e_options = b.addOptions();
     e2e_options.addOption(bool, "born_network", born_network);
     e2e_options.addOption([]const u8, "suite", "nats-e2e");
+    // Narrow runner->facade channel for the pinned nats-server binary path
+    // (born#110 W1). e2e only: the runner's import is comptime-dead for the
+    // unit and http suites, so their roots need no consumer_env module.
+    const consumer_env_mod = b.createModule(.{
+        .root_source_file = b.path("consumer_env.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
     const e2e_mod = b.createModule(.{
         .root_source_file = e2e_root,
         .target = target,
@@ -123,6 +131,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "born_io", .module = io_mod },
             .{ .name = "born", .module = core_mod },
             .{ .name = "consumer_options", .module = e2e_options.createModule() },
+            .{ .name = "consumer_env", .module = consumer_env_mod },
         },
     });
     linkPlatform(e2e_mod, target);
