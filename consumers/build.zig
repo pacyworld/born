@@ -1,4 +1,4 @@
-// Born P5.5 proof consumers build graph (design sections 3-5).
+// Born P5.5 proof consumers build graph (design sections 3-7).
 //
 // Separate package: born's root build.zig/zon/.paths are unchanged and
 // consumers/ never ships downstream. Zero b.dependency calls on any
@@ -65,13 +65,14 @@ pub fn build(b: *std.Build) void {
     nats_options.addOption([]const u8, "name", "nats.zig");
     nats_options.addOption([]const u8, "lang", "zig");
     nats_options.addOption(bool, "use_tls", false);
+    const nats_options_mod = nats_options.createModule();
     const nats_mod = b.createModule(.{
         .root_source_file = .{ .cwd_relative = b.pathJoin(&.{ nats_root, "src", "root.zig" }) },
         .target = target,
         .optimize = optimize,
         .imports = &.{
             .{ .name = "xsync", .module = xsync_mod },
-            .{ .name = "build_options", .module = nats_options.createModule() },
+            .{ .name = "build_options", .module = nats_options_mod },
         },
     });
     nats_mod.addAnonymousImport("tls", .{
@@ -99,6 +100,44 @@ pub fn build(b: *std.Build) void {
     b.step("test-unit", "Run the nats unit suite on born.io (-Dborn-network=false for the all-Threaded baseline)").dependOn(&run_unit.step);
     const install_unit = b.addInstallArtifact(unit_tests, .{});
     b.step("test-bin", "Install the consumer test executable without running it").dependOn(&install_unit.step);
+
+    // e2e suite (design 7.2, Q4): the vendored upstream tests tree,
+    // hash-verified against the pin at configure time (carry-in 4), with
+    // exactly one difference in the generated tree: tests/utils.zig is the
+    // born-owned native-provisioning facade. Configs are verified too but
+    // read at runtime from the CWD (tests/configs), not compiled.
+    const vendored = verifyVendoredTests(b);
+    const e2e_root = generateE2eTree(b, vendored);
+    const e2e_options = b.addOptions();
+    e2e_options.addOption(bool, "born_network", born_network);
+    e2e_options.addOption([]const u8, "suite", "nats-e2e");
+    const e2e_mod = b.createModule(.{
+        .root_source_file = e2e_root,
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "nats", .module = nats_mod },
+            .{ .name = "xsync", .module = xsync_mod },
+            .{ .name = "build_options", .module = nats_options_mod },
+            .{ .name = "std", .module = facade.std_mod },
+            .{ .name = "born_io", .module = io_mod },
+            .{ .name = "born", .module = core_mod },
+            .{ .name = "consumer_options", .module = e2e_options.createModule() },
+        },
+    });
+    linkPlatform(e2e_mod, target);
+    const e2e_tests = b.addTest(.{
+        .name = "nats-e2e",
+        .root_module = e2e_mod,
+        .test_runner = .{ .path = b.path("runner.zig"), .mode = .simple },
+    });
+    const run_e2e = b.addRunArtifact(e2e_tests);
+    // Runtime CWD contract: tests/configs relative to the CWD (auth creds,
+    // nkey/jwt server configs), same as upstream's package-root CWD.
+    run_e2e.setCwd(b.path("nats"));
+    b.step("test-e2e", "Run the nats e2e suite on born.io against native nats-server v2.15.0 (-Dborn-network=false for the all-Threaded baseline)").dependOn(&run_e2e.step);
+    const install_e2e = b.addInstallArtifact(e2e_tests, .{});
+    b.step("test-e2e-bin", "Install the nats e2e test executable without running it").dependOn(&install_e2e.step);
 }
 
 fn linkPlatform(mod: *std.Build.Module, target: std.Build.ResolvedTarget) void {
@@ -239,4 +278,121 @@ fn pkgRoot(comptime packages: type, comptime pkg_name: []const u8, dep_name: []c
     const pkg = @field(packages, pkg_name);
     if (!@hasDecl(pkg, "build_root")) std.debug.panic("package '{s}' not fetched", .{dep_name});
     return pkg.build_root;
+}
+
+/// Filesystem path of the package build root. 0.16 has
+/// Build.build_root (Cache.Directory); 0.17.1 replaced it with
+/// Build.root (Cache.Path = root_dir + sub_path). The "." fallback
+/// assumes the build was invoked from the package directory (CI does
+/// `cd consumers`), matching Directory.path's null-handle case.
+fn buildRootPath(b: *std.Build) []const u8 {
+    if (comptime @hasField(std.Build, "build_root")) {
+        return b.build_root.path orelse ".";
+    } else {
+        const dir_path = b.root.root_dir.path orelse ".";
+        if (b.root.sub_path.len == 0) return dir_path;
+        return b.pathJoin(&.{ dir_path, b.root.sub_path });
+    }
+}
+
+const VendoredEntry = struct {
+    path: []const u8,
+    hash: [64]u8,
+};
+
+/// Hash-verify the vendored nats tests tree against the committed upstream
+/// pin manifest (review 192 carry-in 4). nats's own .paths excludes tests/
+/// from the fetched package, so the tree is vendored byte-identical from
+/// the pin commit; every listed file must match its sha256 and every file
+/// in the tree must be listed. Abort-and-report on any drift.
+fn verifyVendoredTests(b: *std.Build) []const VendoredEntry {
+    const io = b.graph.io;
+    const alloc = b.allocator;
+    const root = buildRootPath(b);
+    const nats_dir = b.pathJoin(&.{ root, "nats" });
+    const cwd = std.Io.Dir.cwd();
+    const limit = std.Io.Limit.limited(1 << 20);
+    const manifest = cwd.readFileAlloc(io, b.pathJoin(&.{ nats_dir, "manifest.sha256" }), alloc, limit) catch |err|
+        std.debug.panic("consumers: cannot read nats/manifest.sha256 ({s})", .{@errorName(err)});
+
+    const entries = alloc.alloc(VendoredEntry, 128) catch @panic("OOM");
+    var entry_count: usize = 0;
+    var lines = std.mem.splitScalar(u8, manifest, '\n');
+    while (lines.next()) |line| {
+        const trimmed = std.mem.trim(u8, line, " \t\r");
+        if (trimmed.len == 0) continue;
+        const sep = std.mem.indexOf(u8, trimmed, "  ") orelse
+            std.debug.panic("consumers: malformed manifest line: '{s}'", .{trimmed});
+        const hex = trimmed[0..sep];
+        const rel = trimmed[sep + 2 ..];
+        if (hex.len != 64 or !std.mem.startsWith(u8, rel, "tests/"))
+            std.debug.panic("consumers: malformed manifest entry: '{s}'", .{trimmed});
+        const bytes = cwd.readFileAlloc(io, b.pathJoin(&.{ nats_dir, rel }), alloc, limit) catch |err|
+            std.debug.panic("consumers: vendored file '{s}' missing or unreadable ({s})", .{ rel, @errorName(err) });
+        var digest: [32]u8 = undefined;
+        std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+        const actual = std.fmt.bytesToHex(digest, .lower);
+        if (!std.mem.eql(u8, &actual, hex))
+            std.debug.panic("consumers: vendored file '{s}' does not match the upstream pin hash (manifest {s}, actual {s}); aborting rather than running drifted tests", .{ rel, hex, actual });
+        if (entry_count == entries.len) @panic("consumers: vendored manifest exceeds 128 entries");
+        entries[entry_count] = .{ .path = rel, .hash = actual };
+        entry_count += 1;
+    }
+    if (entry_count == 0) @panic("consumers: empty vendored manifest");
+
+    // Completeness: every file in the vendored tree must be listed.
+    var tests_dir = cwd.openDir(io, b.pathJoin(&.{ nats_dir, "tests" }), .{ .iterate = true }) catch |err|
+        std.debug.panic("consumers: cannot open vendored tests dir ({s})", .{@errorName(err)});
+    defer tests_dir.close(io);
+    const walked = walkVerify(b, tests_dir, "tests", entries[0..entry_count]);
+    if (walked != entry_count)
+        std.debug.panic("consumers: manifest lists {d} files but the vendored tree has {d}", .{ entry_count, walked });
+    return entries[0..entry_count];
+}
+
+fn walkVerify(b: *std.Build, dir: std.Io.Dir, prefix: []const u8, entries: []const VendoredEntry) usize {
+    const io = b.graph.io;
+    var it = dir.iterate();
+    var count: usize = 0;
+    while (it.next(io) catch |err| std.debug.panic("consumers: cannot iterate vendored tree ({s})", .{@errorName(err)})) |entry| {
+        const rel = b.pathJoin(&.{ prefix, entry.name });
+        switch (entry.kind) {
+            .file => {
+                const listed = for (entries) |e| {
+                    if (std.mem.eql(u8, e.path, rel)) break true;
+                } else false;
+                if (!listed)
+                    std.debug.panic("consumers: vendored file '{s}' is not in manifest.sha256; aborting rather than running unverified tests", .{rel});
+                count += 1;
+            },
+            .directory => {
+                var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch |err|
+                    std.debug.panic("consumers: cannot open vendored dir '{s}' ({s})", .{ rel, @errorName(err) });
+                defer sub.close(io);
+                count += walkVerify(b, sub, rel, entries);
+            },
+            else => std.debug.panic("consumers: unexpected vendored entry kind in '{s}'", .{rel}),
+        }
+    }
+    return count;
+}
+
+/// Generate the e2e tests tree: verified vendored bytes plus the born-owned
+/// utils.zig facade, the only permitted difference (carry-in 4). Non-zig
+/// entries (configs) are verified but not copied: they are runtime reads
+/// relative to the CWD, which the run step sets to consumers/nats.
+fn generateE2eTree(b: *std.Build, entries: []const VendoredEntry) std.Build.LazyPath {
+    const wf = b.addWriteFiles();
+    var all_tests: ?std.Build.LazyPath = null;
+    for (entries) |e| {
+        if (!std.mem.endsWith(u8, e.path, ".zig")) continue;
+        if (std.mem.eql(u8, e.path, "tests/utils.zig")) continue; // replaced by the facade
+        const lp = wf.addCopyFile(b.path(b.pathJoin(&.{ "nats", e.path })), e.path);
+        if (std.mem.eql(u8, e.path, "tests/all_tests.zig")) all_tests = lp;
+    }
+    const root = buildRootPath(b);
+    const facade = std.Io.Dir.cwd().readFileAlloc(b.graph.io, b.pathJoin(&.{ root, "nats", "utils.zig" }), b.allocator, std.Io.Limit.limited(1 << 20)) catch |err|
+        std.debug.panic("consumers: cannot read nats/utils.zig facade ({s})", .{@errorName(err)});
+    _ = wf.add("tests/utils.zig", facade);
+    return all_tests orelse @panic("consumers: vendored tree has no tests/all_tests.zig");
 }

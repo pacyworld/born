@@ -147,15 +147,30 @@ const Totals = struct {
 /// increment only on Born-route completions; the baseline-vtable forwards do
 /// not increment threaded counters, so born connect > 0 is positive proof
 /// the reactor served the traffic. Returns the failure reason, or null.
+///
+/// Consumer sockets (nats client, std.http.Client) are created only by
+/// connect, so threaded_connect == 0 proves no consumer connect was
+/// delegated to Threaded; reads/writes on those Born-owned handles cannot
+/// silently forward (provenance gate). The nats-e2e suite additionally
+/// carries fixture-side threaded read/write: the vendored keepalive and
+/// reconnect_limits tests run fake servers via listen/accept on
+/// std.testing.io, and the shim's adjudicated client-only profile (P5.3
+/// Option B) routes listen/accept to Threaded, so reads/writes on those
+/// Threaded-owned handles forward and count. That is fixture traffic, not
+/// consumer traffic; the vendored bytes cannot be changed (carry-in 4).
 fn routeProof(t: *const Totals) ?[]const u8 {
     if (consumer_options.born_network) {
-        if (t.threaded_connect != 0 or t.threaded_read != 0 or t.threaded_write != 0)
-            return "threaded network counters nonzero on a born leg";
+        if (t.threaded_connect != 0)
+            return "threaded connect nonzero on a born leg: a consumer connect was delegated";
         if (t.born_connect == 0)
             return "born connect == 0: no Born-route traffic";
+        const is_unit = std.mem.eql(u8, consumer_options.suite, "nats-unit");
+        const is_e2e = std.mem.eql(u8, consumer_options.suite, "nats-e2e");
+        if (!is_e2e and (t.threaded_read != 0 or t.threaded_write != 0))
+            return "threaded network counters nonzero on a born leg";
         // The unit suite is parse/serialize-heavy: only connect is exercised
         // (net_util tests). e2e and HTTP must also prove read and write.
-        if (!std.mem.eql(u8, consumer_options.suite, "nats-unit")) {
+        if (!is_unit) {
             if (t.born_read == 0)
                 return "born read == 0: no Born-route traffic";
             if (t.born_write == 0)
