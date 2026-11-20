@@ -688,6 +688,7 @@ jobs:
           } else { "Defender cmdlets unavailable" }
 
       - name: Run HTTP contract suite
+        timeout-minutes: 5
         run: |
           cd "consumer-http\windows-${{ matrix.optimize }}\bin"
           $expected = (Get-Content http-contract.exe.sha256 -Raw).Split(' ')[0].Trim().ToUpperInvariant()
@@ -695,12 +696,25 @@ jobs:
           if ($actual -ne $expected) { throw "http-contract.exe sha256 $actual does not match the build ($expected)" }
           "http-contract.exe: OK ($actual)"
           "host: $([System.Environment]::OSVersion.VersionString), commit $env:GITHUB_SHA, zig ${{ matrix.zig }} ${{ matrix.optimize }} ${{ matrix.route }}"
-          cmd /c "http-contract.exe > http-contract.log 2>&1"
+          # Stream output live and name each test as it starts (TEST_VERBOSE=2)
+          # so a hang surfaces the stuck test in the job log; the per-step
+          # timeout bounds it to minutes. The Windows runner's shell is
+          # PowerShell 5.1 with $ErrorActionPreference = 'stop', where native
+          # stderr is a terminating error even through 2>&1, so merge stderr
+          # inside cmd (as the nats steps do) and stringify each line: plain
+          # text on any PowerShell version, no NativeCommandError (review 702).
+          $env:TEST_VERBOSE = "2"
+          cmd /c "http-contract.exe 2>&1" | ForEach-Object { "$_" } | Tee-Object -FilePath http-contract.log
           $rc = $LASTEXITCODE
-          Get-Content http-contract.log
           if ($rc -ne 0) { throw "http-contract.exe exited with $rc" }
-          $summary = Select-String -Path http-contract.log -Pattern '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$'
+          # Zig's test runner can prefix lines with terminal CSI escapes
+          # (ESC[0K progress clears, ESC[31m color); TEST_VERBOSE=2 adds more
+          # progress output. Strip them once so every exact match below sees the
+          # semantic text (same one-time strip as the unit step).
+          $esc = [char]27
+          $lines = @(Get-Content http-contract.log | ForEach-Object { $_ -replace "$esc\[[0-9;]*[A-Za-z]", '' })
+          $summary = $lines | Select-String -Pattern '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$'
           if (-not $summary) { throw "http-contract.exe printed no passing summary line" }
-          $proof = Select-String -Path http-contract.log -Pattern '^route proof: PASS$'
+          $proof = $lines | Select-String -Pattern '^route proof: PASS$'
           if (-not $proof) { throw "http-contract.exe printed no route proof PASS line" }
           "runtime evidence (x86_64-windows-gnu, IOCP, http, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $($summary.Line)"
