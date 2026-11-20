@@ -851,9 +851,29 @@ const ConcurrentSpawn = struct {
     iterations: u32,
     success: std.atomic.Value(u64) = .init(0),
     failed: std.atomic.Value(u64) = .init(0),
+    // First-failure capture: the failure count alone throws away the error
+    // name, which the #114 signature needs. First writer wins the claim;
+    // the slot is read after join, when every writer has finished.
+    claimed: std.atomic.Value(bool) = .init(false),
+    first_failure: ?SpawnFailure = null,
+
+    fn recordFailure(self: *ConcurrentSpawn, failure: SpawnFailure) void {
+        _ = self.failed.fetchAdd(1, .monotonic);
+        if (self.claimed.cmpxchgStrong(false, true, .acq_rel, .monotonic) == null) {
+            self.first_failure = failure;
+        }
+    }
 };
 
-fn concurrentSpawnWorker(ctx: *ConcurrentSpawn) void {
+const SpawnFailure = struct {
+    worker: usize,
+    iteration: u32,
+    kind: enum { spawn, wait, term },
+    err_name: ?[]const u8 = null,
+    term: ?std.process.Child.Term = null,
+};
+
+fn concurrentSpawnWorker(ctx: *ConcurrentSpawn, worker: usize) void {
     var i: u32 = 0;
     while (i < ctx.iterations) : (i += 1) {
         var child = std.process.spawn(ctx.io, .{
@@ -861,18 +881,22 @@ fn concurrentSpawnWorker(ctx: *ConcurrentSpawn) void {
             .stdin = .ignore,
             .stdout = .ignore,
             .stderr = .ignore,
-        }) catch {
-            _ = ctx.failed.fetchAdd(1, .monotonic);
+        }) catch |err| {
+            ctx.recordFailure(.{ .worker = worker, .iteration = i, .kind = .spawn, .err_name = @errorName(err) });
             return;
         };
-        const term = std.process.Child.wait(&child, ctx.io) catch {
-            _ = ctx.failed.fetchAdd(1, .monotonic);
+        const term = std.process.Child.wait(&child, ctx.io) catch |err| {
+            ctx.recordFailure(.{ .worker = worker, .iteration = i, .kind = .wait, .err_name = @errorName(err) });
             return;
         };
-        if (term.exited == 0) {
+        const ok = switch (term) {
+            .exited => |code| code == 0,
+            else => false,
+        };
+        if (ok) {
             _ = ctx.success.fetchAdd(1, .monotonic);
         } else {
-            _ = ctx.failed.fetchAdd(1, .monotonic);
+            ctx.recordFailure(.{ .worker = worker, .iteration = i, .kind = .term, .term = term });
         }
     }
 }
@@ -893,8 +917,21 @@ test "concurrent spawn/wait from many workers runs on Born without lost wakeups"
     const iterations = 24;
     var ctx = ConcurrentSpawn{ .io = io, .iterations = iterations };
     var threads: [workers]std.Thread = undefined;
-    for (&threads) |*t| t.* = try std.Thread.spawn(.{}, concurrentSpawnWorker, .{&ctx});
+    for (&threads, 0..) |*t, wi| t.* = try std.Thread.spawn(.{}, concurrentSpawnWorker, .{ &ctx, wi });
     for (threads) |t| t.join();
+    if (ctx.first_failure) |f| {
+        std.debug.print("first spawn/wait failure: worker {d} iteration {d}: ", .{ f.worker, f.iteration });
+        switch (f.kind) {
+            .spawn => std.debug.print("spawn error {s}\n", .{f.err_name.?}),
+            .wait => std.debug.print("wait error {s}\n", .{f.err_name.?}),
+            .term => switch (f.term.?) {
+                .exited => |code| std.debug.print("child exited {d}\n", .{code}),
+                .signal => |sig| std.debug.print("child killed by signal {s}\n", .{@tagName(sig)}),
+                .stopped => |sig| std.debug.print("child stopped by signal {s}\n", .{@tagName(sig)}),
+                .unknown => |v| std.debug.print("child unknown termination {d}\n", .{v}),
+            },
+        }
+    }
     try expectEqual(@as(u64, 0), ctx.failed.load(.monotonic));
     try expectEqual(@as(u64, workers * iterations), ctx.success.load(.monotonic));
     if (born_io.process_stats_enabled) {
