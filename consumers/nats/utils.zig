@@ -139,6 +139,20 @@ pub fn waitForHealthyServices(allocator: std.mem.Allocator, timeout: std.Io.Dura
     const start = std.Io.Timestamp.now(io, .awake);
     while (true) {
         if (start.untilNow(io, .awake).nanoseconds > timeout.nanoseconds) {
+            // Surface the last probe state per service so a timeout names
+            // the server, stage and error instead of hiding the cause.
+            log.err("services not healthy within {d} ms; last probe state per service:", .{@divTrunc(timeout.nanoseconds, std.time.ns_per_ms)});
+            for (services, 0..) |svc, i| {
+                log.err("  {s} (client {d}, monitor {d}): spawned={}, client_connect={s}, healthz={s}, healthz_stage={s}", .{
+                    svc.name,
+                    svc.client_port,
+                    svc.monitor_port,
+                    children[i] != null,
+                    if (port_last_err[i]) |e| @errorName(e) else "open",
+                    if (healthz_last[i]) |h| @errorName(h.err) else "ok",
+                    if (healthz_last[i]) |h| @tagName(h.stage) else "-",
+                });
+            }
             return error.ServicesNotHealthy;
         }
 
@@ -162,11 +176,34 @@ pub fn waitForHealthyServices(allocator: std.mem.Allocator, timeout: std.Io.Dura
             }
         }
 
-        if (total_count > 0 and healthy_count == total_count and allServerPortsOpen(io)) {
+        // Probe the client ports every round, even while healthz is still
+        // failing, so the timeout diagnostics cover every service.
+        const ports_open = allServerPortsOpen(io);
+        if (total_count > 0 and healthy_count == total_count and ports_open) {
             return;
         }
 
         blockingIo().sleep(.fromMilliseconds(100), .awake) catch {};
+    }
+}
+
+/// Last probe failure per provisioned service, surfaced by
+/// waitForHealthyServices on timeout. Probe control flow never branches on
+/// error identity: any connect failure means "not open yet", so the Zig
+/// 0.16.0 Threaded Windows refusal mapping (CONNECTION_REFUSED 0xC0000236
+/// -> error.Unexpected, fixed in 0.17.1; tracked in born#118) cannot change
+/// probe behavior. Refusals during startup are expected on every platform;
+/// the recorded error names only feed the timeout diagnostics.
+const HealthzStage = enum { connect, write, read };
+var port_last_err: [services.len]?anyerror = @splat(null);
+var healthz_last: [services.len]?struct { stage: HealthzStage, err: anyerror } = @splat(null);
+
+/// Probe order matches the services array (asserted below).
+const probe_nodes = [_]Node{ .node1, .node2, .node3, .token_auth, .user_pass, .nkey_auth, .jwt_auth };
+comptime {
+    std.debug.assert(probe_nodes.len == services.len);
+    for (probe_nodes, 0..) |node, i| {
+        std.debug.assert(@intFromEnum(node) == services[i].client_port);
     }
 }
 
@@ -175,14 +212,21 @@ pub fn waitForHealthyServices(allocator: std.mem.Allocator, timeout: std.Io.Dura
 /// against a server that is still coming up. Facade difference: the three
 /// TLS nodes are not provisioned (use_tls = false), so only the seven
 /// non-TLS nodes are probed. Node.unknown is intentionally absent: it must
-/// stay server-free for the wrong-port tests.
+/// stay server-free for the wrong-port tests. Every node is probed each
+/// round (no short-circuit) so the timeout diagnostics cover all ports.
 fn allServerPortsOpen(io: std.Io) bool {
-    for ([_]Node{ .node1, .node2, .node3, .token_auth, .user_pass, .nkey_auth, .jwt_auth }) |node| {
+    var all_open = true;
+    for (probe_nodes, 0..) |node, i| {
         const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(@intFromEnum(node)) };
-        const stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch return false;
+        const stream = address.connect(io, .{ .mode = .stream, .protocol = .tcp }) catch |err| {
+            port_last_err[i] = err;
+            all_open = false;
+            continue;
+        };
+        port_last_err[i] = null;
         stream.close(io);
     }
-    return true;
+    return all_open;
 }
 
 /// Publish into a JetStream stream and wait for the PubAck, so the message
@@ -432,6 +476,8 @@ fn provisionUp(allocator: std.mem.Allocator) !void {
         defer allocator.free(path);
         try cwd.createDirPath(io, path);
     }
+    @memset(&port_last_err, null);
+    @memset(&healthz_last, null);
     errdefer stopAll();
     for (services, 0..) |_, i| try spawnService(allocator, i);
 }
@@ -549,10 +595,10 @@ fn spawnService(allocator: std.mem.Allocator, idx: usize) !void {
 fn healthReport(allocator: std.mem.Allocator) ![]u8 {
     var out: std.Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    for (services, 0..) |svc, i| {
+    for (services, 0..) |_, i| {
         const state: []const u8 = if (children[i] == null)
             "exited"
-        else if (healthzOk(svc.monitor_port))
+        else if (healthzOk(i))
             "healthy"
         else
             "starting";
@@ -561,19 +607,28 @@ fn healthReport(allocator: std.mem.Allocator) ![]u8 {
     return try allocator.dupe(u8, out.written());
 }
 
-fn healthzOk(port: u16) bool {
+fn healthzOk(idx: usize) bool {
     const io = blockingIo();
-    const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+    const address: std.Io.net.IpAddress = .{ .ip4 = .loopback(services[idx].monitor_port) };
     const stream = address.connect(io, .{
         .mode = .stream,
         .protocol = .tcp,
-    }) catch return false;
+    }) catch |err| {
+        healthz_last[idx] = .{ .stage = .connect, .err = err };
+        return false;
+    };
     defer stream.close(io);
 
     var wbuf: [256]u8 = undefined;
     var writer = stream.writer(io, &wbuf);
-    writer.interface.writeAll("GET /healthz HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n") catch return false;
-    writer.interface.flush() catch return false;
+    writer.interface.writeAll("GET /healthz HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n") catch |err| {
+        healthz_last[idx] = .{ .stage = .write, .err = err };
+        return false;
+    };
+    writer.interface.flush() catch |err| {
+        healthz_last[idx] = .{ .stage = .write, .err = err };
+        return false;
+    };
 
     // readSliceShort fills the destination or reads to end of stream; it
     // does not return early on the first available bytes. The monitor
@@ -582,7 +637,12 @@ fn healthzOk(port: u16) bool {
     var rbuf: [512]u8 = undefined;
     var reader = stream.reader(io, &rbuf);
     var head_buf: [512]u8 = undefined;
-    const n = reader.interface.readSliceShort(&head_buf) catch return false;
+    const n = reader.interface.readSliceShort(&head_buf) catch |err| {
+        healthz_last[idx] = .{ .stage = .read, .err = err };
+        return false;
+    };
     const head = head_buf[0..n];
-    return std.mem.startsWith(u8, head, "HTTP/1.0 200") or std.mem.startsWith(u8, head, "HTTP/1.1 200");
+    const ok = std.mem.startsWith(u8, head, "HTTP/1.0 200") or std.mem.startsWith(u8, head, "HTTP/1.1 200");
+    healthz_last[idx] = if (ok) null else .{ .stage = .read, .err = error.BadHealthzResponse };
+    return ok;
 }
