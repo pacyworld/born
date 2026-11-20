@@ -16,7 +16,11 @@
 // std.Io.Threaded.default_PATH and never see the step's PATH (born#110 W1).
 // Spawning the exact absolute path bypasses PATH search entirely and the
 // v2.15.0 pin check covers the binary that actually runs; an unset or
-// non-absolute NATS_SERVER fails loudly. Server logs and per-node JetStream
+// non-absolute NATS_SERVER fails loudly. The child environment is likewise
+// built explicitly from the runner's environ_map (born#124): the empty io
+// environ would otherwise leave the Windows nats-server without SystemRoot,
+// failing every socket call with WSAEPROVIDERFAILEDINIT (10106). Server logs
+// and per-node JetStream
 // store directories live under .zig-cache/nats-test-store relative to the
 // CWD, which must contain tests/configs (the same runtime contract as
 // upstream). Store directories survive restart/stop/start; down removes them
@@ -44,6 +48,44 @@ fn blockingIo() std.Io {
         blocking_io_instance = std.Io.Threaded.init(std.heap.page_allocator, .{});
     }
     return blocking_io_instance.?.io();
+}
+
+// Child environment for the spawned nats-server (born#124). blockingIo has an
+// empty environ, so without an explicit environ_map the child inherits an
+// empty environment block; on Windows a Go binary without SystemRoot cannot
+// load Winsock providers and every socket call fails WSAEPROVIDERFAILEDINIT
+// (10106). Build the child map once from the runner's published environment,
+// copying only the allowlisted variables the server needs. No fallback to the
+// empty io environ or the global block. Same whole-process lifetime contract
+// as blockingIo: page_allocator, never deinitialized.
+var child_environ_instance: ?std.process.Environ.Map = null;
+
+fn childEnviron() !*const std.process.Environ.Map {
+    if (child_environ_instance) |*map| return map;
+    const runner_map = consumer_env.environMap() orelse {
+        log.err("runner did not publish its environment (consumer_env.environMap is null); cannot build the nats-server child environment", .{});
+        return error.EnvironMapUnset;
+    };
+    var map = std.process.Environ.Map.init(std.heap.page_allocator);
+    // Map.put copies keys and values; Windows key lookup is case-insensitive.
+    const allowlist = [_][]const u8{ "SystemRoot", "TEMP", "TMP" };
+    for (allowlist) |key| {
+        if (runner_map.get(key)) |value| try map.put(key, value);
+    }
+    if (comptime builtin.os.tag == .windows) {
+        if (map.get("SystemRoot") == null) {
+            log.err("child environment lacks SystemRoot; nats-server would fail every socket call with WSAEPROVIDERFAILEDINIT (10106); the runner environment must carry SystemRoot", .{});
+            return error.SystemRootMissing;
+        }
+        inline for (.{ "TEMP", "TMP" }) |key| {
+            if (map.get(key) == null) {
+                log.err("child environment lacks {s}; the Windows nats-server child environment is incomplete", .{key});
+                return error.ChildEnvironIncomplete;
+            }
+        }
+    }
+    child_environ_instance = map;
+    return &child_environ_instance.?;
 }
 
 pub const Node = enum(u16) {
@@ -426,6 +468,7 @@ fn checkServerVersion(allocator: std.mem.Allocator) !void {
     const argv = [_][]const u8{ bin, "--version" };
     const result = std.process.run(allocator, blockingIo(), .{
         .argv = &argv,
+        .environ_map = try childEnviron(),
         .stdout_limit = .limited(4096),
         .stderr_limit = .limited(4096),
     }) catch |err| {
@@ -844,6 +887,7 @@ fn spawnService(allocator: std.mem.Allocator, idx: usize) !void {
     }
     const child = try std.process.spawn(io, .{
         .argv = argv_buf[0..argc],
+        .environ_map = try childEnviron(),
         .stdin = .ignore,
         .stdout = .ignore,
         .stderr = .{ .file = log_file },
