@@ -7668,26 +7668,44 @@ test "B1b: futexWake during deinit drains a counted waiter without hanging (#117
     testShim(&state);
     defer state.threaded.deinit();
     const ud: ?*anyopaque = @ptrCast(&state);
+    const tio = state.threaded_io;
     var word: std.atomic.Value(u32) = .init(0);
     var done: std.atomic.Value(u32) = .init(0);
+    var claimed: std.atomic.Value(u32) = .init(0);
 
     const Counted = struct {
-        fn run(s: *Shim, w: *std.atomic.Value(u32), d: *std.atomic.Value(u32)) void {
+        fn run(s: *Shim, w: *std.atomic.Value(u32), d: *std.atomic.Value(u32), c: *std.atomic.Value(u32)) void {
             // A counted consumer thunk (claims an entry slot, like a real call).
             if (!s.entryEnter()) return;
             defer s.entryExit();
+            // Handshake: signal the slot is claimed, then park. The main thread
+            // waits on this flag (event-driven, no spin cap) before closing the
+            // gate, so the count is provably 1 when the drain begins.
+            c.store(1, .release);
+            s.threaded_io.vtable.futexWake(s.threaded_io.userdata, &c.raw, 1);
             s.threaded_io.vtable.futexWaitUncancelable(s.threaded_io.userdata, &w.raw, 0);
             d.store(1, .release);
             s.threaded_io.vtable.futexWake(s.threaded_io.userdata, &d.raw, 1);
         }
     };
-    const t = try std.Thread.spawn(.{}, Counted.run, .{ &state, &word, &done });
-    // Wait until the counted waiter has claimed its slot (entry count == 1).
-    const tio = state.threaded_io;
-    var spins: u32 = 0;
-    while (state.entry.load(.acquire) & Shim.entry_count_mask == 0) : (spins += 1) {
-        if (spins > 1_000_000) return error.TestUnexpectedResult;
-        std.atomic.spinLoopHint();
+    const t = try std.Thread.spawn(.{}, Counted.run, .{ &state, &word, &done, &claimed });
+    // On ANY failure path below, release and join the waiter before returning:
+    // a live thread outliving `state` would dereference freed Threaded memory
+    // (the defer above) and crash a later test. Runs before threaded.deinit.
+    var joined = false;
+    defer {
+        if (!joined) {
+            word.store(1, .release);
+            tio.vtable.futexWake(tio.userdata, &word.raw, 1);
+            t.join();
+        }
+    }
+    // Wait until the counted waiter has claimed its slot. Futex re-checks the
+    // value under the parking lock, so a wake that lands before this wait is
+    // not lost; no arbitrary spin budget (Windows schedules the spawn slower
+    // than a capped spin under load, which flaked this test).
+    while (claimed.load(.acquire) == 0) {
+        tio.vtable.futexWait(tio.userdata, &claimed.raw, 0, .none) catch {};
     }
     // Close the gate: the drain now waits for the counted waiter to return.
     _ = state.entry.fetchOr(Shim.entry_closing, .acq_rel);
@@ -7700,6 +7718,7 @@ test "B1b: futexWake during deinit drains a counted waiter without hanging (#117
     tio.vtable.futexWait(tio.userdata, &done.raw, 0, deadline) catch return error.TestUnexpectedResult;
     try std.testing.expectEqual(@as(u32, 1), done.load(.acquire));
     t.join();
+    joined = true;
     // The counted call returned; the drain completes immediately.
     state.entryCloseAndDrain();
     try std.testing.expectEqual(@as(u32, 0), state.entry.load(.acquire) & Shim.entry_count_mask);
