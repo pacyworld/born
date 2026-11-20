@@ -611,6 +611,9 @@ jobs:
             if ($summary -and $errline -and $onlyW3 -and ($rc -eq 1)) {
               "W3 known-failing branch taken (#118): threaded Zig 0.16.0 Windows unit leg accepted with exactly the upstream refusal-mapping failure; any other shape stays red"
               "runtime evidence (x86_64-windows-gnu, IOCP, nats-unit, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}, W3 #118): $($summary.Line)"
+              # The runner's pwsh wrapper ends with exit $LASTEXITCODE, which
+              # cmd /c left at 1; exit explicitly so acceptance is green.
+              exit 0
             } else {
               throw "threaded Zig 0.16.0 Windows unit leg does not match the exact W3 known-failing shape (#118): rc=$rc summary='$($summary.Line)' failedTests='$($failed -join '|')' errLine='$($errline.Line)'"
             }
