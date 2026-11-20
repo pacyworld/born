@@ -1090,6 +1090,11 @@ pub const Shim = struct {
     /// because the test installs/clears it while the loop runs. Guarded by
     /// `builtin.is_test`, so the signal is comptime-dead outside test builds.
     test_net_parked: std.atomic.Value(usize) = .init(0),
+    /// Test-only deferred-close wake counter (#117 B2): bumped at the
+    /// sockUserExit slow path's port.wake, so the racing closer/releaser test
+    /// asserts "a deferred close implies a wake" without a running loop.
+    /// Comptime-dead outside test builds.
+    test_exit_wakes: std.atomic.Value(u32) = .init(0),
 
     /// Per-route process counters, fed by the loop on Born-route completions
     /// and by the thunks on Threaded forwards; read via `processStats`.
@@ -2011,17 +2016,21 @@ pub const Shim = struct {
     /// the finalize pass, which frees the slot under the same mutex.
     fn sockUserExit(self: *Shim, index: u32) void {
         const state = self.sockAt(index) orelse return;
-        if (state.users.fetchSub(1, .acq_rel) != 1) return;
+        if (state.users.fetchSub(1, .seq_cst) != 1) return;
         self.threaded_io.vtable.futexWake(self.threaded_io.userdata, &state.users.raw, 1);
-        // Fast path: a non-closing slot needs no lock. closeDrive reads `users`
-        // under the same mutex hold that stores closing, so if it deferred (saw
-        // users > 0 after the store) this acquire load must observe closing set
-        // — else a happens-before cycle — and the slow path below wakes the loop.
-        if (!state.closing.load(.acquire)) return;
+        // Fast path: a non-closing slot needs no lock. seq_cst pairs with
+        // closeDrive's seq_cst closing store + users load (store-buffer
+        // pattern; the total-order argument is at closeDrive): if closeDrive
+        // deferred (read users > 0 after its store), this load must observe
+        // closing, so the last release always wakes the loop.
+        if (!state.closing.load(.seq_cst)) return;
         self.registry.mutex.lockUncancelable(self.threaded_io);
         const wake = state.occupied and state.closing.load(.acquire);
         self.registry.mutex.unlock(self.threaded_io);
-        if (wake) self.port.wake();
+        if (wake) {
+            if (builtin.is_test) _ = self.test_exit_wakes.fetchAdd(1, .monotonic);
+            self.port.wake();
+        }
     }
 
     /// Blocking drain of a socket's in-flight consumer thunks before close,
@@ -2488,11 +2497,19 @@ pub const Shim = struct {
             self.registry.mutex.unlock(self.threaded_io);
             return self.netRetireOk(op, 0, false);
         }
-        state.closing.store(true, .release);
-        // Read users under the closing claim so the lock-free sockUserExit fast
-        // path is race-free (review 690 B2): a deferred close (users > 0 here)
-        // forces the releasing caller to observe closing and wake the loop.
-        const users = state.users.load(.acquire);
+        state.closing.store(true, .seq_cst);
+        // Store-buffer (Dekker) pairing with sockUserExit: the closer stores
+        // closing then loads users; the releaser subtracts users then loads
+        // closing. Under acquire/release both loads can read the old value —
+        // the closer defers (users > 0) while the releaser fast-paths
+        // (closing == false), and nobody wakes the loop. The mutex does not
+        // help: the releaser's fast path never takes it. All four operations
+        // are seq_cst, so in the single total order the closer's store precedes
+        // its users load and the releaser's fetchSub precedes its closing load:
+        // the closer reading users > 0 while the releaser reads closing == false
+        // would cycle that order, so it cannot happen. Either the closer sees
+        // users == 0 and retires now, or the releaser sees closing and wakes.
+        const users = state.users.load(.seq_cst);
         self.registry.mutex.unlock(self.threaded_io);
         if (state.pending_read) |rop| self.netRetireRoute(rop, false);
         if (state.pending_write) |wop| self.netRetireRoute(wop, false);
@@ -3752,6 +3769,13 @@ const fwd = struct {
         // Wake/release class (group b): never refuse; counted pre-gate only.
         const entered = self.entryEnter();
         defer if (entered) self.entryExit();
+        // Post-gate no-op: Threaded.groupCancel waits on running tasks through
+        // the Threaded object (cancelThreads/signalAllCanceledSyscalls), which
+        // deinit frees. deinit joins every worker, so no group task can still
+        // run after it and cancellation is vacuous; during the drain window
+        // deinit's join drains the tasks instead. The caller-owned group word
+        // is left untouched.
+        if (!entered) return;
         return self.threaded_io.vtable.groupCancel(self.threaded_io.userdata, group, token);
     }
     fn recancel(userdata: ?*anyopaque) void {
@@ -3817,6 +3841,13 @@ const fwd = struct {
         // Wake/release class (group b): never refuse; counted pre-gate only.
         const entered = self.entryEnter();
         defer if (entered) self.entryExit();
+        // Post-gate POSIX no-op: Threaded.batchCancel frees the batch's poll
+        // storage through t.allocator, which deinit frees; the caller-owned
+        // storage leaks at instance teardown (bounded). The Windows path is
+        // stateless (NtCancelIoFileEx on the caller's handles plus an
+        // alertable NtDelayExecution), so it still forwards and cancels
+        // pending I/O out of the caller-owned batch storage.
+        if (!entered and !is_windows) return;
         return self.threaded_io.vtable.batchCancel(self.threaded_io.userdata, batch);
     }
     fn dirCreateDir(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, permissions: Io.Dir.Permissions) Io.Dir.CreateDirError!void {
@@ -4123,6 +4154,11 @@ const fwd = struct {
         const self = shimFrom(userdata);
         const entered = self.entryEnter(); // release class (group b): never refuse
         defer if (entered) self.entryExit();
+        // Post-gate: a file-backed mapping (section non-null) destroys through
+        // munmap / NtUnmapViewOfSection + CloseHandle, stateless, so it still
+        // forwards. An anonymous mapping (section null) frees through
+        // t.allocator, which deinit frees; skip it (bounded leak at teardown).
+        if (!entered and map.section == null) return;
         return self.threaded_io.vtable.fileMemoryMapDestroy(self.threaded_io.userdata, map);
     }
     fn fileMemoryMapSetLength(userdata: ?*anyopaque, map: *Io.File.MemoryMap, length: usize) Io.File.MemoryMap.SetLengthError!void {
@@ -4171,6 +4207,11 @@ const fwd = struct {
         const self = shimFrom(userdata);
         const entered = self.entryEnter(); // release class (group b): never refuse
         defer if (entered) self.entryExit();
+        // Post-gate no-op: the stderr lock, lock count and buffered writer are
+        // Threaded fields that deinit destroys, so there is nothing left to
+        // unlock or flush. lockStderr refuses post-gate (group a), so no new
+        // lock can contend with the skipped unlock.
+        if (!entered) return;
         return self.threaded_io.vtable.unlockStderr(self.threaded_io.userdata);
     }
     fn processCurrentPath(userdata: ?*anyopaque, buffer: []u8) std.process.CurrentPathError!usize {
@@ -7722,6 +7763,217 @@ test "B1b: futexWake during deinit drains a counted waiter without hanging (#117
     // The counted call returned; the drain completes immediately.
     state.entryCloseAndDrain();
     try std.testing.expectEqual(@as(u32, 0), state.entry.load(.acquire) & Shim.entry_count_mask);
+}
+
+test "B2: racing closer and releaser never lose the deferred-close wake (#117)" {
+    // Store-buffer regression for the seq_cst ordering: closeDrive stores
+    // closing then loads users; sockUserExit subtracts users then loads
+    // closing. With acquire/release both sides can read the old value — the
+    // close defers while the release fast-paths without waking the loop. This
+    // races the real functions and asserts the invariant every iteration: a
+    // deferred close implies the releaser took the wake path (counted at the
+    // port.wake site). No loop thread runs here, so the test drives the
+    // finalize pass itself; a lost wake fails the invariant instead of hanging
+    // the suite, and a watchdog bounds every wait regardless.
+    if (is_windows) return error.SkipZigTest; // POSIX slot lifecycle, as the #115 poison
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    state.port = &port;
+    try testNetGrow(&state, 1);
+    defer state.netFreeChunks();
+    try state.registryInit();
+    defer state.registryDeinit();
+
+    const iterations: u32 = 5000;
+    const Race = struct {
+        state: *Shim,
+        index: u32 = 0,
+        op: *NetOp = undefined,
+        go: std.atomic.Value(u32) = .init(0),
+        bail: std.atomic.Value(u32) = .init(0),
+        closer_done: std.atomic.Value(u32) = .init(0),
+        releaser_done: std.atomic.Value(u32) = .init(0),
+
+        // Park until go == want; false when the test bails (cleanup path).
+        // The bail wake can land before this thread parks (flag + wake, the
+        // go value is unchanged), so the park is bounded and re-checks bail
+        // instead of trusting the wake alone.
+        fn waitGo(r: *@This(), want: u32) bool {
+            const tio = r.state.threaded_io;
+            const recheck = Io.Timeout{ .duration = .{ .raw = .fromNanoseconds(std.time.ns_per_s), .clock = .awake } };
+            while (r.go.load(.acquire) != want) {
+                if (r.bail.load(.acquire) != 0) return false;
+                tio.vtable.futexWait(tio.userdata, &r.go.raw, r.go.load(.acquire), recheck) catch {};
+            }
+            return true;
+        }
+        fn signalDone(tio: Io, w: *std.atomic.Value(u32), n: u32) void {
+            w.store(n, .release);
+            tio.vtable.futexWake(tio.userdata, &w.raw, 1);
+        }
+        fn closer(r: *@This()) void {
+            var i: u32 = 0;
+            while (i < iterations) : (i += 1) {
+                if (!waitGo(r, i + 1)) return;
+                r.state.closeDrive(r.op);
+                signalDone(r.state.threaded_io, &r.closer_done, i + 1);
+            }
+        }
+        fn releaser(r: *@This()) void {
+            var i: u32 = 0;
+            while (i < iterations) : (i += 1) {
+                if (!waitGo(r, i + 1)) return;
+                r.state.sockUserExit(r.index);
+                signalDone(r.state.threaded_io, &r.releaser_done, i + 1);
+            }
+        }
+    };
+
+    var race: Race = .{ .state = &state };
+    const tc = try std.Thread.spawn(.{}, Race.closer, .{&race});
+    const tr = try std.Thread.spawn(.{}, Race.releaser, .{&race});
+    // On any failure path, release both workers from their go wait and join
+    // them before the shim teardown defers run (no thread outlives the state).
+    var joined = false;
+    defer {
+        if (!joined) {
+            race.bail.store(1, .release);
+            state.threaded_io.vtable.futexWake(state.threaded_io.userdata, &race.go.raw, 2);
+            tc.join();
+            tr.join();
+        }
+    }
+    const tio = state.threaded_io;
+    const watchdog = Io.Timeout{ .duration = .{ .raw = .fromNanoseconds(10 * std.time.ns_per_s), .clock = .awake } };
+    // futexWait returns normally on timeout, so bound the attempts: a stuck
+    // worker fails the test (3 x 10 s) instead of hanging the suite.
+    const waitDone = struct {
+        fn f(iface: Io, w: *std.atomic.Value(u32), want: u32, to: Io.Timeout) error{TestUnexpectedResult}!void {
+            var attempts: u32 = 0;
+            while (w.load(.acquire) != want) {
+                if (attempts >= 3) return error.TestUnexpectedResult;
+                attempts += 1;
+                iface.vtable.futexWait(iface.userdata, &w.raw, w.load(.acquire), to) catch return error.TestUnexpectedResult;
+            }
+        }
+    }.f;
+
+    var i: u32 = 0;
+    while (i < iterations) : (i += 1) {
+        const fd = try compat.socket(compat.AF.UNIX, compat.SOCK.STREAM, 0);
+        const index = try state.sockAllocLocked();
+        const s = state.sockAt(index).?;
+        s.generation +%= 1;
+        s.occupied = true;
+        s.index = index;
+        s.handle = fd;
+        s.plain.sock = fd; // sockRetire's POSIX deinit closes this
+        try state.registerHandle(fd, index);
+        // The releaser holds the only count through the counting lookup.
+        try std.testing.expectEqual(SockLookup{ .live = index }, state.lookupBorn(fd));
+        try std.testing.expectEqual(@as(u32, 1), s.users.load(.acquire));
+        var close_op: NetOp = .{ .kind = .close, .sock_index = index, .payload = .{ .close = {} } };
+        close_op.slot_index = try state.netAllocSlotLocked();
+        state.netSlotAt(close_op.slot_index).op = &close_op;
+        race.index = index;
+        race.op = &close_op;
+        const wakes_before = state.test_exit_wakes.load(.monotonic);
+        race.go.store(i + 1, .release);
+        tio.vtable.futexWake(tio.userdata, &race.go.raw, 2);
+        // Watchdog-bounded waits: a stuck worker fails instead of hanging.
+        try waitDone(tio, &race.closer_done, i + 1, watchdog);
+        try waitDone(tio, &race.releaser_done, i + 1, watchdog);
+        if (close_op.state.load(.acquire) == 0) {
+            // Deferred: the seq_cst total order forces the releaser to have
+            // observed closing and woken. A lost wake fails here.
+            try std.testing.expect(state.test_exit_wakes.load(.monotonic) > wakes_before);
+            try std.testing.expect(state.has_deferred_close.load(.acquire));
+            state.netCloseDrain(); // the loop's finalize pass, driven by the wake
+            try std.testing.expectEqual(@as(u32, 1), close_op.state.load(.acquire));
+        }
+        try std.testing.expect(!s.occupied); // retired immediately or by the drain
+    }
+    joined = true;
+    tc.join();
+    tr.join();
+}
+
+test "B1b: release thunks after threaded.deinit touch no freed Threaded memory (#117)" {
+    // The drain-window test above covers a wake DURING deinit; this covers
+    // releases AFTER threaded.deinit has fully finished. Threaded lives in its
+    // own page-allocator allocation: free unmaps it, so any forward that
+    // dereferences the dead object faults deterministically (poison semantics;
+    // the embedded stack copy would only be scribbled by `t.* = undefined`).
+    // The stateless forwards must still work; the thunks whose Threaded
+    // implementation touches the object (groupCancel, batchCancel on POSIX,
+    // unlockStderr, anonymous fileMemoryMapDestroy) must take their post-gate
+    // no-op instead. The shim itself stays live on the stack.
+    var state: Shim = undefined;
+    testShim(&state);
+    state.threaded.deinit(); // the unused testing-allocator instance
+    const t = try std.heap.page_allocator.create(Io.Threaded);
+    t.* = Io.Threaded.init(std.heap.page_allocator, .{});
+    state.threaded_io = t.io();
+    const ud: ?*anyopaque = @ptrCast(&state);
+
+    // Drive teardown to the post-threaded.deinit window (the shim is still
+    // mapped; only the Threaded object and its internals are dead).
+    _ = state.entry.fetchOr(Shim.entry_closing, .acq_rel);
+    state.entryCloseAndDrain();
+    state.childRegistryCloseAll();
+    t.deinit();
+    std.heap.page_allocator.destroy(t);
+
+    // Stateless forwards: address-keyed wake, thread-local crash handler,
+    // plain close(2)/CloseHandle releases. None may dereference Threaded.
+    var word: std.atomic.Value(u32) = .init(0);
+    fwd.futexWake(ud, &word.raw, 1);
+    fwd.crashHandler(ud); // Thread.current is null on the test thread: early return
+    fwd.fileClose(ud, &.{});
+    fwd.dirClose(ud, &.{});
+    if (is_017) {
+        fwd017.netClose(ud, &.{});
+    } else {
+        fwd016.netClose(ud, &.{});
+    }
+
+    // Post-gate no-ops: must return without touching the dead object, and
+    // must leave caller-owned state untouched.
+    var group: Io.Group = Io.Group.init;
+    var token: u8 = 0;
+    fwd.groupCancel(ud, &group, &token);
+    try std.testing.expectEqual(@as(?*anyopaque, null), group.token.load(.monotonic));
+    try std.testing.expectEqual(@as(usize, 0), group.state);
+    var storage: [1]Io.Operation.Storage = undefined;
+    var batch = Io.Batch.init(&storage);
+    fwd.batchCancel(ud, &batch); // POSIX no-op; Windows early-returns on empty pending
+    try std.testing.expectEqual(@as(?*anyopaque, null), batch.userdata);
+    fwd.unlockStderr(ud);
+
+    // Anonymous mapping (section null): the no-op must not free through the
+    // dead t.allocator, and must not scribble the caller's MemoryMap.
+    const page = std.heap.pageSize();
+    const anon = try std.heap.page_allocator.alloc(u8, page);
+    var mm_anon: Io.File.MemoryMap = .{ .file = undefined, .offset = 0, .memory = @alignCast(anon), .section = null };
+    fwd.fileMemoryMapDestroy(ud, &mm_anon);
+    try std.testing.expectEqual(page, mm_anon.memory.len); // still ours: not destroyed
+    std.heap.page_allocator.free(anon);
+    // File-backed mapping (section non-null): the stateless munmap /
+    // INVALID_HANDLE_VALUE early-return path still forwards post-gate.
+    const backed = try std.heap.page_allocator.alloc(u8, page);
+    const backed_section: ?Io.File.MemoryMap.Section = if (comptime is_windows)
+        std.os.windows.INVALID_HANDLE_VALUE
+    else
+        @as(?void, {});
+    var mm_backed: Io.File.MemoryMap = .{ .file = undefined, .offset = 0, .memory = @alignCast(backed), .section = backed_section };
+    fwd.fileMemoryMapDestroy(ud, &mm_backed);
+    if (is_windows) std.heap.page_allocator.free(backed); // early-return did not unmap
+
+    // The gate is intact and no counted call leaked in.
+    try std.testing.expectEqual(Shim.entry_closing, state.entry.load(.acquire));
 }
 
 test "B1c: infallible value producers take the panic refusal path after deinit (#117)" {
