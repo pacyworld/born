@@ -588,7 +588,14 @@ jobs:
           cmd /c "nats-unit.exe > nats-unit.log 2>&1"
           $rc = $LASTEXITCODE
           Get-Content nats-unit.log
-          $proof = Select-String -Path nats-unit.log -Pattern '^route proof: PASS$'
+          # Zig's test runner can prefix lines with terminal CSI escapes
+          # (ESC[0K progress clears, ESC[31m color) depending on build mode
+          # and timing; ReleaseSafe emitted them where Debug did not. Strip
+          # them once so every exact match below sees the semantic text.
+          # Acceptance criteria are unchanged.
+          $esc = [char]27
+          $lines = @(Get-Content nats-unit.log | ForEach-Object { $_ -replace "$esc\[[0-9;]*[A-Za-z]", '' })
+          $proof = $lines | Select-String -Pattern '^route proof: PASS$'
           if (-not $proof) { throw "nats-unit.exe printed no route proof PASS line" }
           if (('${{ matrix.route }}' -eq 'threaded') -and ('${{ matrix.zig }}' -eq '0.16.0')) {
             # W3 (#118, review 6166): upstream Zig 0.16.0 threaded Windows
@@ -596,11 +603,11 @@ jobs:
             # exact known-failing shape: this summary, exactly one failed
             # test (the refusal test), this error detail, rc 1. Any other
             # count, test, or error stays red.
-            $summary = Select-String -Path nats-unit.log -Pattern '^118 passed; 2 skipped; 1 failed\.$'
-            $errline = Select-String -Path nats-unit.log -Pattern '^\s*expected error\.ConnectionRefused, found error\.Unexpected\s*$'
+            $summary = $lines | Select-String -Pattern '^118 passed; 2 skipped; 1 failed\.$'
+            $errline = $lines | Select-String -Pattern '^\s*expected error\.ConnectionRefused, found error\.Unexpected\s*$'
             $failed = @()
             $inBlock = $false
-            foreach ($l in (Get-Content nats-unit.log)) {
+            foreach ($l in $lines) {
               if ($l -eq 'Failed tests:') { $inBlock = $true; continue }
               if ($inBlock) {
                 if ($l.Trim() -eq '') { break }
@@ -619,7 +626,7 @@ jobs:
             }
           } else {
             if ($rc -ne 0) { throw "nats-unit.exe exited with $rc" }
-            $summary = Select-String -Path nats-unit.log -Pattern '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$'
+            $summary = $lines | Select-String -Pattern '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$'
             if (-not $summary) { throw "nats-unit.exe printed no passing summary line" }
             "runtime evidence (x86_64-windows-gnu, IOCP, nats-unit, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $($summary.Line)"
           }
