@@ -159,8 +159,9 @@ fails with a named error (`SuiteLockTimeout`, `SuiteLockFailed`,
 `SuiteLockCreateFailed`/`SuiteLockWaitFailed` on Windows) instead of hanging
 until the job timeout; acquisition logs a line. POSIX uses no signals: a
 helper thread blocks in flock(2) and the caller waits on a futex word
-against a monotonic deadline; on timeout the helper is detached and the
-kernel releases any lock it later acquires when the failed leg exits. The
+against a monotonic deadline; on timeout or a wait error the helper is
+detached and the kernel releases any lock it later acquires when the failed
+leg exits. The
 kernel releases the lock when the holder exits, so a crashed or cancelled
 leg cannot wedge the host.
 Linux suite legs run in per-job containers with private network namespaces

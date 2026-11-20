@@ -551,13 +551,10 @@ const suite_lock = if (builtin.os.tag == .windows) struct {
     fn acquire() !void {
         if (lock_fd != null) return;
         const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDWR, .CREAT = true }, 0o666);
-        flockBounded(fd, path, wait_limit_ns) catch |err| {
-            // On timeout a detached helper may still acquire on this fd;
-            // leave it open (the kernel releases the lock at process exit).
-            // Other errors leave no live helper behind.
-            if (err != error.SuiteLockTimeout) _ = std.c.close(fd);
-            return err;
-        };
+        // flockBounded owns fd on every error path: it closes fd unless it
+        // detached a helper that may still acquire on it (the kernel then
+        // releases the lock when this process exits).
+        try flockBounded(fd, path, wait_limit_ns);
         lock_fd = fd;
         log.info("e2e suite lock acquired ({s})", .{path});
     }
@@ -578,9 +575,9 @@ const suite_lock = if (builtin.os.tag == .windows) struct {
         }
     }
 
-    // Heap-allocated: on timeout the helper is detached and may outlive the
-    // call frame. done: 0 pending, 1 acquired, 2 failed; err is written
-    // before the release store of done.
+    // Heap-allocated: on timeout or a futex wait error the helper is detached
+    // and may outlive the call frame. done: 0 pending, 1 acquired, 2 failed;
+    // err is written before the release store of done.
     const WaitState = struct {
         fd: std.posix.fd_t,
         io: std.Io,
@@ -613,26 +610,32 @@ const suite_lock = if (builtin.os.tag == .windows) struct {
     /// and EINTR-ing unrelated syscalls. A non-blocking try first; on
     /// contention a helper thread blocks in flock(2) (a kernel lock wait, not
     /// a sleep loop) and reports through a futex word, while the caller waits
-    /// on that word against a CLOCK_MONOTONIC deadline. On timeout the helper
-    /// is detached and its state and fd are intentionally leaked: if it later
-    /// acquires, the kernel releases the lock when this process exits. The
-    /// caller is a failed leg about to exit, so the hold is bounded by the
-    /// process lifetime.
+    /// on that word against a CLOCK_MONOTONIC deadline. On timeout or a futex
+    /// wait error the helper is detached and its state and fd are intentionally
+    /// leaked: if it later acquires, the kernel releases the lock when this
+    /// process exits. The caller is a failed leg about to exit, so the hold is
+    /// bounded by the process lifetime. On every other error no helper is live
+    /// and fd is closed here; the caller owns fd only on success.
     fn flockBounded(fd: std.posix.fd_t, label: []const u8, limit_ns: i96) !void {
         switch (std.posix.errno(std.c.flock(fd, std.c.LOCK.EX | std.c.LOCK.NB))) {
             .SUCCESS => return,
             .AGAIN => {}, // EWOULDBLOCK == EAGAIN on both Linux and FreeBSD
             else => |e| {
+                _ = std.c.close(fd);
                 log.err("flock({s}) failed: {s}", .{ label, std.enums.tagName(std.posix.E, e) orelse "unknown" });
                 return error.SuiteLockFailed;
             },
         }
         log.info("e2e ports held by another suite; waiting on the suite lock ({s})", .{label});
 
-        const st = try std.heap.page_allocator.create(WaitState);
+        const st = std.heap.page_allocator.create(WaitState) catch {
+            _ = std.c.close(fd);
+            return error.SuiteLockFailed;
+        };
         st.* = .{ .fd = fd, .io = blockingIo() };
         const th = std.Thread.spawn(.{}, lockHelper, .{st}) catch |err| {
             std.heap.page_allocator.destroy(st);
+            _ = std.c.close(fd);
             log.err("suite lock helper spawn ({s}) failed: {s}", .{ label, @errorName(err) });
             return error.SuiteLockFailed;
         };
@@ -645,6 +648,7 @@ const suite_lock = if (builtin.os.tag == .windows) struct {
                 const e = st.err;
                 std.heap.page_allocator.destroy(st);
                 if (w == 1) return;
+                _ = std.c.close(fd);
                 log.err("flock({s}) failed while waiting: {s}", .{ label, std.enums.tagName(std.posix.E, e) orelse "unknown" });
                 return error.SuiteLockFailed;
             }
@@ -656,7 +660,13 @@ const suite_lock = if (builtin.os.tag == .windows) struct {
             }
             // futexWaitTimeout returns normally on wake AND on timeout; the
             // loop re-checks the word and the deadline (spurious wakes too).
-            try std.Io.futexWaitTimeout(st.io, u32, &st.done.raw, 0, ioTimeout(std.Io.Duration.fromNanoseconds(remaining)));
+            // On error (e.g. Canceled) detach as on timeout: the helper may
+            // still acquire, so st and fd stay with the kernel until exit.
+            std.Io.futexWaitTimeout(st.io, u32, &st.done.raw, 0, ioTimeout(std.Io.Duration.fromNanoseconds(remaining))) catch |err| {
+                th.detach();
+                log.err("suite lock futex wait ({s}) failed: {s}", .{ label, @errorName(err) });
+                return error.SuiteLockFailed;
+            };
         }
     }
 };
