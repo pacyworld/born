@@ -1033,6 +1033,13 @@ pub const Shim = struct {
     /// (born#111). Reset by the retirement. The check is guarded by
     /// `builtin.is_test`, so the hook is comptime-dead outside test builds.
     test_proc_frame_reuse: ?u32 = null,
+    /// Test-only park counter address (#116): when non-zero, the read/write
+    /// drive paths bump the pointed-to counter each time an op parks and wake
+    /// its waiters, so tests synchronize on the actual park instead of a
+    /// fixed sleep that races thread startup under scheduler load. Atomic
+    /// because the test installs/clears it while the loop runs. Guarded by
+    /// `builtin.is_test`, so the signal is comptime-dead outside test builds.
+    test_net_parked: std.atomic.Value(usize) = .init(0),
 
     /// Per-route process counters, fed by the loop on Born-route completions
     /// and by the thunks on Threaded forwards; read via `processStats`.
@@ -2341,6 +2348,7 @@ pub const Shim = struct {
                         return self.netRetireOk(op, op.cursor, false);
                     }
                     self.armRead(state);
+                    self.testParkSignal();
                     return;
                 },
                 .eof => {
@@ -2386,6 +2394,7 @@ pub const Shim = struct {
                 },
                 .want_write => {
                     self.armWrite(state);
+                    self.testParkSignal();
                     return;
                 },
                 .want_read => return self.netRetireErr(op, .write_failed),
@@ -2462,6 +2471,19 @@ pub const Shim = struct {
         }
         if (!any) self.has_deferred_close.store(false, .release);
         self.registry.mutex.unlock(self.threaded_io);
+    }
+
+    /// Test-only park signal (#116): bump the installed counter and wake its
+    /// waiters. Called from the drive paths' park branches on every platform
+    /// (on Windows the overlapped post already happened inside readNb/writeNb;
+    /// armRead/armWrite are no-ops there). Comptime-dead outside test builds.
+    fn testParkSignal(self: *Shim) void {
+        if (!builtin.is_test) return;
+        const addr = self.test_net_parked.load(.acquire);
+        if (addr == 0) return;
+        const c: *std.atomic.Value(u32) = @ptrFromInt(addr);
+        _ = c.fetchAdd(1, .release);
+        self.threaded_io.vtable.futexWake(self.threaded_io.userdata, &c.raw, 1);
     }
 
     fn armRead(self: *Shim, state: *SocketState) void {
@@ -3408,6 +3430,13 @@ pub fn deinit(interface: Io) void {
     shim.procFreeChunks();
     shim.childRegistryDeinit();
     allocator.destroy(shim);
+}
+
+/// Test-only: install the park counter hook (#116), or null to clear it.
+/// Comptime-dead outside test builds. See `Shim.test_net_parked`.
+pub fn testParkHook(interface: Io, hook: ?*std.atomic.Value(u32)) void {
+    if (!builtin.is_test) return;
+    shimFrom(interface.userdata).test_net_parked.store(if (hook) |h| @intFromPtr(h) else 0, .release);
 }
 
 /// The first route-level failure latched by any Born route: a port `wait`
