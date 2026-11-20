@@ -100,17 +100,28 @@ jobs:
           esac
           cache="$HOME/.cache/born-zig/$ver"
           if [ ! -x "$cache/zig" ]; then
-            mkdir -p "$cache"
+            # Atomic publish: download and extract into a private tmp dir,
+            # then rename into place. The eight legs share two version-keyed
+            # cache dirs and run concurrently, so no tree is ever extracted
+            # into a dir another leg may already be using. A rename loser
+            # discards its tree; the version guard below proves the winner.
+            tmp="$cache.tmp.$$"
+            trap 'rm -rf "$tmp"' EXIT
+            mkdir -p "$tmp" "$(dirname "$cache")"
             url="https://ziglang.org/download/$ver/zig-x86_64-freebsd-$ver.tar.xz"
             echo "Downloading $url"
             if command -v curl >/dev/null 2>&1; then
-              curl -fsSL --retry 3 "$url" -o "$cache/zig.tar.xz"
+              curl -fsSL --retry 3 "$url" -o "$tmp/zig.tar.xz"
             else
-              fetch -o "$cache/zig.tar.xz" "$url"
+              fetch -o "$tmp/zig.tar.xz" "$url"
             fi
-            echo "$sha  $cache/zig.tar.xz" | sha256sum -c -
-            tar -xf "$cache/zig.tar.xz" -C "$cache" --strip-components=1
-            rm -f "$cache/zig.tar.xz"
+            echo "$sha  $tmp/zig.tar.xz" | sha256sum -c -
+            tar -xf "$tmp/zig.tar.xz" -C "$tmp" --strip-components=1
+            rm -f "$tmp/zig.tar.xz"
+            mv "$tmp" "$cache"
+            # If another leg published first, mv nested our tree inside
+            # theirs; discard it.
+            rm -rf "$cache/$(basename "$tmp")"
           fi
           test "$("$cache/zig" version)" = "$ver"
           echo "ZIG=$cache/zig" >> "$GITHUB_ENV"
@@ -266,13 +277,20 @@ jobs:
           set -eu
           cache="$HOME/.cache/born-nats-server/v2.15.0"
           if [ ! -x "$cache/nats-server" ]; then
-            mkdir -p "$cache"
+            # Atomic publish (private tmp dir + rename): the four 0.16.0
+            # legs share this cache and run concurrently. A rename loser
+            # discards its tree; the version guard below proves the winner.
+            tmp="$cache.tmp.$$"
+            trap 'rm -rf "$tmp"' EXIT
+            mkdir -p "$tmp" "$(dirname "$cache")"
             url="https://github.com/nats-io/nats-server/releases/download/v2.15.0/nats-server-v2.15.0-freebsd-amd64.tar.gz"
             echo "Downloading $url"
-            curl -fsSL --retry 3 "$url" -o "$cache/nats-server.tar.gz"
-            echo "$NATS_SERVER_FREEBSD_SHA256  $cache/nats-server.tar.gz" | sha256sum -c -
-            tar -xzf "$cache/nats-server.tar.gz" -C "$cache" --strip-components=1
-            rm -f "$cache/nats-server.tar.gz"
+            curl -fsSL --retry 3 "$url" -o "$tmp/nats-server.tar.gz"
+            echo "$NATS_SERVER_FREEBSD_SHA256  $tmp/nats-server.tar.gz" | sha256sum -c -
+            tar -xzf "$tmp/nats-server.tar.gz" -C "$tmp" --strip-components=1
+            rm -f "$tmp/nats-server.tar.gz"
+            mv "$tmp" "$cache"
+            rm -rf "$cache/$(basename "$tmp")"
           fi
           test "$("$cache/nats-server" --version)" = "nats-server: v2.15.0"
           echo "NATS_SERVER=$cache/nats-server" >> "$GITHUB_ENV"
@@ -404,13 +422,21 @@ jobs:
           set -eu
           cache="$HOME/.cache/born-nats-server/v2.15.0"
           if [ ! -x "$cache/nats-server" ]; then
-            mkdir -p "$cache"
+            # Atomic publish (private tmp dir + rename), same pattern as the
+            # FreeBSD legs. Each job container has a private filesystem, so
+            # this cache does not contend today; the pattern keeps provision
+            # safe if a runner config ever shares or reuses it.
+            tmp="$cache.tmp.$$"
+            trap 'rm -rf "$tmp"' EXIT
+            mkdir -p "$tmp" "$(dirname "$cache")"
             url="https://github.com/nats-io/nats-server/releases/download/v2.15.0/nats-server-v2.15.0-linux-amd64.tar.gz"
             echo "Downloading $url"
-            curl -fsSL --retry 3 "$url" -o "$cache/nats-server.tar.gz"
-            echo "$NATS_SERVER_LINUX_SHA256  $cache/nats-server.tar.gz" | sha256sum -c -
-            tar -xzf "$cache/nats-server.tar.gz" -C "$cache" --strip-components=1
-            rm -f "$cache/nats-server.tar.gz"
+            curl -fsSL --retry 3 "$url" -o "$tmp/nats-server.tar.gz"
+            echo "$NATS_SERVER_LINUX_SHA256  $tmp/nats-server.tar.gz" | sha256sum -c -
+            tar -xzf "$tmp/nats-server.tar.gz" -C "$tmp" --strip-components=1
+            rm -f "$tmp/nats-server.tar.gz"
+            mv "$tmp" "$cache"
+            rm -rf "$cache/$(basename "$tmp")"
           fi
           test "$("$cache/nats-server" --version)" = "nats-server: v2.15.0"
           echo "NATS_SERVER=$cache/nats-server" >> "$GITHUB_ENV"
@@ -520,14 +546,30 @@ jobs:
           $bin = Join-Path $cache 'nats-server-v2.15.0-windows-amd64'
           $exe = Join-Path $bin 'nats-server.exe'
           if (-not (Test-Path $exe)) {
-            New-Item -ItemType Directory -Force -Path $cache | Out-Null
-            $url = 'https://github.com/nats-io/nats-server/releases/download/v2.15.0/nats-server-v2.15.0-windows-amd64.zip'
-            $zip = Join-Path $cache 'nats-server.zip'
-            Invoke-WebRequest -Uri $url -OutFile $zip
-            $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-            if ($hash -ne $env:NATS_SERVER_WINDOWS_SHA256) { throw "nats-server zip sha256 $hash does not match the pin ($env:NATS_SERVER_WINDOWS_SHA256)" }
-            Expand-Archive -Path $zip -DestinationPath $cache -Force
-            Remove-Item $zip
+            # Atomic publish (private tmp dir + rename), same pattern as the
+            # POSIX legs: the 0.16.0 legs share this cache and run
+            # concurrently. A rename loser discards its tree; the version
+            # guard below proves the winner.
+            $tmp = "$cache.tmp.$PID"
+            try {
+              New-Item -ItemType Directory -Force -Path $tmp | Out-Null
+              New-Item -ItemType Directory -Force -Path (Split-Path $cache) | Out-Null
+              $url = 'https://github.com/nats-io/nats-server/releases/download/v2.15.0/nats-server-v2.15.0-windows-amd64.zip'
+              $zip = Join-Path $tmp 'nats-server.zip'
+              Invoke-WebRequest -Uri $url -OutFile $zip
+              $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+              if ($hash -ne $env:NATS_SERVER_WINDOWS_SHA256) { throw "nats-server zip sha256 $hash does not match the pin ($env:NATS_SERVER_WINDOWS_SHA256)" }
+              Expand-Archive -Path $zip -DestinationPath $tmp -Force
+              Remove-Item $zip
+              Move-Item -Path $tmp -Destination $cache
+              # If another leg published first, Move-Item nested our tree
+              # inside theirs; discard it.
+              $nested = Join-Path $cache (Split-Path $tmp -Leaf)
+              if (Test-Path $nested) { Remove-Item -Recurse -Force $nested }
+            } catch {
+              if (Test-Path $tmp) { Remove-Item -Recurse -Force $tmp }
+              throw
+            }
           }
           $version = (& $exe --version | Out-String).Trim()
           if ($version -ne 'nats-server: v2.15.0') { throw "nats-server pin mismatch: $version" }

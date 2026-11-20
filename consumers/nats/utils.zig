@@ -469,14 +469,22 @@ fn portFree(io: std.Io, port: u16) bool {
 /// exit), so the ports are free before the lock changes hands. Linux legs
 /// run in per-job containers with private network namespaces and a private
 /// /tmp, so the lock never contends there.
+///
+/// The wait is bounded well under the 30-minute suite job timeout (review
+/// 694): a stuck holder fails the leg with a named error instead of hanging
+/// it until the job timeout. Acquisition logs a line so a run shows whether
+/// the lock was taken (on Windows this also proves the Global\ namespace
+/// privilege, since CreateMutexW there would otherwise fail).
 const suite_lock = if (builtin.os.tag == .windows) struct {
     // A named mutex in the Global namespace is host-wide across job
     // sessions; like flock it is released by the kernel on holder death.
     // WAIT_ABANDONED still grants ownership (the previous holder died).
     const name = std.unicode.utf8ToUtf16LeStringLiteral("Global\\born-nats-e2e-suite");
+    const wait_limit_ms: u32 = 15 * 60 * 1000; // 900 s, half the job timeout
     const wait_object_0: u32 = 0x0;
     const wait_abandoned: u32 = 0x80;
-    const infinite: u32 = 0xFFFFFFFF;
+    const wait_timeout: u32 = 258;
+    const wait_failed: u32 = 0xFFFFFFFF;
 
     extern "kernel32" fn CreateMutexW(attrs: ?*anyopaque, initial_owner: c_int, mutex_name: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
     extern "kernel32" fn WaitForSingleObject(handle: *anyopaque, milliseconds: u32) callconv(.winapi) u32;
@@ -485,19 +493,43 @@ const suite_lock = if (builtin.os.tag == .windows) struct {
 
     var mutex: ?*anyopaque = null;
 
+    fn logWin32(comptime what: []const u8, e: std.os.windows.Win32Error) void {
+        log.err("{s} for the e2e suite lock (Global\\born-nats-e2e-suite): {s} ({d})", .{
+            what,
+            std.enums.tagName(std.os.windows.Win32Error, e) orelse "unknown",
+            @intFromEnum(e),
+        });
+    }
+
     fn acquire() !void {
         if (mutex != null) return;
-        const h = CreateMutexW(null, 0, name) orelse return error.Unexpected;
+        const h = CreateMutexW(null, 0, name) orelse {
+            logWin32("CreateMutexW failed", std.os.windows.GetLastError());
+            return error.SuiteLockCreateFailed;
+        };
+        errdefer _ = CloseHandle(h);
         const status = WaitForSingleObject(h, 0);
+        if (status == wait_failed) {
+            logWin32("WaitForSingleObject failed", std.os.windows.GetLastError());
+            return error.SuiteLockWaitFailed;
+        }
         if (status != wait_object_0 and status != wait_abandoned) {
             log.info("e2e ports held by another suite; waiting on the suite lock", .{});
-            const waited = WaitForSingleObject(h, infinite);
-            if (waited != wait_object_0 and waited != wait_abandoned) {
-                _ = CloseHandle(h);
-                return error.Unexpected;
+            const waited = WaitForSingleObject(h, wait_limit_ms);
+            switch (waited) {
+                wait_object_0, wait_abandoned => {},
+                wait_timeout => {
+                    log.err("e2e suite lock wait timed out after {d} ms: Global\\born-nats-e2e-suite", .{wait_limit_ms});
+                    return error.SuiteLockTimeout;
+                },
+                else => {
+                    logWin32("WaitForSingleObject failed", std.os.windows.GetLastError());
+                    return error.SuiteLockWaitFailed;
+                },
             }
         }
         mutex = h;
+        log.info("e2e suite lock acquired (Global\\born-nats-e2e-suite)", .{});
     }
 
     fn release() void {
@@ -512,21 +544,27 @@ const suite_lock = if (builtin.os.tag == .windows) struct {
     // account changes. flock is per open-file-description, so a second
     // acquire in this process would also succeed; the guard keeps one hold.
     const path = "/tmp/born-nats-e2e.lock";
+    const wait_limit_ns: i96 = 15 * std.time.ns_per_min; // 900 s, half the job timeout
+    const alarm_interval_ns: i96 = std.time.ns_per_s;
+    const itimer_real: c_int = 0; // ITIMER_REAL
+
+    // setitimer is not declared in std for the BSDs; the layout matches
+    // <sys/time.h> (two timevals: repeating interval, initial value).
+    const Itimerval = extern struct {
+        it_interval: std.c.timeval,
+        it_value: std.c.timeval,
+    };
+    extern "c" fn setitimer(which: c_int, new: *const Itimerval, old: ?*Itimerval) c_int;
+
     var lock_fd: ?std.posix.fd_t = null;
 
     fn acquire() !void {
         if (lock_fd != null) return;
         const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDWR, .CREAT = true }, 0o666);
         errdefer _ = std.c.close(fd);
-        switch (std.posix.errno(std.c.flock(fd, std.c.LOCK.EX | std.c.LOCK.NB))) {
-            .SUCCESS => {},
-            .AGAIN => { // EWOULDBLOCK == EAGAIN on both Linux and FreeBSD
-                log.info("e2e ports held by another suite; waiting on the suite lock", .{});
-                if (std.c.flock(fd, std.c.LOCK.EX) != 0) return error.Unexpected;
-            },
-            else => return error.Unexpected,
-        }
+        try flockBounded(fd, path, wait_limit_ns);
         lock_fd = fd;
+        log.info("e2e suite lock acquired ({s})", .{path});
     }
 
     fn release() void {
@@ -536,7 +574,153 @@ const suite_lock = if (builtin.os.tag == .windows) struct {
             lock_fd = null;
         }
     }
+
+    fn monoNowNs() i96 {
+        var ts: std.c.timespec = undefined;
+        switch (std.posix.errno(std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts))) {
+            .SUCCESS => return @as(i96, ts.sec) * std.time.ns_per_s + ts.nsec,
+            else => unreachable, // CLOCK_MONOTONIC cannot fail
+        }
+    }
+
+    fn nsToTimeval(ns: i96) std.c.timeval {
+        return .{
+            .sec = @intCast(@divTrunc(ns, std.time.ns_per_s)),
+            .usec = @intCast(@divTrunc(@mod(ns, std.time.ns_per_s), std.time.ns_per_us)),
+        };
+    }
+
+    // Empty: the alarm exists only to interrupt the blocking flock with
+    // EINTR so the wait can re-check its deadline.
+    fn alarmHandler(sig: std.posix.SIG) callconv(.c) void {
+        _ = sig;
+    }
+
+    /// Bounded exclusive flock. A non-blocking try first; on contention the
+    /// thread blocks in flock(2) (a kernel lock wait, not a sleep loop) while
+    /// a repeating ITIMER_REAL alarm interrupts it with EINTR to re-check a
+    /// monotonic deadline. The wait is bounded by limit_ns plus one alarm
+    /// interval. SIGALRM is blocked on this thread outside the flock call and
+    /// left blocked on return, so every thread the fixture spawns later
+    /// inherits the block and the process-directed alarm can only land on the
+    /// thread inside flock. The fixture uses SIGALRM for nothing else.
+    fn flockBounded(fd: std.posix.fd_t, label: []const u8, limit_ns: i96) !void {
+        switch (std.posix.errno(std.c.flock(fd, std.c.LOCK.EX | std.c.LOCK.NB))) {
+            .SUCCESS => return,
+            .AGAIN => {}, // EWOULDBLOCK == EAGAIN on both Linux and FreeBSD
+            else => |e| {
+                log.err("flock({s}) failed: {s}", .{ label, std.enums.tagName(std.posix.E, e) orelse "unknown" });
+                return error.SuiteLockFailed;
+            },
+        }
+        log.info("e2e ports held by another suite; waiting on the suite lock ({s})", .{label});
+
+        var alrm: std.posix.sigset_t = std.posix.sigemptyset();
+        std.posix.sigaddset(&alrm, .ALRM);
+        std.posix.sigprocmask(std.posix.SIG.BLOCK, &alrm, null);
+
+        var old_act: std.posix.Sigaction = undefined;
+        const act: std.posix.Sigaction = .{
+            .handler = .{ .handler = &alarmHandler },
+            .flags = 0, // no SA_RESTART: the alarm must interrupt flock
+            .mask = std.posix.sigemptyset(),
+        };
+        std.posix.sigaction(.ALRM, &act, &old_act);
+
+        // On every exit: disarm, discard any pending alarm (so it cannot land
+        // on the restored SIG_DFL and kill the process), restore the old
+        // action, and keep SIGALRM blocked for the inheritance discipline.
+        defer {
+            const zero: Itimerval = .{
+                .it_interval = .{ .sec = 0, .usec = 0 },
+                .it_value = .{ .sec = 0, .usec = 0 },
+            };
+            _ = setitimer(itimer_real, &zero, null);
+            const ign: std.posix.Sigaction = .{
+                .handler = .{ .handler = std.posix.SIG.IGN },
+                .flags = 0,
+                .mask = std.posix.sigemptyset(),
+            };
+            std.posix.sigaction(.ALRM, &ign, null);
+            std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &alrm, null);
+            std.posix.sigprocmask(std.posix.SIG.BLOCK, &alrm, null);
+            std.posix.sigaction(.ALRM, &old_act, null);
+        }
+
+        const deadline = monoNowNs() + limit_ns;
+        const timer: Itimerval = .{
+            .it_interval = nsToTimeval(alarm_interval_ns),
+            .it_value = nsToTimeval(@min(limit_ns, alarm_interval_ns)),
+        };
+        const timer_rc = setitimer(itimer_real, &timer, null);
+        if (timer_rc != 0) {
+            log.err("setitimer for the suite lock wait ({s}) failed: {s}", .{ label, std.enums.tagName(std.posix.E, std.posix.errno(timer_rc)) orelse "unknown" });
+            return error.SuiteLockFailed;
+        }
+
+        while (true) {
+            std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &alrm, null);
+            const rc = std.c.flock(fd, std.c.LOCK.EX);
+            const e = std.posix.errno(rc);
+            std.posix.sigprocmask(std.posix.SIG.BLOCK, &alrm, null);
+            switch (e) {
+                .SUCCESS => return,
+                .INTR => {
+                    if (monoNowNs() >= deadline) {
+                        log.err("e2e suite lock wait timed out after {d} s: {s}", .{ @divTrunc(limit_ns, std.time.ns_per_s), label });
+                        return error.SuiteLockTimeout;
+                    }
+                },
+                else => {
+                    log.err("flock({s}) failed while waiting: {s}", .{ label, std.enums.tagName(std.posix.E, e) orelse "unknown" });
+                    return error.SuiteLockFailed;
+                },
+            }
+        }
+    }
 };
+
+/// Bounded-wait regression for the suite lock (#118, review 694 point 2).
+/// POSIX-only: a named Windows mutex is recursive per thread, so an
+/// in-process holder cannot contend with itself; the Windows bounded wait is
+/// exercised by the Windows CI legs instead. Uses a throwaway lock file, not
+/// the suite lock path, which provisionUp holds for the whole suite.
+const suite_lock_wait_test = if (builtin.os.tag == .windows) struct {
+    fn run() !void {
+        return error.SkipZigTest;
+    }
+} else struct {
+    fn run() !void {
+        const allocator = std.testing.allocator;
+        var path_buf: [128]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "/tmp/born-nats-e2e-lock-test-{d}", .{std.c.getpid()});
+        const path_z = try allocator.dupeZ(u8, path);
+        defer allocator.free(path_z);
+
+        // Two independent open file descriptions on one file: flock is per
+        // OFD, so the holder's exclusive lock contends with the target fd.
+        const holder = try std.posix.openat(std.posix.AT.FDCWD, path_z, .{ .ACCMODE = .RDWR, .CREAT = true }, 0o600);
+        defer _ = std.c.close(holder);
+        defer _ = std.c.unlinkat(std.posix.AT.FDCWD, path_z, 0);
+        if (std.c.flock(holder, std.c.LOCK.EX | std.c.LOCK.NB) != 0) return error.Unexpected;
+
+        const target = try std.posix.openat(std.posix.AT.FDCWD, path_z, .{ .ACCMODE = .RDWR }, 0o600);
+        defer _ = std.c.close(target);
+
+        // Contended: the bounded wait must time out (exercising the SIGALRM
+        // EINTR path), not block forever.
+        try std.testing.expectError(error.SuiteLockTimeout, suite_lock.flockBounded(target, path, 300 * std.time.ns_per_ms));
+
+        // Release the holder; the same fd now acquires.
+        if (std.c.flock(holder, std.c.LOCK.UN) != 0) return error.Unexpected;
+        try suite_lock.flockBounded(target, path, 300 * std.time.ns_per_ms);
+        if (std.c.flock(target, std.c.LOCK.UN) != 0) return error.Unexpected;
+    }
+};
+
+test "suite lock: bounded wait times out, then acquires (#118)" {
+    try suite_lock_wait_test.run();
+}
 
 fn provisionUp(allocator: std.mem.Allocator) !void {
     try suite_lock.acquire();
