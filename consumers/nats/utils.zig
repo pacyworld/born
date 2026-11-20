@@ -23,6 +23,7 @@
 // (review 192 carry-in 5).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const nats = @import("nats");
 const consumer_env = @import("consumer_env");
 
@@ -456,7 +457,268 @@ fn portFree(io: std.Io, port: u16) bool {
     return false;
 }
 
+/// Host-global e2e suite lock (#118). The e2e topology binds fixed loopback
+/// ports (14222-14229, monitors 18222+), a host-global resource. Forgejo does
+/// not enforce strategy.max-parallel, so matrix legs and overlapping
+/// dispatches run concurrently on one runner host; without arbitration a
+/// leg's beforeAll sees a sibling leg's servers and fails with PortsNotFree.
+/// The lock is held from `up -d` (provisionUp) to `down` (provisionDown),
+/// serializing whole suites on the host. The kernel releases it when the
+/// holder exits, so a crashed or cancelled leg cannot wedge the host.
+/// stopAll's Child.kill reaps each server (Threaded childKill waits for
+/// exit), so the ports are free before the lock changes hands. Linux legs
+/// run in per-job containers with private network namespaces and a private
+/// /tmp, so the lock never contends there.
+///
+/// The wait is bounded well under the 30-minute suite job timeout (review
+/// 694): a stuck holder fails the leg with a named error instead of hanging
+/// it until the job timeout. Acquisition logs a line so a run shows whether
+/// the lock was taken (on Windows this also proves the Global\ namespace
+/// privilege, since CreateMutexW there would otherwise fail).
+const suite_lock = if (builtin.os.tag == .windows) struct {
+    // A named mutex in the Global namespace is host-wide across job
+    // sessions; like flock it is released by the kernel on holder death.
+    // WAIT_ABANDONED still grants ownership (the previous holder died).
+    const name = std.unicode.utf8ToUtf16LeStringLiteral("Global\\born-nats-e2e-suite");
+    const wait_limit_ms: u32 = 15 * 60 * 1000; // 900 s, half the job timeout
+    const wait_object_0: u32 = 0x0;
+    const wait_abandoned: u32 = 0x80;
+    const wait_timeout: u32 = 258;
+    const wait_failed: u32 = 0xFFFFFFFF;
+
+    extern "kernel32" fn CreateMutexW(attrs: ?*anyopaque, initial_owner: c_int, mutex_name: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn WaitForSingleObject(handle: *anyopaque, milliseconds: u32) callconv(.winapi) u32;
+    extern "kernel32" fn ReleaseMutex(handle: *anyopaque) callconv(.winapi) c_int;
+    extern "kernel32" fn CloseHandle(handle: *anyopaque) callconv(.winapi) c_int;
+
+    var mutex: ?*anyopaque = null;
+
+    fn logWin32(comptime what: []const u8, e: std.os.windows.Win32Error) void {
+        log.err("{s} for the e2e suite lock (Global\\born-nats-e2e-suite): {s} ({d})", .{
+            what,
+            std.enums.tagName(std.os.windows.Win32Error, e) orelse "unknown",
+            @intFromEnum(e),
+        });
+    }
+
+    fn acquire() !void {
+        if (mutex != null) return;
+        const h = CreateMutexW(null, 0, name) orelse {
+            logWin32("CreateMutexW failed", std.os.windows.GetLastError());
+            return error.SuiteLockCreateFailed;
+        };
+        errdefer _ = CloseHandle(h);
+        const status = WaitForSingleObject(h, 0);
+        if (status == wait_failed) {
+            logWin32("WaitForSingleObject failed", std.os.windows.GetLastError());
+            return error.SuiteLockWaitFailed;
+        }
+        if (status != wait_object_0 and status != wait_abandoned) {
+            log.info("e2e ports held by another suite; waiting on the suite lock", .{});
+            const waited = WaitForSingleObject(h, wait_limit_ms);
+            switch (waited) {
+                wait_object_0, wait_abandoned => {},
+                wait_timeout => {
+                    log.err("e2e suite lock wait timed out after {d} ms: Global\\born-nats-e2e-suite", .{wait_limit_ms});
+                    return error.SuiteLockTimeout;
+                },
+                else => {
+                    logWin32("WaitForSingleObject failed", std.os.windows.GetLastError());
+                    return error.SuiteLockWaitFailed;
+                },
+            }
+        }
+        mutex = h;
+        log.info("e2e suite lock acquired (Global\\born-nats-e2e-suite)", .{});
+    }
+
+    fn release() void {
+        if (mutex) |h| {
+            _ = ReleaseMutex(h);
+            _ = CloseHandle(h);
+            mutex = null;
+        }
+    }
+} else struct {
+    // Same-user CI jobs share the file; 0666 keeps it openable if the runner
+    // account changes. flock is per open-file-description, so a second
+    // acquire in this process would also succeed; the guard keeps one hold.
+    const path = "/tmp/born-nats-e2e.lock";
+    const wait_limit_ns: i96 = 15 * std.time.ns_per_min; // 900 s, half the job timeout
+
+    var lock_fd: ?std.posix.fd_t = null;
+
+    fn acquire() !void {
+        if (lock_fd != null) return;
+        const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDWR, .CREAT = true }, 0o666);
+        // flockBounded owns fd on every error path: it closes fd unless it
+        // detached a helper that may still acquire on it (the kernel then
+        // releases the lock when this process exits).
+        try flockBounded(fd, path, wait_limit_ns);
+        lock_fd = fd;
+        log.info("e2e suite lock acquired ({s})", .{path});
+    }
+
+    fn release() void {
+        if (lock_fd) |fd| {
+            _ = std.c.flock(fd, std.c.LOCK.UN);
+            _ = std.c.close(fd);
+            lock_fd = null;
+        }
+    }
+
+    fn monoNowNs() i96 {
+        var ts: std.c.timespec = undefined;
+        switch (std.posix.errno(std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts))) {
+            .SUCCESS => return @as(i96, ts.sec) * std.time.ns_per_s + ts.nsec,
+            else => unreachable, // CLOCK_MONOTONIC cannot fail
+        }
+    }
+
+    // Heap-allocated: on timeout or a futex wait error the helper is detached
+    // and may outlive the call frame. done: 0 pending, 1 acquired, 2 failed;
+    // err is written before the release store of done.
+    const WaitState = struct {
+        fd: std.posix.fd_t,
+        io: std.Io,
+        err: std.c.E = .SUCCESS,
+        done: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    };
+
+    fn lockHelper(st: *WaitState) void {
+        while (true) {
+            switch (std.posix.errno(std.c.flock(st.fd, std.c.LOCK.EX))) {
+                .SUCCESS => {
+                    st.done.store(1, .release);
+                    std.Io.futexWake(st.io, u32, &st.done.raw, 1);
+                    return;
+                },
+                .INTR => continue, // retry; the caller's deadline bounds the wait
+                else => |e| {
+                    st.err = e;
+                    st.done.store(2, .release);
+                    std.Io.futexWake(st.io, u32, &st.done.raw, 1);
+                    return;
+                },
+            }
+        }
+    }
+
+    /// Bounded exclusive flock, no signals (review 697): a process-directed
+    /// alarm can land on any thread that does not block it, including the
+    /// fixture's long-lived Threaded workers, leaving the flock uninterruptible
+    /// and EINTR-ing unrelated syscalls. A non-blocking try first; on
+    /// contention a helper thread blocks in flock(2) (a kernel lock wait, not
+    /// a sleep loop) and reports through a futex word, while the caller waits
+    /// on that word against a CLOCK_MONOTONIC deadline. On timeout or a futex
+    /// wait error the helper is detached and its state and fd are intentionally
+    /// leaked: if it later acquires, the kernel releases the lock when this
+    /// process exits. The caller is a failed leg about to exit, so the hold is
+    /// bounded by the process lifetime. On every other error no helper is live
+    /// and fd is closed here; the caller owns fd only on success.
+    fn flockBounded(fd: std.posix.fd_t, label: []const u8, limit_ns: i96) !void {
+        switch (std.posix.errno(std.c.flock(fd, std.c.LOCK.EX | std.c.LOCK.NB))) {
+            .SUCCESS => return,
+            .AGAIN => {}, // EWOULDBLOCK == EAGAIN on both Linux and FreeBSD
+            else => |e| {
+                _ = std.c.close(fd);
+                log.err("flock({s}) failed: {s}", .{ label, std.enums.tagName(std.posix.E, e) orelse "unknown" });
+                return error.SuiteLockFailed;
+            },
+        }
+        log.info("e2e ports held by another suite; waiting on the suite lock ({s})", .{label});
+
+        const st = std.heap.page_allocator.create(WaitState) catch {
+            _ = std.c.close(fd);
+            return error.SuiteLockFailed;
+        };
+        st.* = .{ .fd = fd, .io = blockingIo() };
+        const th = std.Thread.spawn(.{}, lockHelper, .{st}) catch |err| {
+            std.heap.page_allocator.destroy(st);
+            _ = std.c.close(fd);
+            log.err("suite lock helper spawn ({s}) failed: {s}", .{ label, @errorName(err) });
+            return error.SuiteLockFailed;
+        };
+
+        const deadline = monoNowNs() + limit_ns;
+        while (true) {
+            const w = st.done.load(.acquire);
+            if (w != 0) {
+                th.join();
+                const e = st.err;
+                std.heap.page_allocator.destroy(st);
+                if (w == 1) return;
+                _ = std.c.close(fd);
+                log.err("flock({s}) failed while waiting: {s}", .{ label, std.enums.tagName(std.posix.E, e) orelse "unknown" });
+                return error.SuiteLockFailed;
+            }
+            const remaining = deadline - monoNowNs();
+            if (remaining <= 0) {
+                th.detach(); // st and fd intentionally leaked; see doc comment
+                log.err("e2e suite lock wait timed out after {d} s: {s}", .{ @divTrunc(limit_ns, std.time.ns_per_s), label });
+                return error.SuiteLockTimeout;
+            }
+            // futexWaitTimeout returns normally on wake AND on timeout; the
+            // loop re-checks the word and the deadline (spurious wakes too).
+            // On error (e.g. Canceled) detach as on timeout: the helper may
+            // still acquire, so st and fd stay with the kernel until exit.
+            std.Io.futexWaitTimeout(st.io, u32, &st.done.raw, 0, ioTimeout(std.Io.Duration.fromNanoseconds(remaining))) catch |err| {
+                th.detach();
+                log.err("suite lock futex wait ({s}) failed: {s}", .{ label, @errorName(err) });
+                return error.SuiteLockFailed;
+            };
+        }
+    }
+};
+
+/// Bounded-wait regression for the suite lock (#118, review 694 point 2).
+/// POSIX-only: a named Windows mutex is recursive per thread, so an
+/// in-process holder cannot contend with itself; the Windows bounded wait is
+/// exercised by the Windows CI legs instead. Uses a throwaway lock file, not
+/// the suite lock path, which provisionUp holds for the whole suite.
+const suite_lock_wait_test = if (builtin.os.tag == .windows) struct {
+    fn run() !void {
+        return error.SkipZigTest;
+    }
+} else struct {
+    fn run() !void {
+        const allocator = std.testing.allocator;
+        var path_buf: [128]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "/tmp/born-nats-e2e-lock-test-{d}", .{std.c.getpid()});
+        const path_z = try allocator.dupeZ(u8, path);
+        defer allocator.free(path_z);
+
+        // Two independent open file descriptions on one file: flock is per
+        // OFD, so the holder's exclusive lock contends with the target fd.
+        const holder = try std.posix.openat(std.posix.AT.FDCWD, path_z, .{ .ACCMODE = .RDWR, .CREAT = true }, 0o600);
+        defer _ = std.c.close(holder);
+        defer _ = std.c.unlinkat(std.posix.AT.FDCWD, path_z, 0);
+        if (std.c.flock(holder, std.c.LOCK.EX | std.c.LOCK.NB) != 0) return error.Unexpected;
+
+        const target = try std.posix.openat(std.posix.AT.FDCWD, path_z, .{ .ACCMODE = .RDWR }, 0o600);
+        defer _ = std.c.close(target);
+
+        // Contended: the bounded wait must time out (helper thread + futex
+        // deadline), not block forever. The timed-out helper is detached and
+        // may still acquire on the target's OFD after the holder releases.
+        try std.testing.expectError(error.SuiteLockTimeout, suite_lock.flockBounded(target, path, 300 * std.time.ns_per_ms));
+
+        // Release the holder; the same fd now acquires. flock does not
+        // self-contend within one OFD, so this succeeds whether or not the
+        // detached helper got there first.
+        if (std.c.flock(holder, std.c.LOCK.UN) != 0) return error.Unexpected;
+        try suite_lock.flockBounded(target, path, 300 * std.time.ns_per_ms);
+        if (std.c.flock(target, std.c.LOCK.UN) != 0) return error.Unexpected;
+    }
+};
+
+test "suite lock: bounded wait times out, then acquires (#118)" {
+    try suite_lock_wait_test.run();
+}
+
 fn provisionUp(allocator: std.mem.Allocator) !void {
+    try suite_lock.acquire();
+    errdefer suite_lock.release();
     try checkServerVersion(allocator);
     const io = blockingIo();
     for (required_free_ports) |port| {
@@ -483,6 +745,7 @@ fn provisionUp(allocator: std.mem.Allocator) !void {
 }
 
 fn provisionDown() !void {
+    defer suite_lock.release();
     stopAll();
     // deleteTree is a silent no-op when the path does not exist.
     try std.Io.Dir.cwd().deleteTree(blockingIo(), store_root);

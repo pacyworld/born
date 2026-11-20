@@ -107,10 +107,21 @@ tarball, verified against a pinned SHA-256 and cached under
 | Job | Runner role (`runs-on`) | What it does |
 |---|---|---|
 | `fmt` | FreeBSD (`FreeBSD`) | The single Zig 0.15.2 `zig fmt --check .` gate plus README/AGENTS version-and-target presence (three versions, seven target names); `build.zig` carries the real target-table row guard. No fmt matrix |
-| `build` | FreeBSD (`FreeBSD`) | Matrix `zig: [0.15.2, 0.16.0, 0.17.1]`, `max-parallel: 1`; native Debug and ReleaseSafe tests (kqueue); `check-targets`; API docs; native `example-smoke`; cross-builds both `born-tests` executables in Debug and ReleaseSafe and uploads each with its sha256; cross-builds and uploads `born-example-smoke` on every toolchain; on Zig >= 0.16 also cross-builds and uploads both `born-io-tests` executables |
+| `build` | FreeBSD (`FreeBSD`) | Matrix `zig: [0.15.2, 0.16.0, 0.17.1]`, legs concurrent (Forgejo ignores `strategy.max-parallel`); native Debug and ReleaseSafe tests (kqueue); `check-targets`; API docs; native `example-smoke`; cross-builds both `born-tests` executables in Debug and ReleaseSafe and uploads each with its sha256; cross-builds and uploads `born-example-smoke` on every toolchain; on Zig >= 0.16 also cross-builds and uploads both `born-io-tests` executables |
 | `linux-runtime` | Linux (`ubuntu-24.04`) | Matrix `zig × optimize`; runs the Linux executable in a `node:24-bookworm` container on the runner's kernel (epoll); runs `born-example-smoke`; on Zig >= 0.16 also runs `born-io-tests` |
 | `windows-runtime` | Windows (`windows-2022`) | Matrix `zig × optimize`; runs `born-tests.exe` on the host (IOCP); runs `born-example-smoke.exe`; on Zig >= 0.16 also runs `born-io-tests.exe` |
 
+- Forgejo (16.0.5) does not enforce `strategy.max-parallel`: matrix legs and
+  overlapping runs execute concurrently on one runner host. The `build` legs
+  share no mutable state: each leg has its own checkout workdir (private
+  `.zig-cache` and `zig-out` prefixes), the toolchain cache is keyed by
+  version (three distinct dirs), and the core/example suites bind only
+  port 0, never a fixed loopback port. Cold toolchain provision is atomic
+  (private tmp dir + rename) so concurrent provisions cannot corrupt a
+  shared cache dir; the version guard rejects a wrong tree. A cache dir
+  left incomplete by pre-atomic provision code (present but without its
+  binary) is not auto-cleared: the version guard fails loudly on it, and
+  the dir must be removed once by hand.
 - The runtime jobs need no Zig. Each checks the executable's sha256
   against the build, prints the host kernel or OS version and the commit,
   and ends with a `runtime evidence (...)` line holding the test summary.
@@ -131,6 +142,31 @@ tarball, verified against a pinned SHA-256 and cached under
 
 To cite CI evidence, link the job: `https://pacyworld.dev/pacyworld/born/actions/runs/<run number>`
 (the number shown in the web UI, not the API id), with its summary line.
+
+### Consumers CI (`.forgejo/workflows/consumers.yml`)
+
+Push and pull-request events run the `consumer-build` legs only: native plus
+Linux/Windows cross-builds of the consumer test executables, uploaded with
+their sha256. The suite jobs (`consumer-suite-freebsd`, `-linux`, `-windows`)
+run on schedule and `workflow_dispatch` only. Legs run concurrently here too.
+
+The nats e2e topology binds fixed loopback ports (14222-14229), a host-global
+resource. The fixture facade holds a host-global suite lock from `up -d` to
+`down` (flock on `/tmp/born-nats-e2e.lock` on POSIX, a `Global\` named mutex
+on Windows), serializing whole suites on the shared FreeBSD and Windows
+hosts. The wait is bounded at 15 minutes (half the 30-minute job timeout) and
+fails with a named error (`SuiteLockTimeout`, `SuiteLockFailed`,
+`SuiteLockCreateFailed`/`SuiteLockWaitFailed` on Windows) instead of hanging
+until the job timeout; acquisition logs a line. POSIX uses no signals: a
+helper thread blocks in flock(2) and the caller waits on a futex word
+against a monotonic deadline; on timeout or a wait error the helper is
+detached and the kernel releases any lock it later acquires when the failed
+leg exits. The kernel releases the lock when the holder exits, so a crashed
+or cancelled leg cannot wedge the host.
+Linux suite legs run in per-job containers with private network namespaces
+and a private `/tmp`, so the lock never contends there. Toolchain and
+nats-server caches provision atomically (private tmp dir + rename), as in
+ci.yml.
 
 ### Symbolizing a Windows crash
 

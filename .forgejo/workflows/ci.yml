@@ -107,8 +107,15 @@ jobs:
   # ReleaseSafe) for the runtime jobs below. On Zig >= 0.16 the test and
   # compile gates also cover the born.io shim, and the born.io test
   # executables are cross-built for the Linux and Windows runtime jobs too.
-  # max-parallel keeps the legs sequential on the shared host so they do not
-  # contend for CPU or loopback.
+  # Forgejo does not enforce strategy.max-parallel (it is not part of the
+  # workflow syntax), so the legs run concurrently on the shared host; the
+  # key is kept for forward compatibility. They share no mutable state: each
+  # leg has its own checkout workdir (its own .zig-cache and zig-out
+  # prefixes), and the toolchain cache is keyed by version, so the three legs
+  # use three distinct cache dirs. The core and example suites bind only
+  # port 0 (kernel-assigned), never a fixed loopback port. Cold provision of
+  # a version is atomic (private tmp dir + rename) so overlapping runs cannot
+  # corrupt a shared cache dir.
   build:
     name: FreeBSD tests + cross-builds (zig ${{ matrix.zig }})
     runs-on: FreeBSD
@@ -133,17 +140,28 @@ jobs:
           esac
           cache="$HOME/.cache/born-zig/$ver"
           if [ ! -x "$cache/zig" ]; then
-            mkdir -p "$cache"
+            # Atomic publish: download and extract into a private tmp dir,
+            # then rename into place. Legs and overlapping runs provision
+            # concurrently, so no tree is ever extracted into a dir another
+            # job may already be using. A rename loser discards its tree;
+            # the version guard below proves whichever tree won.
+            tmp="$cache.tmp.$$"
+            trap 'rm -rf "$tmp"' EXIT
+            mkdir -p "$tmp" "$(dirname "$cache")"
             url="https://ziglang.org/download/$ver/zig-x86_64-freebsd-$ver.tar.xz"
             echo "Downloading $url"
             if command -v curl >/dev/null 2>&1; then
-              curl -fsSL --retry 3 "$url" -o "$cache/zig.tar.xz"
+              curl -fsSL --retry 3 "$url" -o "$tmp/zig.tar.xz"
             else
-              fetch -o "$cache/zig.tar.xz" "$url"
+              fetch -o "$tmp/zig.tar.xz" "$url"
             fi
-            echo "$sha  $cache/zig.tar.xz" | sha256sum -c -
-            tar -xf "$cache/zig.tar.xz" -C "$cache" --strip-components=1
-            rm -f "$cache/zig.tar.xz"
+            echo "$sha  $tmp/zig.tar.xz" | sha256sum -c -
+            tar -xf "$tmp/zig.tar.xz" -C "$tmp" --strip-components=1
+            rm -f "$tmp/zig.tar.xz"
+            mv "$tmp" "$cache"
+            # If another job published first, mv nested our tree inside
+            # theirs; discard it.
+            rm -rf "$cache/$(basename "$tmp")"
           fi
           test "$("$cache/zig" version)" = "$ver"
           echo "ZIG=$cache/zig" >> "$GITHUB_ENV"
