@@ -19,12 +19,11 @@
 // non-absolute NATS_SERVER fails loudly. The child environment is likewise
 // built explicitly from the runner's environ_map (born#124): the empty io
 // environ would otherwise leave the Windows nats-server without SystemRoot,
-// failing every socket call with WSAEPROVIDERFAILEDINIT (10106). Server logs
-// and per-node JetStream
-// store directories live under .zig-cache/nats-test-store relative to the
-// CWD, which must contain tests/configs (the same runtime contract as
-// upstream). Store directories survive restart/stop/start; down removes them
-// (review 192 carry-in 5).
+// failing every socket call with WSAEPROVIDERFAILEDINIT (10106).
+// Server logs and per-node JetStream store directories live under
+// .zig-cache/nats-test-store relative to the CWD, which must contain
+// tests/configs (the same runtime contract as upstream). Store directories
+// survive restart/stop/start; down removes them (review 192 carry-in 5).
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -54,14 +53,17 @@ fn blockingIo() std.Io {
 // empty environ, so without an explicit environ_map the child inherits an
 // empty environment block; on Windows a Go binary without SystemRoot cannot
 // load Winsock providers and every socket call fails WSAEPROVIDERFAILEDINIT
-// (10106). Build the child map once from the runner's published environment,
-// copying only the allowlisted variables the server needs. No fallback to the
-// empty io environ or the global block. Same whole-process lifetime contract
-// as blockingIo: page_allocator, never deinitialized.
+// (10106). The child map is built once from the runner's published
+// environment, copying only the allowlisted variables the server needs. No
+// fallback to the empty io environ or the global block. Same whole-process
+// lifetime contract as blockingIo: page_allocator, never deinitialized.
 var child_environ_instance: ?std.process.Environ.Map = null;
 
-fn childEnviron() !*const std.process.Environ.Map {
-    if (child_environ_instance) |*map| return map;
+// Built once on the runner path (the start of provisionUp), before any spawn
+// or version check, so concurrent (re)spawns only read the finished map and
+// cannot race a first build. Idempotent: a repeat call is a no-op.
+fn buildChildEnviron() !void {
+    if (child_environ_instance != null) return;
     const runner_map = consumer_env.environMap() orelse {
         log.err("runner did not publish its environment (consumer_env.environMap is null); cannot build the nats-server child environment", .{});
         return error.EnvironMapUnset;
@@ -85,7 +87,14 @@ fn childEnviron() !*const std.process.Environ.Map {
         }
     }
     child_environ_instance = map;
-    return &child_environ_instance.?;
+}
+
+// Pure accessor: provisionUp builds the map before any spawn, so this only
+// returns it; there is no lazy init to race under concurrent restart.
+fn childEnviron() !*const std.process.Environ.Map {
+    if (child_environ_instance) |*map| return map;
+    log.err("child environment not built; provisionUp must build it before any spawn", .{});
+    return error.EnvironMapUnset;
 }
 
 pub const Node = enum(u16) {
@@ -760,6 +769,9 @@ test "suite lock: bounded wait times out, then acquires (#118)" {
 }
 
 fn provisionUp(allocator: std.mem.Allocator) !void {
+    // Build the child environment once here on the runner path, before the
+    // version check and any spawn read it (born#124, review 701 nit 1).
+    try buildChildEnviron();
     try suite_lock.acquire();
     errdefer suite_lock.release();
     try checkServerVersion(allocator);
