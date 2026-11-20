@@ -96,6 +96,16 @@ OS per primitive, and lists real runs only.
 | kqueue, FreeBSD 15 (CI FreeBSD runner) | born.io network route, close is route death (#106) | [run 330, FreeBSD job (zig 0.16.0)](https://pacyworld.dev/pacyworld/born/actions/runs/330/jobs/2) and [zig 0.17.1 job](https://pacyworld.dev/pacyworld/born/actions/runs/330/jobs/3): Debug and ReleaseSafe, born-io-tests 128 passed, 6 skipped, 0 failed each; the close-retirement unit and the Unexpected close contract run here | 2026-11-19 | [cdc2b58](https://pacyworld.dev/pacyworld/born/commit/cdc2b58b383eb4d697b18ea0a349c3aa0f1eea04) |
 | epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | born.io network route, close is route death (#106) | [run 330, Linux job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/330/jobs/8): Debug and ReleaseSafe on 0.16.0 and 0.17.1, born-io-tests 125 passed, 9 skipped, 0 failed each; the close-retirement unit and the Unexpected close contract run here | 2026-11-19 | [cdc2b58](https://pacyworld.dev/pacyworld/born/commit/cdc2b58b383eb4d697b18ea0a349c3aa0f1eea04) |
 | IOCP, Windows Server 2022 build 20348 (CI Windows runner) | born.io network route, close retirement and failed exit drain leak guard (#106) | [run 330, Windows job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/330/jobs/14): Debug and ReleaseSafe on 0.16.0 and 0.17.1, born-io-tests.exe 76 passed, 58 skipped, 0 failed each; the leak path is tested at the deinit-decision level only (a synthetic drain failure), not by a real GetQueuedCompletionStatusEx failure | 2026-11-19 | [cdc2b58](https://pacyworld.dev/pacyworld/born/commit/cdc2b58b383eb4d697b18ea0a349c3aa0f1eea04) |
+| kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io network route, nats.zig consumer unit suite | nats-unit Debug and ReleaseSafe on Zig 0.16.0, born and all-Threaded baseline, re-run at the W1 facade fix with NATS_SERVER unset (unit provisions no server): 119 passed, 2 skipped, 0 failed each; born connect=2 with threaded connect=0, baseline counters zero, route proof PASS x4 | 2026-11-19 | [7c1f229](https://pacyworld.dev/pacyworld/born/commit/7c1f2298635785766f5522321cd9b0dff11e1347) |
+| kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io network route, nats.zig consumer e2e suite (native nats-server v2.15.0) | nats-e2e Debug and ReleaseSafe on Zig 0.16.0, born and all-Threaded baseline, against the pinned v2.15.0 binary (sha256 d3496cfe2199ef65489d63f2f26e946fc3a77c4a1d9baf424ebe761d7d84d48f) spawned by absolute NATS_SERVER path from a directory outside default_PATH (W1 facade fix): 177 passed, 0 skipped, 0 failed each; born legs connect=192 with threaded connect=0 (fixture-side threaded r=5 w=4 only in the two fake-server tests, per-test gate), baseline legs all counters zero with identical results, route proof PASS x4 | 2026-11-19 | [7c1f229](https://pacyworld.dev/pacyworld/born/commit/7c1f2298635785766f5522321cd9b0dff11e1347) |
+| kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io network route, std.http.Client contract suite | http-contract Debug and ReleaseSafe on Zig 0.16.0 and 0.17.1, born and all-Threaded control, re-run at the W1 facade fix with NATS_SERVER unset (http provisions no server): 8 passed, 0 skipped, 0 failed each; born legs connect=8 with all threaded counters zero, control legs identical results, route proof PASS x8 | 2026-11-19 | [7c1f229](https://pacyworld.dev/pacyworld/born/commit/7c1f2298635785766f5522321cd9b0dff11e1347) |
+| kqueue, FreeBSD 15 (CI FreeBSD runner) | born.io network route, nats.zig consumer unit suite | [run 364](https://pacyworld.dev/pacyworld/born/actions/runs/364), Zig 0.16.0 born [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/8) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/12) and all-Threaded baseline [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/10) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/14): 119 passed, 2 skipped, 0 failed each; born connect=2 with threaded connect=0, baseline counters zero, route proof PASS | 2026-11-19 | [7f93288](https://pacyworld.dev/pacyworld/born/commit/7f932884b80f8382a9dc29e0729c6c1e5d8a1b40) |
+| kqueue, FreeBSD 15 (CI FreeBSD runner) | born.io network route, nats.zig consumer e2e suite (native nats-server v2.15.0) | [run 364](https://pacyworld.dev/pacyworld/born/actions/runs/364), Zig 0.16.0 born [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/8) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/12) and all-Threaded baseline [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/10) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/14), against the pinned v2.15.0 binary spawned by the absolute NATS_SERVER path (W1 facade fix): 177 passed, 0 skipped, 0 failed each; born connect=192 with threaded connect=0 (fixture-side threaded r=5 w=4 only), baseline counters zero with identical results, route proof PASS | 2026-11-19 | [7f93288](https://pacyworld.dev/pacyworld/born/commit/7f932884b80f8382a9dc29e0729c6c1e5d8a1b40) |
+| kqueue, FreeBSD 15 (CI FreeBSD runner) | born.io network route, std.http.Client contract suite | [run 364](https://pacyworld.dev/pacyworld/born/actions/runs/364), Zig 0.16.0 born [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/8) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/12) and all-Threaded control [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/10) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/14), plus 0.17.1 born [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/9) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/13) and control [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/11) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/15) (0.17.1 runs http only): 8 passed, 0 skipped, 0 failed each; born connect=8 with all threaded counters zero, control identical results, route proof PASS | 2026-11-19 | [7f93288](https://pacyworld.dev/pacyworld/born/commit/7f932884b80f8382a9dc29e0729c6c1e5d8a1b40) |
+| epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | born.io network route, nats.zig consumer unit suite | [run 364](https://pacyworld.dev/pacyworld/born/actions/runs/364), Zig 0.16.0 born [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/16) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/20) and all-Threaded baseline [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/18) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/22): 119 passed, 2 skipped, 0 failed each; born connect=2 with threaded connect=0, baseline counters zero, route proof PASS | 2026-11-19 | [7f93288](https://pacyworld.dev/pacyworld/born/commit/7f932884b80f8382a9dc29e0729c6c1e5d8a1b40) |
+| epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | born.io network route, nats.zig consumer e2e suite (native nats-server v2.15.0) | [run 364](https://pacyworld.dev/pacyworld/born/actions/runs/364), Zig 0.16.0 born [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/16) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/20) and all-Threaded baseline [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/18) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/22), against the pinned v2.15.0 binary (linux-amd64 tarball sha256 verified) spawned by the absolute NATS_SERVER path (W1 facade fix): 177 passed, 0 skipped, 0 failed each; born connect=192 with threaded connect=0 (fixture-side threaded r=5 w=4 only), baseline counters zero with identical results, route proof PASS | 2026-11-19 | [7f93288](https://pacyworld.dev/pacyworld/born/commit/7f932884b80f8382a9dc29e0729c6c1e5d8a1b40) |
+| epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | born.io network route, std.http.Client contract suite | [run 364](https://pacyworld.dev/pacyworld/born/actions/runs/364), Zig 0.16.0 born [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/16) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/20) and all-Threaded control [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/18) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/22), plus 0.17.1 born [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/17) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/21) and control [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/19) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/23) (0.17.1 runs http only): 8 passed, 0 skipped, 0 failed each; born connect=8 with all threaded counters zero, control identical results, route proof PASS | 2026-11-19 | [7f93288](https://pacyworld.dev/pacyworld/born/commit/7f932884b80f8382a9dc29e0729c6c1e5d8a1b40) |
+| IOCP, Windows Server 2022 build 20348 (CI Windows runner) | born.io network route, std.http.Client contract suite (0.17.1 only) | [run 364](https://pacyworld.dev/pacyworld/born/actions/runs/364), Zig 0.17.1 born [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/25) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/29) and all-Threaded control [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/27) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/31): 8 passed, 0 skipped, 0 failed each; born connect=8 with all threaded counters zero, control identical results, route proof PASS. The Windows 0.16.0 nats rows are pending the runner trust-store fix | 2026-11-19 | [7f93288](https://pacyworld.dev/pacyworld/born/commit/7f932884b80f8382a9dc29e0729c6c1e5d8a1b40) |
 
 Commit 3ed3785 changes only the CI workflow; its library and tests are
 those of master d1017b8. Skips identify platform exclusions or primitives
@@ -105,6 +115,23 @@ kqueue-only loop-death test. The default-config (stats off) runs use
 born-io-tests-default, the exported module built without -Dtime-stats. The
 commit adding these rows changes only this README; its library, tests and
 CI are those of 1a008de.
+
+The consumer rows at 7c1f229 re-run the suites after the W1 facade fix: the
+e2e fixture now spawns the pinned nats-server v2.15.0 by the absolute
+NATS_SERVER path the runner publishes, from a directory outside the fixture
+Threaded io's default_PATH (an unset or non-absolute NATS_SERVER fails
+loudly). The earlier 1d3b401 e2e rows used the packaged
+/usr/local/bin/nats-server, which sits on that default_PATH. The unit and
+http suites provision no server and run with NATS_SERVER unset.
+
+The consumer CI rows record consumers dispatch run 364 at 7f93288: the
+FreeBSD and Linux 0.16.0 nats-unit, nats-e2e and http suites (born and
+all-Threaded, Debug and ReleaseSafe) and the 0.17.1 http suite, plus the
+Windows 0.17.1 http suite. The Windows 0.16.0 nats rows are pending the
+runner trust-store fix: the nats-server download fails on the missing
+ISRG Root X1 root certificate before any test runs, so those legs carry
+no runtime evidence yet. The commit adding these rows changes only this
+README; its library, tests and CI are those of 7f93288.
 
 The examples smoke rows record the example integration suite
 (examples/smoke.zig) through the shared echo engine; Windows skips the
@@ -696,6 +723,68 @@ The all-Threaded baseline (every slot delegated, no loop thread) remains
 available and is the default. The shim is isolated: the core never imports
 it, and the build enforces that boundary on every toolchain. Removal is
 `git rm -r src/io` plus the conditional export lines in `build.zig`.
+
+### Proof consumers
+
+The `consumers/` package proves the born.io network client route against
+real upstream consumers: the nats.zig client (unit and e2e suites) and
+std.http.Client (a born-owned contract suite). It is a separate package
+with its own build graph; born's root build and shipped module set are
+unchanged, and nothing in `consumers/` ships downstream. A generated std
+facade redirects `std.testing.io` to a fresh born-backed Io per test, so
+the vendored consumer tests run on the shim without source changes.
+
+- nats unit + e2e (Zig 0.16.0): the upstream tests tree is vendored
+  byte-identical at pin b8ffdd9 and hash-verified against
+  `consumers/nats/manifest.sha256` at configure time; the generated tree
+  is written from those verified bytes. The only permitted difference is
+  tests/utils.zig, a born-owned facade that provisions
+  native nats-server v2.15.0 child processes (sha256-pinned per OS in CI)
+  in place of docker-compose, on the vendored fixed loopback ports.
+- std.http.Client contracts (Zig 0.16.0 and 0.17.1): eight born-owned
+  tests over plain HTTP against a plain-Threaded fixture server. This
+  suite carries the 0.17.1 consumer proof.
+- Gap note: upstream nats.zig tip does not build on 0.17.1, so the nats
+  legs are 0.16.0-only; #109 tracks the port. On 0.17.1 the consumer
+  proof is the HTTP suite plus the born.io shim suite.
+
+Every suite runs on born.io (`capabilities.network = .born_evented`) and,
+as a permanent control leg, on the all-Threaded baseline
+(`-Dborn-network=false`) with identical results required. The shared test
+runner asserts route proof from the shim's network counters, per test on
+a fresh reactor: no consumer connect may be delegated to Threaded
+(`threaded_connect == 0` on every born leg) and born connect > 0; e2e and
+HTTP also require born read and write > 0. The nats-e2e leg additionally
+shows fixture-side threaded read/write: the vendored keepalive
+stale-connection and reconnect_limits handshake-failure tests run fake
+servers whose listen/accept handles are Threaded-owned under the shim's
+client-only profile, so their reads/writes forward by design. Only those
+two tests may move threaded read/write; any other test doing so fails
+the leg. That is fixture traffic, not consumer traffic.
+`TEST_ROUTE_TRACE=1` prints the per-test threaded deltas for attribution
+audits.
+
+CI (`.forgejo/workflows/consumers.yml`) builds every leg on each push and
+pull request (FreeBSD native plus Linux and Windows cross-builds, with
+sha256) and runs the suites on all three kernels weekly and on
+workflow_dispatch (the release gate). The HTTP consumer benchmark
+(`zig build bench-http`, driver `consumers/bench/http.sh`) is a
+per-release recording step under the same quiet-host guard as
+`bench/time.sh`, not a gate.
+
+Run locally from `consumers/` with Zig >= 0.16 (the e2e suite needs
+nats-server v2.15.0 on PATH):
+
+```
+zig build test-unit
+zig build test-e2e
+zig build test-http
+zig build test-unit -Dborn-network=false
+```
+
+A project-local `zig-pkg/` directory overrides dependency fetching, so
+clean-fetch evidence must run from a clean checkout without it and with
+an empty global cache.
 
 ## Use
 

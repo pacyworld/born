@@ -1,0 +1,624 @@
+name: Consumers
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '0 8 * * 0'
+  # Release gate: devin dispatches this workflow at the cut commit; the
+  # suite jobs are the tri-kernel consumer evidence for the tag. Stress and
+  # bench stay schedule/dispatch only and never gate a push; this dispatch
+  # is the one that does.
+  workflow_dispatch:
+
+env:
+  # Pacy World Root CA, the root of the pacyworld.dev chain. The artifact
+  # actions run under Node, which neither reads the Windows runner's store
+  # nor finds this root in the Linux container, so the runtime jobs hand
+  # it to Node through NODE_EXTRA_CA_CERTS after checking its fingerprint.
+  PACYWORLD_ROOT_CA_SHA256: F6:56:80:C5:A0:CC:7C:AC:7E:73:CA:3C:FA:45:3E:7E:81:D9:59:40:0C:92:3B:AA:EA:F9:9D:CF:F4:0D:28:A8
+  PACYWORLD_ROOT_CA: |
+    -----BEGIN CERTIFICATE-----
+    MIIGDDCCA/SgAwIBAgIJAPjlE9EKnbAtMA0GCSqGSIb3DQEBCwUAMIGSMQswCQYD
+    VQQGEwJVUzEQMA4GA1UECAwHRmxvcmlkYTEPMA0GA1UEBwwGTmFwbGVzMSkwJwYD
+    VQQKDCBUaGUgRGFuaWVsIE1vcmFudGUgQ29tcGFueSwgSW5jLjEYMBYGA1UECwwP
+    UGFjeSBXb3JsZCwgTExDMRswGQYDVQQDDBJQYWN5IFdvcmxkIFJvb3QgQ0EwHhcN
+    MTgwNzA3MTczNDAxWhcNMzgwNzAyMTczNDAxWjCBkjELMAkGA1UEBhMCVVMxEDAO
+    BgNVBAgMB0Zsb3JpZGExDzANBgNVBAcMBk5hcGxlczEpMCcGA1UECgwgVGhlIERh
+    bmllbCBNb3JhbnRlIENvbXBhbnksIEluYy4xGDAWBgNVBAsMD1BhY3kgV29ybGQs
+    IExMQzEbMBkGA1UEAwwSUGFjeSBXb3JsZCBSb290IENBMIICIjANBgkqhkiG9w0B
+    AQEFAAOCAg8AMIICCgKCAgEAxcG5VqHdWQ00Av5k8qQRtYit6ihHNCRBrOQqvrNV
+    V2pTaDgTc3HjgDhb3KtZpV/63EwTGkg2M+amm4XkCcwI2STiTLzKZ+wmuYf9/udQ
+    tjw5Br0p3T2c9HvZauNqzZ9L3e0HiI5+F4GI7rAjuRNU5oxD8MrfGXap6JgV8V8o
+    1bNkRI9xCYg2ZGCvJLWGBJK0fKxbl6N7A2Vh4FM4VzjMBxElUBYn4iazsyqsmfY0
+    eN1Ln6Yg64n34xYSPuJyEzhSbxLS0wMQO5N3d7UrYcK7REE/PR3lM8naqb/MWN6l
+    AeEB2cH138x1tPQywAk4BGWNaPndrCRnCFXkoianMgj2PztDKa5gk6l9WqSmwo8M
+    FlNhKknYWoaQ75Wz16goG3w1bkWDB/Wc5G+5GC2LD/WZNHAR6rA0tOK785pE/Lmb
+    aWhyqhndMTfRlaAlzEblzAoZX+sSB5ocs0AXf3e1EwV22E3UH+cghORp7z1CfbQI
+    vGF7fNG8c8tTzrgV9ifEphmZtDRrmtcbYYXJubdEKZmxahDN7QjVEnkXrdsuc8b7
+    Egz+KetGjj6n0tIRWCCxrIz9kOf652TBlJc/AWCnzDLgqv+CSw+Wrmm92dGfSgI4
+    W3todx0BW1XdMldbmB3Afo5o5gfc77QIcwSVSYJByiZDvkj9OPC48Hf1/1uGoe+r
+    4FsCAwEAAaNjMGEwHQYDVR0OBBYEFHoERjvfovVsJyua3AVoSD3edl25MB8GA1Ud
+    IwQYMBaAFHoERjvfovVsJyua3AVoSD3edl25MA8GA1UdEwEB/wQFMAMBAf8wDgYD
+    VR0PAQH/BAQDAgGGMA0GCSqGSIb3DQEBCwUAA4ICAQAe3IsTEblRYEGY/MICG8cg
+    l2SfqxYx0t9qvhCz/gLqvA8fiCijneAG3gR2trrHwTAQC5+arWUYs9yy8HilWTul
+    6HempVgguoz/XPqHsAonBW8vaImnSSVOsXIQkqkEX7g+HAAe4RMz71ykIXiWC345
+    LCjBVA3XGFNSIuQKchtzpchJGyVqqQxfbmeQt8rGvHkDkpCH3I8cO/J2xZW4n3bC
+    HUDj0oXuyW7zlKv4ytHK/TN+HYgMwXCd1LITK87OCmf4izLLdNxBwsQnWeaTNWS9
+    7wUGa0E9mWvuKONxx/JMVpUD+ewJQOD/JIYZumzNGBH3k0vl9pNtRAqeE03HmRCy
+    fgxWv8uJ/wz8mo3W8BRFnAd1AyJy6GPyLtMKa1yr11ITY0dJ/BTADmdO/6VKmlk5
+    sla/THr8mR4QYCUWE+zfU8nRGKLmJADg3lQJg0oC8HDTDyxZnAlM+0cFLanc5gDx
+    Q2/u+Z3fKyKGBaOzdruG5hKEWZ1E6bmNH2ttl/nkhiDl1tNFF4FWpC30N6PG1u1/
+    iJC/kgtEf2bSkfbm8xyrznWAygcinPSiH36C46M7y4GKp2+Aq6r95Q8b2YO69Opr
+    I/pDB/oQiCQ78Dp7e4yxY+GLR71QWf/wA5Tw1FbzqPvGnZ+tK//ZKGDeqmuDBCRF
+    3NDrfSHlK+Nk91FpLogS9g==
+    -----END CERTIFICATE-----
+  # Official ziglang.org x86_64-freebsd tarball SHA-256 pins. The consumers
+  # package requires Zig >= 0.16 (born.io); 0.15.2 is absent by design.
+  ZIG_0160_SHA256: 390379bfaf6b89b001c6bb4035b8fcbc5c12193fd9fd5048c3a0fe39e5d1cf72
+  ZIG_0171_SHA256: fd8b9728f05db2a9942fc1f18087c0e0d6dfccb7a51557b06cf026d3e4c78542
+  # nats-server v2.15.0 release tarball SHA-256 pins (github.com/nats-io/
+  # nats-server releases). The e2e facade version-checks the binary against
+  # "nats-server: v2.15.0" at runtime; these pins verify the download first.
+  NATS_SERVER_FREEBSD_SHA256: 5437a533b7a66d94dffc9fcb89bc3acbff7b7f36cbbae169445e28a1c415228b
+  NATS_SERVER_LINUX_SHA256: 5d2c51caca950333aba84911df7d377f826f3a59ec36061c6539105084f65c92
+  NATS_SERVER_WINDOWS_SHA256: 2d0861dc2ca3567d17f7d19611d7b346cc2ccbd7086a0a77cc957a2c71663200
+
+jobs:
+  # FreeBSD runner: one leg per toolchain, optimize mode and route. Each leg
+  # builds the consumer test executables natively and cross-builds Linux and
+  # Windows, uploading each suite's three executables with their sha256.
+  # nats (unit + e2e) exists on 0.16.0 only: upstream nats tip cannot build
+  # on 0.17.1 (born#109 tracks the port); the HTTP contract suite carries the
+  # 0.17.1 consumer proof on both toolchains. The threaded route builds the
+  # all-Threaded baseline/control executables (review 192 Q2/Q3: permanent
+  # legs, identical results required). max-parallel keeps the legs sequential
+  # on the shared host.
+  consumer-build:
+    name: Consumer builds (zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }})
+    runs-on: FreeBSD
+    timeout-minutes: 45
+    strategy:
+      max-parallel: 1
+      matrix:
+        zig: [0.16.0, 0.17.1]
+        optimize: [Debug, ReleaseSafe]
+        route: [born, threaded]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Provision Zig ${{ matrix.zig }} (pinned sha256, cached)
+        run: |
+          set -eu
+          ver="${{ matrix.zig }}"
+          case "$ver" in
+            0.16.0) sha="$ZIG_0160_SHA256" ;;
+            0.17.1) sha="$ZIG_0171_SHA256" ;;
+            *) echo "unknown toolchain $ver"; exit 1 ;;
+          esac
+          cache="$HOME/.cache/born-zig/$ver"
+          if [ ! -x "$cache/zig" ]; then
+            mkdir -p "$cache"
+            url="https://ziglang.org/download/$ver/zig-x86_64-freebsd-$ver.tar.xz"
+            echo "Downloading $url"
+            if command -v curl >/dev/null 2>&1; then
+              curl -fsSL --retry 3 "$url" -o "$cache/zig.tar.xz"
+            else
+              fetch -o "$cache/zig.tar.xz" "$url"
+            fi
+            echo "$sha  $cache/zig.tar.xz" | sha256sum -c -
+            tar -xf "$cache/zig.tar.xz" -C "$cache" --strip-components=1
+            rm -f "$cache/zig.tar.xz"
+          fi
+          test "$("$cache/zig" version)" = "$ver"
+          echo "ZIG=$cache/zig" >> "$GITHUB_ENV"
+          echo "host: $(uname -srm), commit $GITHUB_SHA, zig $ver"
+          "$cache/zig" version
+
+      - name: Build consumer test executables (native + Linux + Windows)
+        run: |
+          set -eu
+          cd consumers
+          flag=""
+          if [ "${{ matrix.route }}" = threaded ]; then flag="-Dborn-network=false"; fi
+          steps="test-http-bin"
+          if [ "${{ matrix.zig }}" = "0.16.0" ]; then steps="test-bin test-e2e-bin test-http-bin"; fi
+          for t in freebsd linux windows; do
+            target_flag=""
+            case "$t" in
+              linux) target_flag="-Dtarget=x86_64-linux-gnu" ;;
+              windows) target_flag="-Dtarget=x86_64-windows-gnu" ;;
+            esac
+            "$ZIG" build $steps -Doptimize="${{ matrix.optimize }}" $flag $target_flag --prefix "zig-out/$t-${{ matrix.optimize }}" --summary all
+            ( cd "zig-out/$t-${{ matrix.optimize }}/bin"
+              if [ "${{ matrix.zig }}" = "0.16.0" ]; then
+                for exe in nats-unit nats-e2e; do
+                  if [ "$t" = windows ]; then
+                    sha256sum "$exe.exe" | tee "$exe.exe.sha256"
+                  else
+                    sha256sum "$exe" | tee "$exe.sha256"
+                  fi
+                done
+              fi
+              if [ "$t" = windows ]; then
+                sha256sum http-contract.exe | tee http-contract.exe.sha256
+              else
+                sha256sum http-contract | tee http-contract.sha256
+              fi )
+          done
+
+      - name: Upload nats unit executables
+        if: matrix.zig == '0.16.0'
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: consumer-nats-unit-${{ matrix.zig }}-${{ matrix.optimize }}-${{ matrix.route }}
+          path: |
+            consumers/zig-out/freebsd-${{ matrix.optimize }}/bin/nats-unit
+            consumers/zig-out/freebsd-${{ matrix.optimize }}/bin/nats-unit.sha256
+            consumers/zig-out/linux-${{ matrix.optimize }}/bin/nats-unit
+            consumers/zig-out/linux-${{ matrix.optimize }}/bin/nats-unit.sha256
+            consumers/zig-out/windows-${{ matrix.optimize }}/bin/nats-unit.exe
+            consumers/zig-out/windows-${{ matrix.optimize }}/bin/nats-unit.exe.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload nats e2e executables
+        if: matrix.zig == '0.16.0'
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: consumer-nats-e2e-${{ matrix.zig }}-${{ matrix.optimize }}-${{ matrix.route }}
+          path: |
+            consumers/zig-out/freebsd-${{ matrix.optimize }}/bin/nats-e2e
+            consumers/zig-out/freebsd-${{ matrix.optimize }}/bin/nats-e2e.sha256
+            consumers/zig-out/linux-${{ matrix.optimize }}/bin/nats-e2e
+            consumers/zig-out/linux-${{ matrix.optimize }}/bin/nats-e2e.sha256
+            consumers/zig-out/windows-${{ matrix.optimize }}/bin/nats-e2e.exe
+            consumers/zig-out/windows-${{ matrix.optimize }}/bin/nats-e2e.exe.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload HTTP contract executables
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: consumer-http-${{ matrix.zig }}-${{ matrix.optimize }}-${{ matrix.route }}
+          path: |
+            consumers/zig-out/freebsd-${{ matrix.optimize }}/bin/http-contract
+            consumers/zig-out/freebsd-${{ matrix.optimize }}/bin/http-contract.sha256
+            consumers/zig-out/linux-${{ matrix.optimize }}/bin/http-contract
+            consumers/zig-out/linux-${{ matrix.optimize }}/bin/http-contract.sha256
+            consumers/zig-out/windows-${{ matrix.optimize }}/bin/http-contract.exe
+            consumers/zig-out/windows-${{ matrix.optimize }}/bin/http-contract.exe.sha256
+          if-no-files-found: error
+          retention-days: 14
+
+      # The e2e executable reads tests/configs relative to its CWD at
+      # runtime (auth creds, nkey/jwt server configs); the configs are
+      # hash-verified vendored bytes, toolchain-independent.
+      - name: Upload nats e2e configs
+        if: matrix.zig == '0.16.0' && matrix.optimize == 'Debug' && matrix.route == 'born'
+        uses: https://code.forgejo.org/forgejo/upload-artifact@v4
+        with:
+          name: consumer-nats-configs
+          path: consumers/nats/tests/configs
+          if-no-files-found: error
+          retention-days: 14
+
+  # Suite jobs run on schedule (weekly) and workflow_dispatch (the release
+  # gate), never on push/PR: the build job above is the per-push gate. Each
+  # suite job runs the cross-built (or natively built) executables on its
+  # actual kernel; no Zig is needed. The e2e legs provision the pinned
+  # nats-server v2.15.0 first; unit and http legs need no server. The
+  # provision steps export the absolute binary path as NATS_SERVER through
+  # GITHUB_ENV; the runner hands it to the e2e fixture facade, which spawns
+  # that exact path (born#110 W1: the facade's Threaded io has an empty
+  # environ, so a bare name would resolve only against default_PATH, never
+  # the step's PATH). No PATH plumbing is needed.
+
+  # FreeBSD runner: native kqueue. max-parallel keeps the legs sequential:
+  # the e2e topology binds fixed loopback ports (14222-14229).
+  consumer-suite-freebsd:
+    name: FreeBSD consumer suites (zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: FreeBSD
+    needs: consumer-build
+    timeout-minutes: 30
+    strategy:
+      max-parallel: 1
+      matrix:
+        zig: [0.16.0, 0.17.1]
+        optimize: [Debug, ReleaseSafe]
+        route: [born, threaded]
+    steps:
+      - name: Download nats unit executable
+        if: matrix.zig == '0.16.0'
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: consumer-nats-unit-${{ matrix.zig }}-${{ matrix.optimize }}-${{ matrix.route }}
+          path: consumer-nats-unit
+
+      - name: Download nats e2e executable
+        if: matrix.zig == '0.16.0'
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: consumer-nats-e2e-${{ matrix.zig }}-${{ matrix.optimize }}-${{ matrix.route }}
+          path: consumer-nats-e2e
+
+      - name: Download nats e2e configs
+        if: matrix.zig == '0.16.0'
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: consumer-nats-configs
+          path: nats-configs
+
+      - name: Download HTTP contract executable
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: consumer-http-${{ matrix.zig }}-${{ matrix.optimize }}-${{ matrix.route }}
+          path: consumer-http
+
+      - name: Provision nats-server v2.15.0 (pinned sha256, cached)
+        if: matrix.zig == '0.16.0'
+        run: |
+          set -eu
+          cache="$HOME/.cache/born-nats-server/v2.15.0"
+          if [ ! -x "$cache/nats-server" ]; then
+            mkdir -p "$cache"
+            url="https://github.com/nats-io/nats-server/releases/download/v2.15.0/nats-server-v2.15.0-freebsd-amd64.tar.gz"
+            echo "Downloading $url"
+            curl -fsSL --retry 3 "$url" -o "$cache/nats-server.tar.gz"
+            echo "$NATS_SERVER_FREEBSD_SHA256  $cache/nats-server.tar.gz" | sha256sum -c -
+            tar -xzf "$cache/nats-server.tar.gz" -C "$cache" --strip-components=1
+            rm -f "$cache/nats-server.tar.gz"
+          fi
+          test "$("$cache/nats-server" --version)" = "nats-server: v2.15.0"
+          echo "NATS_SERVER=$cache/nats-server" >> "$GITHUB_ENV"
+
+      - name: Run nats unit suite
+        if: matrix.zig == '0.16.0'
+        run: |
+          set -eu
+          cd "consumer-nats-unit/freebsd-${{ matrix.optimize }}/bin"
+          sha256sum -c nats-unit.sha256
+          chmod +x nats-unit
+          echo "host: $(uname -srm), commit $GITHUB_SHA, zig ${{ matrix.zig }} ${{ matrix.optimize }} ${{ matrix.route }}"
+          if ./nats-unit > nats-unit.log 2>&1; then rc=0; else rc=$?; fi
+          cat nats-unit.log
+          if [ "$rc" -ne 0 ]; then echo "nats-unit exited $rc"; exit "$rc"; fi
+          summary=$(grep -E '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$' nats-unit.log) || { echo "nats-unit printed no passing summary line"; exit 1; }
+          grep -q '^route proof: PASS$' nats-unit.log || { echo "nats-unit printed no route proof PASS line"; exit 1; }
+          echo "runtime evidence (x86_64-freebsd, kqueue, nats-unit, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $summary"
+
+      - name: Run nats e2e suite
+        if: matrix.zig == '0.16.0'
+        run: |
+          set -eu
+          ws=$(pwd)
+          cd "consumer-nats-e2e/freebsd-${{ matrix.optimize }}/bin"
+          sha256sum -c nats-e2e.sha256
+          chmod +x nats-e2e
+          mkdir -p tests
+          cp -R "$ws/nats-configs" tests/configs
+          echo "host: $(uname -srm), commit $GITHUB_SHA, zig ${{ matrix.zig }} ${{ matrix.optimize }} ${{ matrix.route }}"
+          if ./nats-e2e > nats-e2e.log 2>&1; then rc=0; else rc=$?; fi
+          cat nats-e2e.log
+          if [ "$rc" -ne 0 ]; then echo "nats-e2e exited $rc"; exit "$rc"; fi
+          summary=$(grep -E '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$' nats-e2e.log) || { echo "nats-e2e printed no passing summary line"; exit 1; }
+          grep -q '^route proof: PASS$' nats-e2e.log || { echo "nats-e2e printed no route proof PASS line"; exit 1; }
+          echo "runtime evidence (x86_64-freebsd, kqueue, nats-e2e, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $summary"
+
+      # Post-mortem for e2e provisioning failures (PortsNotFree stale
+      # servers, ServicesNotHealthy): dump the port owners, any nats-server
+      # processes, and the per-service stderr logs the facade keeps under
+      # .zig-cache/nats-test-store. Diagnostics only; never masks the
+      # original failure.
+      - name: e2e failure diagnostics (port owners, server logs)
+        if: failure() && matrix.zig == '0.16.0'
+        run: |
+          echo "=== listeners on e2e ports ==="
+          sockstat -l | grep -E '\.(1422[2-9]|1622[2-4]|1822[2-9])[[:space:]]' || echo none
+          echo "=== nats-server processes ==="
+          ps aux | grep '[n]ats-server' || echo none
+          store="consumer-nats-e2e/freebsd-${{ matrix.optimize }}/bin/.zig-cache/nats-test-store"
+          echo "=== server logs under $store ==="
+          if [ -d "$store" ]; then
+            for f in "$store"/*.log; do
+              [ -f "$f" ] || continue
+              echo "--- $f ---"
+              tail -40 "$f"
+            done
+          else
+            echo "no store directory"
+          fi
+
+      - name: Run HTTP contract suite
+        run: |
+          set -eu
+          cd "consumer-http/freebsd-${{ matrix.optimize }}/bin"
+          sha256sum -c http-contract.sha256
+          chmod +x http-contract
+          echo "host: $(uname -srm), commit $GITHUB_SHA, zig ${{ matrix.zig }} ${{ matrix.optimize }} ${{ matrix.route }}"
+          if ./http-contract > http-contract.log 2>&1; then rc=0; else rc=$?; fi
+          cat http-contract.log
+          if [ "$rc" -ne 0 ]; then echo "http-contract exited $rc"; exit "$rc"; fi
+          summary=$(grep -E '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$' http-contract.log) || { echo "http-contract printed no passing summary line"; exit 1; }
+          grep -q '^route proof: PASS$' http-contract.log || { echo "http-contract printed no route proof PASS line"; exit 1; }
+          echo "runtime evidence (x86_64-freebsd, kqueue, http, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $summary"
+
+  # Linux runner (Ubuntu 24.04): epoll. The job container shares the runner's
+  # kernel, so the syscalls under test are real Linux ones. No Zig is needed.
+  consumer-suite-linux:
+    name: Linux consumer suites (zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    container: node:24-bookworm
+    needs: consumer-build
+    timeout-minutes: 30
+    strategy:
+      max-parallel: 1
+      matrix:
+        zig: [0.16.0, 0.17.1]
+        optimize: [Debug, ReleaseSafe]
+        route: [born, threaded]
+    steps:
+      - name: Trust the Pacy World Root CA for Node
+        run: |
+          pem="$RUNNER_TEMP/pacyworld-root.pem"
+          printf '%s' "$PACYWORLD_ROOT_CA" > "$pem"
+          node -e 'const c = new (require("crypto").X509Certificate)(require("fs").readFileSync(process.argv[1])); if (c.fingerprint256 !== process.argv[2]) { console.error("root CA fingerprint mismatch: " + c.fingerprint256); process.exit(1); }' "$pem" "$PACYWORLD_ROOT_CA_SHA256"
+          echo "NODE_EXTRA_CA_CERTS=$pem" >> "$GITHUB_ENV"
+
+      - name: Download nats unit executable
+        if: matrix.zig == '0.16.0'
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: consumer-nats-unit-${{ matrix.zig }}-${{ matrix.optimize }}-${{ matrix.route }}
+          path: consumer-nats-unit
+
+      - name: Download nats e2e executable
+        if: matrix.zig == '0.16.0'
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: consumer-nats-e2e-${{ matrix.zig }}-${{ matrix.optimize }}-${{ matrix.route }}
+          path: consumer-nats-e2e
+
+      - name: Download nats e2e configs
+        if: matrix.zig == '0.16.0'
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: consumer-nats-configs
+          path: nats-configs
+
+      - name: Download HTTP contract executable
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: consumer-http-${{ matrix.zig }}-${{ matrix.optimize }}-${{ matrix.route }}
+          path: consumer-http
+
+      - name: Provision nats-server v2.15.0 (pinned sha256, cached)
+        if: matrix.zig == '0.16.0'
+        run: |
+          set -eu
+          cache="$HOME/.cache/born-nats-server/v2.15.0"
+          if [ ! -x "$cache/nats-server" ]; then
+            mkdir -p "$cache"
+            url="https://github.com/nats-io/nats-server/releases/download/v2.15.0/nats-server-v2.15.0-linux-amd64.tar.gz"
+            echo "Downloading $url"
+            curl -fsSL --retry 3 "$url" -o "$cache/nats-server.tar.gz"
+            echo "$NATS_SERVER_LINUX_SHA256  $cache/nats-server.tar.gz" | sha256sum -c -
+            tar -xzf "$cache/nats-server.tar.gz" -C "$cache" --strip-components=1
+            rm -f "$cache/nats-server.tar.gz"
+          fi
+          test "$("$cache/nats-server" --version)" = "nats-server: v2.15.0"
+          echo "NATS_SERVER=$cache/nats-server" >> "$GITHUB_ENV"
+
+      - name: Run nats unit suite
+        if: matrix.zig == '0.16.0'
+        run: |
+          set -eu
+          cd "consumer-nats-unit/linux-${{ matrix.optimize }}/bin"
+          sha256sum -c nats-unit.sha256
+          chmod +x nats-unit
+          echo "host: $(uname -srm), $(. /etc/os-release && echo "$PRETTY_NAME") container, commit $GITHUB_SHA, zig ${{ matrix.zig }} ${{ matrix.optimize }} ${{ matrix.route }}"
+          if ./nats-unit > nats-unit.log 2>&1; then rc=0; else rc=$?; fi
+          cat nats-unit.log
+          if [ "$rc" -ne 0 ]; then echo "nats-unit exited $rc"; exit "$rc"; fi
+          summary=$(grep -E '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$' nats-unit.log) || { echo "nats-unit printed no passing summary line"; exit 1; }
+          grep -q '^route proof: PASS$' nats-unit.log || { echo "nats-unit printed no route proof PASS line"; exit 1; }
+          echo "runtime evidence (x86_64-linux-gnu, epoll, nats-unit, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $summary"
+
+      - name: Run nats e2e suite
+        if: matrix.zig == '0.16.0'
+        run: |
+          set -eu
+          ws=$(pwd)
+          cd "consumer-nats-e2e/linux-${{ matrix.optimize }}/bin"
+          sha256sum -c nats-e2e.sha256
+          chmod +x nats-e2e
+          mkdir -p tests
+          cp -R "$ws/nats-configs" tests/configs
+          echo "host: $(uname -srm), $(. /etc/os-release && echo "$PRETTY_NAME") container, commit $GITHUB_SHA, zig ${{ matrix.zig }} ${{ matrix.optimize }} ${{ matrix.route }}"
+          if ./nats-e2e > nats-e2e.log 2>&1; then rc=0; else rc=$?; fi
+          cat nats-e2e.log
+          if [ "$rc" -ne 0 ]; then echo "nats-e2e exited $rc"; exit "$rc"; fi
+          summary=$(grep -E '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$' nats-e2e.log) || { echo "nats-e2e printed no passing summary line"; exit 1; }
+          grep -q '^route proof: PASS$' nats-e2e.log || { echo "nats-e2e printed no route proof PASS line"; exit 1; }
+          echo "runtime evidence (x86_64-linux-gnu, epoll, nats-e2e, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $summary"
+
+      - name: Run HTTP contract suite
+        run: |
+          set -eu
+          cd "consumer-http/linux-${{ matrix.optimize }}/bin"
+          sha256sum -c http-contract.sha256
+          chmod +x http-contract
+          echo "host: $(uname -srm), $(. /etc/os-release && echo "$PRETTY_NAME") container, commit $GITHUB_SHA, zig ${{ matrix.zig }} ${{ matrix.optimize }} ${{ matrix.route }}"
+          if ./http-contract > http-contract.log 2>&1; then rc=0; else rc=$?; fi
+          cat http-contract.log
+          if [ "$rc" -ne 0 ]; then echo "http-contract exited $rc"; exit "$rc"; fi
+          summary=$(grep -E '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$' http-contract.log) || { echo "http-contract printed no passing summary line"; exit 1; }
+          grep -q '^route proof: PASS$' http-contract.log || { echo "http-contract printed no route proof PASS line"; exit 1; }
+          echo "runtime evidence (x86_64-linux-gnu, epoll, http, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $summary"
+
+  # Windows runner (Windows Server 2022, host mode): IOCP. No Zig is needed.
+  consumer-suite-windows:
+    name: Windows consumer suites (zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: windows-2022
+    needs: consumer-build
+    timeout-minutes: 30
+    strategy:
+      max-parallel: 1
+      matrix:
+        zig: [0.16.0, 0.17.1]
+        optimize: [Debug, ReleaseSafe]
+        route: [born, threaded]
+    steps:
+      - name: Trust the Pacy World Root CA for Node
+        run: |
+          $pem = Join-Path $env:RUNNER_TEMP 'pacyworld-root.pem'
+          Set-Content -Path $pem -Value $env:PACYWORLD_ROOT_CA -Encoding ascii -NoNewline
+          $cert = New-Object System.Security.Cryptography.X509Certificates.X509Certificate2 -ArgumentList $pem
+          $digest = [System.Security.Cryptography.SHA256]::Create().ComputeHash($cert.RawData)
+          $fingerprint = ($digest | ForEach-Object { $_.ToString('X2') }) -join ':'
+          if ($fingerprint -ne $env:PACYWORLD_ROOT_CA_SHA256) { throw "root CA fingerprint mismatch: $fingerprint" }
+          Add-Content -Path $env:GITHUB_ENV -Value "NODE_EXTRA_CA_CERTS=$pem" -Encoding ascii
+
+      - name: Download nats unit executable
+        if: matrix.zig == '0.16.0'
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: consumer-nats-unit-${{ matrix.zig }}-${{ matrix.optimize }}-${{ matrix.route }}
+          path: consumer-nats-unit
+
+      - name: Download nats e2e executable
+        if: matrix.zig == '0.16.0'
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: consumer-nats-e2e-${{ matrix.zig }}-${{ matrix.optimize }}-${{ matrix.route }}
+          path: consumer-nats-e2e
+
+      - name: Download nats e2e configs
+        if: matrix.zig == '0.16.0'
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: consumer-nats-configs
+          path: nats-configs
+
+      - name: Download HTTP contract executable
+        uses: https://code.forgejo.org/forgejo/download-artifact@v4
+        with:
+          name: consumer-http-${{ matrix.zig }}-${{ matrix.optimize }}-${{ matrix.route }}
+          path: consumer-http
+
+      - name: Provision nats-server v2.15.0 (pinned sha256, cached)
+        if: matrix.zig == '0.16.0'
+        run: |
+          $cache = Join-Path $env:USERPROFILE '.cache\born-nats-server\v2.15.0'
+          $bin = Join-Path $cache 'nats-server-v2.15.0-windows-amd64'
+          $exe = Join-Path $bin 'nats-server.exe'
+          if (-not (Test-Path $exe)) {
+            New-Item -ItemType Directory -Force -Path $cache | Out-Null
+            $url = 'https://github.com/nats-io/nats-server/releases/download/v2.15.0/nats-server-v2.15.0-windows-amd64.zip'
+            $zip = Join-Path $cache 'nats-server.zip'
+            Invoke-WebRequest -Uri $url -OutFile $zip
+            $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($hash -ne $env:NATS_SERVER_WINDOWS_SHA256) { throw "nats-server zip sha256 $hash does not match the pin ($env:NATS_SERVER_WINDOWS_SHA256)" }
+            Expand-Archive -Path $zip -DestinationPath $cache -Force
+            Remove-Item $zip
+          }
+          $version = (& $exe --version | Out-String).Trim()
+          if ($version -ne 'nats-server: v2.15.0') { throw "nats-server pin mismatch: $version" }
+          Add-Content -Path $env:GITHUB_ENV -Value "NATS_SERVER=$exe" -Encoding ascii
+
+      - name: Run nats unit suite
+        if: matrix.zig == '0.16.0'
+        run: |
+          cd "consumer-nats-unit\windows-${{ matrix.optimize }}\bin"
+          $expected = (Get-Content nats-unit.exe.sha256 -Raw).Split(' ')[0].Trim().ToUpperInvariant()
+          $actual = (Get-FileHash nats-unit.exe -Algorithm SHA256).Hash
+          if ($actual -ne $expected) { throw "nats-unit.exe sha256 $actual does not match the build ($expected)" }
+          "nats-unit.exe: OK ($actual)"
+          "host: $([System.Environment]::OSVersion.VersionString), commit $env:GITHUB_SHA, zig ${{ matrix.zig }} ${{ matrix.optimize }} ${{ matrix.route }}"
+          # cmd redirection keeps the test runner's stderr out of PowerShell's error stream.
+          cmd /c "nats-unit.exe > nats-unit.log 2>&1"
+          $rc = $LASTEXITCODE
+          Get-Content nats-unit.log
+          if ($rc -ne 0) { throw "nats-unit.exe exited with $rc" }
+          $summary = Select-String -Path nats-unit.log -Pattern '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$'
+          if (-not $summary) { throw "nats-unit.exe printed no passing summary line" }
+          $proof = Select-String -Path nats-unit.log -Pattern '^route proof: PASS$'
+          if (-not $proof) { throw "nats-unit.exe printed no route proof PASS line" }
+          "runtime evidence (x86_64-windows-gnu, IOCP, nats-unit, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $($summary.Line)"
+
+      - name: Run nats e2e suite
+        if: matrix.zig == '0.16.0'
+        run: |
+          cd "consumer-nats-e2e\windows-${{ matrix.optimize }}\bin"
+          $expected = (Get-Content nats-e2e.exe.sha256 -Raw).Split(' ')[0].Trim().ToUpperInvariant()
+          $actual = (Get-FileHash nats-e2e.exe -Algorithm SHA256).Hash
+          if ($actual -ne $expected) { throw "nats-e2e.exe sha256 $actual does not match the build ($expected)" }
+          "nats-e2e.exe: OK ($actual)"
+          New-Item -ItemType Directory -Force -Path tests | Out-Null
+          Copy-Item -Recurse (Join-Path $env:GITHUB_WORKSPACE 'nats-configs') tests\configs
+          "host: $([System.Environment]::OSVersion.VersionString), commit $env:GITHUB_SHA, zig ${{ matrix.zig }} ${{ matrix.optimize }} ${{ matrix.route }}"
+          cmd /c "nats-e2e.exe > nats-e2e.log 2>&1"
+          $rc = $LASTEXITCODE
+          Get-Content nats-e2e.log
+          if ($rc -ne 0) { throw "nats-e2e.exe exited with $rc" }
+          $summary = Select-String -Path nats-e2e.log -Pattern '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$'
+          if (-not $summary) { throw "nats-e2e.exe printed no passing summary line" }
+          $proof = Select-String -Path nats-e2e.log -Pattern '^route proof: PASS$'
+          if (-not $proof) { throw "nats-e2e.exe printed no route proof PASS line" }
+          "runtime evidence (x86_64-windows-gnu, IOCP, nats-e2e, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $($summary.Line)"
+
+      # Post-mortem for e2e provisioning failures (ServicesNotHealthy: the
+      # pinned server spawns but never listens): re-check the binary, list
+      # nats-server processes and e2e-port listeners, dump the per-service
+      # stderr logs the facade keeps under .zig-cache\nats-test-store, and
+      # surface recent Defender detections (quarantine can remove the exe
+      # after the provision-time version check). Diagnostics only; every
+      # probe is guarded so the step never masks the original failure.
+      - name: e2e failure diagnostics (server logs, binary, processes)
+        if: failure() && matrix.zig == '0.16.0'
+        run: |
+          $ErrorActionPreference = 'Continue'
+          "=== nats-server binary (NATS_SERVER=$env:NATS_SERVER) ==="
+          if ($env:NATS_SERVER -and (Test-Path $env:NATS_SERVER)) {
+            (Get-FileHash $env:NATS_SERVER -Algorithm SHA256).Hash
+            & $env:NATS_SERVER --version
+          } else { "NATS_SERVER unset or missing" }
+          "=== nats-server processes ==="
+          Get-Process nats-server -ErrorAction SilentlyContinue | Format-Table Id, StartTime, Path -AutoSize | Out-String
+          "=== listeners on e2e ports ==="
+          Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+            Where-Object { ($_.LocalPort -ge 14222 -and $_.LocalPort -le 14229) -or ($_.LocalPort -ge 16222 -and $_.LocalPort -le 16224) -or ($_.LocalPort -ge 18222 -and $_.LocalPort -le 18229) } |
+            Format-Table LocalAddress, LocalPort, OwningProcess -AutoSize | Out-String
+          $store = "consumer-nats-e2e\windows-${{ matrix.optimize }}\bin\.zig-cache\nats-test-store"
+          "=== server logs under $store ==="
+          if (Test-Path $store) {
+            Get-ChildItem $store -File -ErrorAction SilentlyContinue | ForEach-Object {
+              "--- $($_.Name) ($($_.Length) bytes) ---"
+              if ($_.Extension -eq '.log') { Get-Content $_.FullName -Tail 60 -ErrorAction SilentlyContinue }
+            }
+          } else { "no store directory" }
+          "=== Defender recent detections ==="
+          if (Get-Command Get-MpThreatDetection -ErrorAction SilentlyContinue) {
+            Get-MpThreatDetection -ErrorAction SilentlyContinue | Select-Object -First 5 | Format-List | Out-String
+          } else { "Defender cmdlets unavailable" }
+
+      - name: Run HTTP contract suite
+        run: |
+          cd "consumer-http\windows-${{ matrix.optimize }}\bin"
+          $expected = (Get-Content http-contract.exe.sha256 -Raw).Split(' ')[0].Trim().ToUpperInvariant()
+          $actual = (Get-FileHash http-contract.exe -Algorithm SHA256).Hash
+          if ($actual -ne $expected) { throw "http-contract.exe sha256 $actual does not match the build ($expected)" }
+          "http-contract.exe: OK ($actual)"
+          "host: $([System.Environment]::OSVersion.VersionString), commit $env:GITHUB_SHA, zig ${{ matrix.zig }} ${{ matrix.optimize }} ${{ matrix.route }}"
+          cmd /c "http-contract.exe > http-contract.log 2>&1"
+          $rc = $LASTEXITCODE
+          Get-Content http-contract.log
+          if ($rc -ne 0) { throw "http-contract.exe exited with $rc" }
+          $summary = Select-String -Path http-contract.log -Pattern '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$'
+          if (-not $summary) { throw "http-contract.exe printed no passing summary line" }
+          $proof = Select-String -Path http-contract.log -Pattern '^route proof: PASS$'
+          if (-not $proof) { throw "http-contract.exe printed no route proof PASS line" }
+          "runtime evidence (x86_64-windows-gnu, IOCP, http, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $($summary.Line)"

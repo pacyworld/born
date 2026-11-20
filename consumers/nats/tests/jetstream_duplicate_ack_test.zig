@@ -1,0 +1,358 @@
+const std = @import("std");
+const testing = std.testing;
+const nats = @import("nats");
+const xsync = @import("xsync");
+const utils = @import("utils.zig");
+
+const log = std.log.default;
+
+test "ack should succeed on first call" {
+    const io = std.testing.io;
+
+    const conn = try utils.createDefaultConnection(io);
+    defer utils.closeConnection(conn);
+
+    var js = conn.jetstream(.{});
+
+    // Create stream
+    const stream_config = nats.StreamConfig{
+        .name = "TEST_DUP_ACK_STREAM",
+        .subjects = &.{"test.dup.ack.*"},
+    };
+    var stream_info = try js.addStream(stream_config);
+    defer stream_info.deinit();
+
+    // Test data to track received messages
+    const TestData = struct {
+        received: bool = false,
+        acknowledged: bool = false,
+        mutex: xsync.Mutex = .init,
+    };
+
+    var test_data = TestData{};
+
+    // Handler that performs first ack
+    const AckHandler = struct {
+        fn handle(js_msg: *nats.JetStreamMessage, data: *TestData) !void {
+            defer js_msg.deinit();
+
+            try data.mutex.lock(std.testing.io);
+            defer data.mutex.unlock(std.testing.io);
+
+            data.received = true;
+
+            // First ack should succeed
+            js_msg.ack() catch |err| {
+                log.err("Failed to ACK message: {}", .{err});
+                return;
+            };
+
+            // Verify message is acknowledged
+            data.acknowledged = js_msg.isAcked();
+        }
+    };
+
+    var push_sub = try js.subscribe("test.dup.ack.*", AckHandler.handle, .{&test_data}, .{
+        .stream = "TEST_DUP_ACK_STREAM",
+        .durable = "dup_ack_consumer",
+        .config = .{
+            .deliver_policy = .all,
+        },
+    });
+    defer push_sub.deinit();
+
+    // Publish test message
+    try conn.publish("test.dup.ack.msg", "test ack message");
+
+    // Wait for message processing
+    var attempts: u32 = 0;
+    while (attempts < 30) {
+        try io.sleep(.fromMilliseconds(100), .awake);
+        attempts += 1;
+
+        try test_data.mutex.lock(std.testing.io);
+        const done = test_data.received;
+        test_data.mutex.unlock(std.testing.io);
+
+        if (done) break;
+    }
+
+    // Verify results
+    try test_data.mutex.lock(std.testing.io);
+    defer test_data.mutex.unlock(std.testing.io);
+
+    try testing.expect(test_data.received);
+    try testing.expect(test_data.acknowledged);
+}
+
+test "ack should fail on second call" {
+    const io = std.testing.io;
+
+    const conn = try utils.createDefaultConnection(io);
+    defer utils.closeConnection(conn);
+
+    var js = conn.jetstream(.{});
+
+    // Create stream
+    const stream_config = nats.StreamConfig{
+        .name = "TEST_DUP_ACK2_STREAM",
+        .subjects = &.{"test.dup.ack2.*"},
+    };
+    var stream_info = try js.addStream(stream_config);
+    defer stream_info.deinit();
+
+    // Test data to track results
+    const TestData = struct {
+        received: bool = false,
+        first_ack_success: bool = false,
+        second_ack_failed: bool = false,
+        mutex: xsync.Mutex = .init,
+    };
+
+    var test_data = TestData{};
+
+    // Handler that performs double ack
+    const DoubleAckHandler = struct {
+        fn handle(js_msg: *nats.JetStreamMessage, data: *TestData) !void {
+            defer js_msg.deinit();
+
+            try data.mutex.lock(std.testing.io);
+            defer data.mutex.unlock(std.testing.io);
+
+            data.received = true;
+
+            // First ack should succeed
+            if (js_msg.ack()) {
+                data.first_ack_success = true;
+            } else |_| {
+                return;
+            }
+
+            // Second ack should fail with AlreadyAcked
+            if (js_msg.ack()) {
+                // Should not reach here
+            } else |err| {
+                if (err == nats.AckError.AlreadyAcked) {
+                    data.second_ack_failed = true;
+                }
+            }
+        }
+    };
+
+    var push_sub = try js.subscribe("test.dup.ack2.*", DoubleAckHandler.handle, .{&test_data}, .{
+        .stream = "TEST_DUP_ACK2_STREAM",
+        .durable = "dup_ack2_consumer",
+        .config = .{
+            .deliver_policy = .all,
+        },
+    });
+    defer push_sub.deinit();
+
+    // Publish test message
+    try conn.publish("test.dup.ack2.msg", "test double ack message");
+
+    // Wait for message processing
+    var attempts: u32 = 0;
+    while (attempts < 30) {
+        try io.sleep(.fromMilliseconds(100), .awake);
+        attempts += 1;
+
+        try test_data.mutex.lock(std.testing.io);
+        const done = test_data.received;
+        test_data.mutex.unlock(std.testing.io);
+
+        if (done) break;
+    }
+
+    // Verify results
+    try test_data.mutex.lock(std.testing.io);
+    defer test_data.mutex.unlock(std.testing.io);
+
+    try testing.expect(test_data.received);
+    try testing.expect(test_data.first_ack_success);
+    try testing.expect(test_data.second_ack_failed);
+}
+
+test "nak should fail after ack" {
+    const io = std.testing.io;
+
+    const conn = try utils.createDefaultConnection(io);
+    defer utils.closeConnection(conn);
+
+    var js = conn.jetstream(.{});
+
+    // Create stream
+    const stream_config = nats.StreamConfig{
+        .name = "TEST_ACK_NAK_STREAM",
+        .subjects = &.{"test.ack.nak.*"},
+    };
+    var stream_info = try js.addStream(stream_config);
+    defer stream_info.deinit();
+
+    // Test data to track results
+    const TestData = struct {
+        received: bool = false,
+        ack_success: bool = false,
+        nak_failed: bool = false,
+        mutex: xsync.Mutex = .init,
+    };
+
+    var test_data = TestData{};
+
+    // Handler that acks then naks
+    const AckNakHandler = struct {
+        fn handle(js_msg: *nats.JetStreamMessage, data: *TestData) !void {
+            defer js_msg.deinit();
+
+            try data.mutex.lock(std.testing.io);
+            defer data.mutex.unlock(std.testing.io);
+
+            data.received = true;
+
+            // First ack should succeed
+            if (js_msg.ack()) {
+                data.ack_success = true;
+            } else |_| {
+                return;
+            }
+
+            // NAK after ack should fail
+            if (js_msg.nak()) {
+                // Should not reach here
+            } else |err| {
+                if (err == nats.AckError.AlreadyAcked) {
+                    data.nak_failed = true;
+                }
+            }
+        }
+    };
+
+    var push_sub = try js.subscribe("test.ack.nak.*", AckNakHandler.handle, .{&test_data}, .{
+        .stream = "TEST_ACK_NAK_STREAM",
+        .durable = "ack_nak_consumer",
+        .config = .{
+            .deliver_policy = .all,
+        },
+    });
+    defer push_sub.deinit();
+
+    // Publish test message
+    try conn.publish("test.ack.nak.msg", "test ack then nak message");
+
+    // Wait for message processing
+    var attempts: u32 = 0;
+    while (attempts < 30) {
+        try io.sleep(.fromMilliseconds(100), .awake);
+        attempts += 1;
+
+        try test_data.mutex.lock(std.testing.io);
+        const done = test_data.received;
+        test_data.mutex.unlock(std.testing.io);
+
+        if (done) break;
+    }
+
+    // Verify results
+    try test_data.mutex.lock(std.testing.io);
+    defer test_data.mutex.unlock(std.testing.io);
+
+    try testing.expect(test_data.received);
+    try testing.expect(test_data.ack_success);
+    try testing.expect(test_data.nak_failed);
+}
+
+test "inProgress can be called multiple times" {
+    const io = std.testing.io;
+
+    const conn = try utils.createDefaultConnection(io);
+    defer utils.closeConnection(conn);
+
+    var js = conn.jetstream(.{});
+
+    // Create stream
+    const stream_config = nats.StreamConfig{
+        .name = "TEST_PROGRESS_STREAM",
+        .subjects = &.{"test.progress.*"},
+    };
+    var stream_info = try js.addStream(stream_config);
+    defer stream_info.deinit();
+
+    // Test data to track results
+    const TestData = struct {
+        received: bool = false,
+        progress_calls: u32 = 0,
+        final_ack: bool = false,
+        not_acknowledged_after_progress: bool = false,
+        mutex: xsync.Mutex = .init,
+    };
+
+    var test_data = TestData{};
+
+    // Handler that calls inProgress multiple times then acks
+    const ProgressHandler = struct {
+        fn handle(js_msg: *nats.JetStreamMessage, data: *TestData) !void {
+            defer js_msg.deinit();
+
+            try data.mutex.lock(std.testing.io);
+            defer data.mutex.unlock(std.testing.io);
+
+            data.received = true;
+
+            // Call inProgress multiple times
+            var i: u32 = 0;
+            while (i < 3) : (i += 1) {
+                if (js_msg.inProgress()) {
+                    data.progress_calls += 1;
+                } else |_| {
+                    return;
+                }
+            }
+
+            // Check not acknowledged after inProgress calls
+            if (!js_msg.isAcked()) {
+                data.not_acknowledged_after_progress = true;
+            }
+
+            // Final ack should still work
+            if (js_msg.ack()) {
+                data.final_ack = true;
+            } else |_| {
+                return;
+            }
+        }
+    };
+
+    var push_sub = try js.subscribe("test.progress.*", ProgressHandler.handle, .{&test_data}, .{
+        .stream = "TEST_PROGRESS_STREAM",
+        .durable = "progress_consumer",
+        .config = .{
+            .deliver_policy = .all,
+        },
+    });
+    defer push_sub.deinit();
+
+    // Publish test message
+    try conn.publish("test.progress.msg", "test progress message");
+
+    // Wait for message processing
+    var attempts: u32 = 0;
+    while (attempts < 30) {
+        try io.sleep(.fromMilliseconds(100), .awake);
+        attempts += 1;
+
+        try test_data.mutex.lock(std.testing.io);
+        const done = test_data.received;
+        test_data.mutex.unlock(std.testing.io);
+
+        if (done) break;
+    }
+
+    // Verify results
+    try test_data.mutex.lock(std.testing.io);
+    defer test_data.mutex.unlock(std.testing.io);
+
+    try testing.expect(test_data.received);
+    try testing.expectEqual(@as(u32, 3), test_data.progress_calls);
+    try testing.expect(test_data.not_acknowledged_after_progress);
+    try testing.expect(test_data.final_ack);
+}

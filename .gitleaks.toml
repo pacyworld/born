@@ -1,0 +1,10 @@
+# Born: extend (never replace) the default gitleaks ruleset. The hook only
+# honors this file when useDefault is true.
+useDefault = true
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Vendored upstream nats.zig tests tree at pin b8ffdd9 (consumers/nats/tests/): public test-only keys, creds and nkey constants published in github.com/lalinsky/nats.zig, every file hash-verified by consumers/nats/manifest.sha256 (P5.5). The vendoring contract requires byte-identical bytes; these are not estate secrets. Born-owned code (the utils.zig facade) lives outside this path and stays scanned."
+paths = ['''^consumers/nats/tests/''']
