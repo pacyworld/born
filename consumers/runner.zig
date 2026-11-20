@@ -258,13 +258,16 @@ pub fn main(init: std.process.Init) !void {
     var env = Env.init(gpa, init.environ_map);
     defer env.deinit(gpa);
 
-    // e2e only: hand the pinned nats-server binary path to the fixture facade
-    // before any test runs (born#110 W1). The facade spawns this exact
-    // absolute path; unit and http never read it. The import is comptime-dead
-    // outside the e2e suite, so those roots need no consumer_env module.
+    // e2e only: hand the pinned nats-server binary path and the process
+    // environment to the fixture facade before any test runs (born#110 W1,
+    // born#124). The facade spawns this exact absolute path with an explicit
+    // child environ_map; unit and http never read it. The import is
+    // comptime-dead outside the e2e suite, so those roots need no consumer_env
+    // module.
     if (comptime std.mem.eql(u8, consumer_options.suite, "nats-e2e")) {
         const consumer_env = @import("consumer_env");
         consumer_env.setNatsServer(init.environ_map.get("NATS_SERVER"));
+        consumer_env.setEnvironMap(init.environ_map);
     }
 
     var slowest = SlowTracker.init(io, 5);
