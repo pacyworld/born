@@ -132,6 +132,19 @@ tarball, verified against a pinned SHA-256 and cached under
 To cite CI evidence, link the job: `https://pacyworld.dev/pacyworld/born/actions/runs/<run number>`
 (the number shown in the web UI, not the API id), with its summary line.
 
+### Symbolizing a Windows crash
+
+Zig's self-hosted COFF linker strips debug info, so a crash stack from a
+default Windows build has no symbols. For a repro build, set
+`use_lld = true` on the test's `Build.Step.Compile` step: LLD emits
+CodeView and installs a PDB beside the executable. Upload the exe and PDB
+together and keep them side by side. Resolve the stack's `module+0x...`
+frame offsets (the fault address itself is not an RVA) with:
+
+```
+llvm-symbolizer --obj=born-tests.exe 0x<offset>
+```
+
 ### Scheduled gates (`.forgejo/workflows/stress.yml`, `bench.yml`)
 
 These run weekly and on `workflow_dispatch`, never on push/PR, so they do not
