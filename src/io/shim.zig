@@ -450,7 +450,9 @@ const SocketState = struct {
     /// instead of forwarding to Threaded onto a descriptor about to close
     /// (#115). Windows keeps the slot occupied/closing until socketEvent
     /// absorbs every completion; the generation guard protects late ones.
-    closing: bool = false,
+    /// Atomic so `sockUserExit`'s last-release fast path reads it lock-free;
+    /// written (release) under the registry mutex, read (acquire) elsewhere.
+    closing: std.atomic.Value(bool) = .init(false),
     /// In-flight consumer thunks that resolved this handle through the
     /// counting lookup (`lookupBorn`). The socket is not freed until this
     /// drains to zero, so no recv/send is in flight on the descriptor at close
@@ -464,6 +466,12 @@ const SocketState = struct {
     /// `users` reaches zero, woken by `sockUserExit`. Null when no close is
     /// pending. Loop-only after closeDrive stores it.
     pending_close: ?*NetOp = null,
+    /// Intrusive link in the loop's deferred-close list (#115, review 690 B3).
+    /// closeDrive pushes a deferred slot here; `netCloseDrain` walks the list
+    /// and pops only entries whose `users` drained to zero, so a wake costs
+    /// O(deferred closes), not O(total sockets). Loop-owned; null when not
+    /// deferred. Reset by sockFreeLocked so a reused slot starts clean.
+    deferred_next: ?*SocketState = null,
     /// Windows: shutdown(.recv/.both) issued. shutdown() does not complete a
     /// pending overlapped WSARecv, so netShutdown cancels it and the loop maps
     /// the abort completion (or a recv posted after shutdown) to EOF.
@@ -868,6 +876,43 @@ fn deadError(comptime E: type) E {
     return @field(anyerror, names[0]);
 }
 
+/// Dead-route refusal for an infallible value producer (review 690 B1, group c).
+/// These slots have no error channel, so a refusal that returns a fabricated
+/// value silently corrupts the caller: `async` returning null means "start ran
+/// inline" (it did not, so the result is uninitialized); `await`/`cancel`
+/// returning without writing `result` leaves garbage; `random` leaves stale
+/// bytes; `now` returns a zero timestamp that corrupts deadlines. The contract
+/// failure is therefore loud: panic naming the call. `async` could instead run
+/// `start` inline, but a uniform panic is simpler and equally correct on a dead
+/// route. `futexWaitUncancelable` joins this group: a silent post-gate return
+/// would let a mutex/condvar waiter proceed without the lock, and forwarding
+/// uncounted could block deinit forever, so it panics too.
+fn deadPanic(comptime call: []const u8) noreturn {
+    @panic("Io." ++ call ++ " used during or after deinit");
+}
+
+/// Test-only interception of the group (c) refusal. The 0.16 standalone test
+/// runner has no `--test-filter`, so an in-suite subprocess cannot assert the
+/// real `@panic` abort portably; instead a test installs `test_dead_panic_hook`
+/// and `deadRefuse` records the exact contract message and returns, letting the
+/// test assert the refusal path without aborting the suite. Production (and any
+/// test without the hook) takes `deadPanic` and aborts. The real abort is also
+/// exercised by the stress suite and the #108-style external rc=134 checks.
+var test_dead_panic_hook: ?*const fn (msg: []const u8) void = null;
+
+/// Group (c) refusal with a return type: panic in production, record-and-return
+/// under the test hook. The returned value is undefined and only ever observed
+/// by a test that asserts the hook fired (never used as a real result).
+fn deadRefuse(comptime call: []const u8, comptime T: type) T {
+    if (builtin.is_test) {
+        if (test_dead_panic_hook) |hook| {
+            hook("Io." ++ call ++ " used during or after deinit");
+            return undefined;
+        }
+    }
+    deadPanic(call);
+}
+
 /// Result of a successful submission: the assigned slot and whether the
 /// queue went from empty to non-empty (the only case that needs a wake).
 const SubmitResult = struct { index: u32, was_empty: bool };
@@ -899,6 +944,11 @@ pub const Shim = struct {
     /// while this is set and clears it (acquire) once no deferred close remains.
     /// The normal loop path pays a single atomic load per iteration.
     has_deferred_close: std.atomic.Value(bool) = .init(false),
+    /// Head of the intrusive deferred-close list (#115, review 690 B3).
+    /// closeDrive pushes; netCloseDrain pops entries whose `users` reached
+    /// zero. Loop-owned (both run on the loop thread); the push happens under
+    /// the registry mutex only to pair the closing claim with sockUserExit.
+    deferred_close_head: ?*SocketState = null,
     /// Submission queue: intrusive FIFO of caller-owned `SleepOp` nodes. The
     /// mutex critical sections are O(1) per node (push, or swap out the whole
     /// list); the loop never holds it across `wait`. Locking is uncancelable:
@@ -1876,10 +1926,11 @@ pub const Shim = struct {
         state.occupied = false;
         // Reset teardown state so a reused slot starts clean (#115): a stale
         // `closing` would make the next closeDrive early-return, and a stale
-        // `users`/`pending_close` would corrupt the next drain.
-        state.closing = false;
+        // `users`/`pending_close`/`deferred_next` would corrupt the next drain.
+        state.closing.store(false, .monotonic);
         state.users.store(0, .monotonic);
         state.pending_close = null;
+        state.deferred_next = null;
         state.next_free = self.registry.free_head;
         self.registry.free_head = index;
     }
@@ -1946,7 +1997,7 @@ pub const Shim = struct {
         if (!self.registry.initialized) return .absent;
         const index = self.registry.map.get(handle) orelse return .absent;
         const state = self.sockAt(index) orelse return .absent;
-        if (state.closing) return .closing;
+        if (state.closing.load(.acquire)) return .closing;
         return .{ .live = index };
     }
 
@@ -1954,15 +2005,21 @@ pub const Shim = struct {
     /// `users` > 0 (it is not freed until the drain completes), so the
     /// lock-free `sockAt` is safe. On the last release, wake a blocking exit
     /// drain (`sockDrainUsers`) and, if the slot is closing, wake the loop to
-    /// finalize a deferred runtime close (`netCloseDrain`). The occupancy and
-    /// closing re-check under the registry mutex pairs with the finalize pass,
-    /// which frees the slot under the same mutex.
+    /// finalize a deferred runtime close (`netCloseDrain`). The common exit
+    /// (slot not closing) returns without the registry mutex (review 690 B2);
+    /// only a closing slot takes the mutex to re-check occupancy, pairing with
+    /// the finalize pass, which frees the slot under the same mutex.
     fn sockUserExit(self: *Shim, index: u32) void {
         const state = self.sockAt(index) orelse return;
         if (state.users.fetchSub(1, .acq_rel) != 1) return;
         self.threaded_io.vtable.futexWake(self.threaded_io.userdata, &state.users.raw, 1);
+        // Fast path: a non-closing slot needs no lock. closeDrive reads `users`
+        // under the same mutex hold that stores closing, so if it deferred (saw
+        // users > 0 after the store) this acquire load must observe closing set
+        // — else a happens-before cycle — and the slow path below wakes the loop.
+        if (!state.closing.load(.acquire)) return;
         self.registry.mutex.lockUncancelable(self.threaded_io);
-        const wake = state.occupied and state.closing;
+        const wake = state.occupied and state.closing.load(.acquire);
         self.registry.mutex.unlock(self.threaded_io);
         if (wake) self.port.wake();
     }
@@ -2025,15 +2082,17 @@ pub const Shim = struct {
     /// then closes the descriptor, drops the handle mapping and frees the slot
     /// under ONE registry mutex hold, so a consumer lookup never resolves the
     /// handle to a closed fd (#115); `closing` is already set and `users`
-    /// drained before this runs. Windows unregisters before cancelAndClose and
-    /// keeps the slot occupied/closing until socketEvent absorbs every
-    /// completion (the stable OVERLAPPED storage must outlive the drain); the
-    /// generation guard still protects late completions.
+    /// drained before this runs. Holding the mutex across close assumes close
+    /// does not block (no `SO_LINGER` with a nonzero linger on these sockets).
+    /// Windows unregisters before cancelAndClose and keeps the slot
+    /// occupied/closing until socketEvent absorbs every completion (the stable
+    /// OVERLAPPED storage must outlive the drain); the generation guard still
+    /// protects late completions.
     fn sockRetire(self: *Shim, state: *SocketState, index: u32) void {
         if (is_windows) {
             self.unregisterHandle(state.handle, index);
             state.plain.cancelAndClose();
-            state.closing = true;
+            state.closing.store(true, .release);
             if (state.plain.pendingOps() == 0) self.sockFree(state, index);
         } else {
             self.port.purgeFd(state.handle);
@@ -2073,6 +2132,7 @@ pub const Shim = struct {
     fn registryCloseAll(self: *Shim) void {
         if (!self.registry.initialized) return;
         self.has_deferred_close.store(false, .release);
+        self.deferred_close_head = null;
         const chunk_count = self.registry.chunk_count;
         var ci: usize = 0;
         while (ci < chunk_count) : (ci += 1) {
@@ -2086,8 +2146,9 @@ pub const Shim = struct {
                     // for in-flight consumer thunks to release their users hold
                     // before the descriptor closes; the count only falls.
                     self.registry.mutex.lockUncancelable(self.threaded_io);
-                    state.closing = true;
+                    state.closing.store(true, .release);
                     state.pending_close = null;
+                    state.deferred_next = null;
                     self.registry.mutex.unlock(self.threaded_io);
                     self.sockDrainUsers(state);
                     self.sockRetire(state, index);
@@ -2173,7 +2234,7 @@ pub const Shim = struct {
         const state = self.sockAt(index).?;
         state.generation +%= 1;
         state.occupied = true;
-        state.closing = false;
+        state.closing.store(false, .monotonic);
         state.index = index;
         state.pending_connect = op;
         state.pending_read = null;
@@ -2311,7 +2372,7 @@ pub const Shim = struct {
     /// park (arm read interest) only when no bytes are available yet.
     fn readDrive(self: *Shim, op: *NetOp) void {
         const state = self.sockSnapshot(op.sock_index) orelse return self.netRetireErr(op, .read_failed);
-        if (state.closing) return self.netRetireErr(op, .read_failed);
+        if (state.closing.load(.acquire)) return self.netRetireErr(op, .read_failed);
         // A second concurrent read would orphan the parked op and hang its
         // submitter; reject it with busy (mapped to Unexpected). The completion
         // re-entry from socketEvent has p == op and proceeds.
@@ -2367,7 +2428,7 @@ pub const Shim = struct {
     /// parking on `want_write`.
     fn writeDrive(self: *Shim, op: *NetOp) void {
         const state = self.sockSnapshot(op.sock_index) orelse return self.netRetireErr(op, .write_failed);
-        if (state.closing) return self.netRetireErr(op, .write_failed);
+        if (state.closing.load(.acquire)) return self.netRetireErr(op, .write_failed);
         // Reject a concurrent write rather than orphaning the parked op.
         if (state.pending_write) |p| {
             if (p != op) return self.netRetireErr(op, .busy);
@@ -2402,72 +2463,88 @@ pub const Shim = struct {
         }
     }
 
-    /// Close a Born-owned socket: drain every pending op, then retire the
-    /// socket (unregister before close; Windows keeps the stable SocketState
-    /// alive until every completion is absorbed, 4.4). A close kills the
-    /// socket's route, so parked ops retire route_dead (Unexpected at the
-    /// thunk), never as the caller's Canceled (#106, section 4.5), unless the
-    /// submitter itself requested cancellation.
     /// Drive a user close on the loop thread (#115). Claim the slot under the
     /// registry mutex so new consumer lookups refuse with a dead error rather
     /// than forward to Threaded onto a descriptor about to close, then retire
-    /// the parked Born ops (waking their submitters). If no consumer thunk is
-    /// in flight (`users` == 0) the socket retires immediately. Otherwise the
-    /// close is DEFERRED: the live loop must keep servicing submissions (a
-    /// counted caller may still arm a read/write that the drive path refuses on
-    /// the closing slot, or complete a Threaded forward), so blocking here
-    /// would deadlock. Store the close op in `pending_close` and return without
-    /// retiring it; `sockUserExit` wakes the loop when `users` reaches zero and
-    /// `netCloseDrain` finalizes. A second close on an already-closing slot
-    /// completes immediately (the first close owns the teardown).
+    /// the parked Born ops (waking their submitters). A close kills the
+    /// socket's route, so parked ops retire route_dead (Unexpected at the
+    /// thunk), never as the caller's Canceled (#106, section 4.5), unless the
+    /// submitter itself requested cancellation. If no consumer thunk is in
+    /// flight (`users` == 0, read under the same mutex hold that sets closing)
+    /// the socket retires immediately. Otherwise the close is DEFERRED: the
+    /// live loop must keep servicing submissions (a counted caller may still
+    /// arm a read/write that the drive path refuses on the closing slot, or
+    /// complete a Threaded forward), so blocking here would deadlock. Store the
+    /// close op in `pending_close`, push the slot onto the deferred-close list
+    /// and return without retiring it; `sockUserExit` wakes the loop when
+    /// `users` reaches zero and `netCloseDrain` finalizes. A second close on an
+    /// already-closing slot completes immediately (the first close owns the
+    /// teardown). Windows keeps the stable SocketState alive until every
+    /// completion is absorbed (4.4).
     fn closeDrive(self: *Shim, op: *NetOp) void {
         const state = self.sockSnapshot(op.sock_index) orelse return self.netRetireOk(op, 0, false);
         self.registry.mutex.lockUncancelable(self.threaded_io);
-        if (state.closing) {
+        if (state.closing.load(.acquire)) {
             self.registry.mutex.unlock(self.threaded_io);
             return self.netRetireOk(op, 0, false);
         }
-        state.closing = true;
+        state.closing.store(true, .release);
+        // Read users under the closing claim so the lock-free sockUserExit fast
+        // path is race-free (review 690 B2): a deferred close (users > 0 here)
+        // forces the releasing caller to observe closing and wake the loop.
+        const users = state.users.load(.acquire);
         self.registry.mutex.unlock(self.threaded_io);
         if (state.pending_read) |rop| self.netRetireRoute(rop, false);
         if (state.pending_write) |wop| self.netRetireRoute(wop, false);
         if (state.pending_connect) |cop| self.netRetireRoute(cop, false);
-        if (state.users.load(.acquire) == 0) {
+        if (users == 0) {
             self.sockRetire(state, op.sock_index);
             return self.netRetireOk(op, 0, false);
         }
         state.pending_close = op;
+        state.deferred_next = self.deferred_close_head;
+        self.deferred_close_head = state;
         self.has_deferred_close.store(true, .release);
     }
 
     /// Loop finalize pass for deferred runtime closes (#115). Runs only while
-    /// `has_deferred_close` is set. For each closing slot whose `users` drained
-    /// to zero, retire the socket and complete its stored close op (waking
-    /// `netCloseWait`). The registry mutex serializes with `sockUserExit`'s
-    /// last-release re-check and with `sockRetire`'s atomic close+unregister,
-    /// so a slot is never freed while a counting caller still holds it. Clears
-    /// the flag once no deferred close remains.
+    /// `has_deferred_close` is set. Walks the intrusive deferred-close list
+    /// (review 690 B3) and pops only entries whose `users` drained to zero:
+    /// retire the socket and complete its stored close op (waking
+    /// `netCloseWait`). O(deferred closes) per wake, not O(total sockets). The
+    /// registry mutex serializes with `sockUserExit`'s last-release re-check
+    /// and with `sockRetire`'s atomic close+unregister, so a slot is never
+    /// freed while a counting caller still holds it. Clears the flag once no
+    /// deferred close remains.
     fn netCloseDrain(self: *Shim) void {
         self.registry.mutex.lockUncancelable(self.threaded_io);
         var any = false;
-        const chunk_count = self.registry.chunk_count;
-        var ci: usize = 0;
-        while (ci < chunk_count) : (ci += 1) {
-            const chunk = self.registry.chunks[ci].load(.acquire) orelse continue;
-            for (&chunk.socks, 0..) |*state, si| {
-                if (!state.occupied or !state.closing) continue;
-                const op = state.pending_close orelse continue;
-                if (state.users.load(.acquire) != 0) {
-                    any = true;
-                    continue;
-                }
-                const index: u32 = @intCast(ci * sock_per_chunk + si);
-                state.pending_close = null;
-                self.registry.mutex.unlock(self.threaded_io);
-                self.sockRetire(state, index);
-                self.netRetireOk(op, 0, false);
-                self.registry.mutex.lockUncancelable(self.threaded_io);
+        var prev: ?*SocketState = null;
+        var cur = self.deferred_close_head;
+        while (cur) |state| {
+            const next = state.deferred_next;
+            if (state.users.load(.acquire) != 0) {
+                any = true;
+                prev = state;
+                cur = next;
+                continue;
             }
+            // users drained: unlink, then retire outside the mutex (sockRetire
+            // takes it internally for the atomic close+unregister).
+            if (prev) |p| {
+                p.deferred_next = next;
+            } else {
+                self.deferred_close_head = next;
+            }
+            const op = state.pending_close.?;
+            state.pending_close = null;
+            state.deferred_next = null;
+            const index = state.index;
+            self.registry.mutex.unlock(self.threaded_io);
+            self.sockRetire(state, index);
+            self.netRetireOk(op, 0, false);
+            self.registry.mutex.lockUncancelable(self.threaded_io);
+            cur = next;
         }
         if (!any) self.has_deferred_close.store(false, .release);
         self.registry.mutex.unlock(self.threaded_io);
@@ -2560,7 +2637,7 @@ pub const Shim = struct {
                 .send => if (s.pending_write) |op| self.writeDrive(op),
                 .unknown => {},
             }
-            if (s.closing and s.plain.pendingOps() == 0) self.sockFree(s, id.index);
+            if (s.closing.load(.acquire) and s.plain.pendingOps() == 0) self.sockFree(s, id.index);
             return;
         }
 
@@ -3401,13 +3478,18 @@ pub fn io(port: *born.EvPort, opts: InitOptions) InitError!Io {
 
 /// Releases the composite created by `io`. As with `Io.Threaded`, every task
 /// must have been awaited or canceled first. Sets the instance entry gate so
-/// new consumer calls reject with their dead-route error, then stops and joins
+/// new consumer calls reject with their dead-route error (infallible value
+/// producers panic; wake/release calls still forward), then stops and joins
 /// the Born route's loop thread (retiring any operation still pending as
 /// canceled and closing any remaining registered socket): the loop calls into
 /// Threaded until it exits. Drains every in-flight consumer thunk before
-/// freeing anything it touches (#113), then closes any remaining shim-owned
-/// child (killing one still running), joins the Threaded pool and frees the
-/// composite.
+/// freeing anything it touches (#113). The drain BLOCKS until each counted
+/// call returns, including a Threaded forward that can block indefinitely
+/// (`netAccept`, `childWait`, `futexWait`/`futexWaitUncancelable`): a caller
+/// parked in one of those must be woken or canceled by its peer before deinit
+/// can finish, exactly as `Io.Threaded.deinit` requires its tasks awaited.
+/// Then closes any remaining shim-owned child (killing one still running),
+/// joins the Threaded pool and frees the composite.
 pub fn deinit(interface: Io) void {
     const shim = shimFrom(interface.userdata);
     const allocator = shim.allocator;
@@ -3580,8 +3662,11 @@ pub fn processStats(interface: Io) ProcessStats {
 const fwd = struct {
     fn crashHandler(userdata: ?*anyopaque) void {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return;
-        defer self.entryExit();
+        // Wake/release class (review 690 B1 group b): never refuse. Counted
+        // pre-gate so the drain protects an in-flight call; post-gate it still
+        // forwards (refusing a crash handler would strand teardown).
+        const entered = self.entryEnter();
+        defer if (entered) self.entryExit();
         return self.threaded_io.vtable.crashHandler(self.threaded_io.userdata);
     }
     fn async(
@@ -3593,7 +3678,7 @@ const fwd = struct {
         start: *const fn (context: *const anyopaque, result: *anyopaque) void,
     ) ?*Io.AnyFuture {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return deadResult(?*Io.AnyFuture);
+        if (!self.entryEnter()) return deadRefuse("async", ?*Io.AnyFuture);
         defer self.entryExit();
         return self.threaded_io.vtable.async(self.threaded_io.userdata, result, result_alignment, context, context_alignment, start);
     }
@@ -3617,7 +3702,7 @@ const fwd = struct {
         result_alignment: std.mem.Alignment,
     ) void {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return;
+        if (!self.entryEnter()) return deadRefuse("await", void);
         defer self.entryExit();
         return self.threaded_io.vtable.await(self.threaded_io.userdata, any_future, result, result_alignment);
     }
@@ -3628,7 +3713,7 @@ const fwd = struct {
         result_alignment: std.mem.Alignment,
     ) void {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return;
+        if (!self.entryEnter()) return deadRefuse("cancel", void);
         defer self.entryExit();
         return self.threaded_io.vtable.cancel(self.threaded_io.userdata, any_future, result, result_alignment);
     }
@@ -3640,7 +3725,7 @@ const fwd = struct {
         start: *const fn (context: *const anyopaque) void,
     ) void {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return;
+        if (!self.entryEnter()) return deadRefuse("groupAsync", void);
         defer self.entryExit();
         return self.threaded_io.vtable.groupAsync(self.threaded_io.userdata, group, context, context_alignment, start);
     }
@@ -3664,19 +3749,20 @@ const fwd = struct {
     }
     fn groupCancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) void {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return;
-        defer self.entryExit();
+        // Wake/release class (group b): never refuse; counted pre-gate only.
+        const entered = self.entryEnter();
+        defer if (entered) self.entryExit();
         return self.threaded_io.vtable.groupCancel(self.threaded_io.userdata, group, token);
     }
     fn recancel(userdata: ?*anyopaque) void {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return;
+        if (!self.entryEnter()) return deadRefuse("recancel", void);
         defer self.entryExit();
         return self.threaded_io.vtable.recancel(self.threaded_io.userdata);
     }
     fn swapCancelProtection(userdata: ?*anyopaque, new: Io.CancelProtection) Io.CancelProtection {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return deadResult(Io.CancelProtection);
+        if (!self.entryEnter()) return deadRefuse("swapCancelProtection", Io.CancelProtection);
         defer self.entryExit();
         return self.threaded_io.vtable.swapCancelProtection(self.threaded_io.userdata, new);
     }
@@ -3694,14 +3780,18 @@ const fwd = struct {
     }
     fn futexWaitUncancelable(userdata: ?*anyopaque, ptr: *const u32, expected: u32) void {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return;
+        if (!self.entryEnter()) return deadRefuse("futexWaitUncancelable", void);
         defer self.entryExit();
         return self.threaded_io.vtable.futexWaitUncancelable(self.threaded_io.userdata, ptr, expected);
     }
     fn futexWake(userdata: ?*anyopaque, ptr: *const u32, max_waiters: u32) void {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return;
-        defer self.entryExit();
+        // Wake/release class (group b): never refuse. A counted waiter blocked
+        // in futexWaitUncancelable whose waker arrives during deinit MUST still
+        // be woken, or entryCloseAndDrain hangs forever (review 690 B1). The
+        // forward is a stateless futex wake on the caller's word, safe post-gate.
+        const entered = self.entryEnter();
+        defer if (entered) self.entryExit();
         return self.threaded_io.vtable.futexWake(self.threaded_io.userdata, ptr, max_waiters);
     }
     fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
@@ -3724,8 +3814,9 @@ const fwd = struct {
     }
     fn batchCancel(userdata: ?*anyopaque, batch: *Io.Batch) void {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return;
-        defer self.entryExit();
+        // Wake/release class (group b): never refuse; counted pre-gate only.
+        const entered = self.entryEnter();
+        defer if (entered) self.entryExit();
         return self.threaded_io.vtable.batchCancel(self.threaded_io.userdata, batch);
     }
     fn dirCreateDir(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, permissions: Io.Dir.Permissions) Io.Dir.CreateDirError!void {
@@ -3790,8 +3881,8 @@ const fwd = struct {
     }
     fn dirClose(userdata: ?*anyopaque, dirs: []const Io.Dir) void {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return;
-        defer self.entryExit();
+        const entered = self.entryEnter(); // release class (group b): never refuse
+        defer if (entered) self.entryExit();
         return self.threaded_io.vtable.dirClose(self.threaded_io.userdata, dirs);
     }
     fn dirRead(userdata: ?*anyopaque, reader: *Io.Dir.Reader, entries: []Io.Dir.Entry) Io.Dir.Reader.Error!usize {
@@ -3898,8 +3989,8 @@ const fwd = struct {
     }
     fn fileClose(userdata: ?*anyopaque, files: []const Io.File) void {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return;
-        defer self.entryExit();
+        const entered = self.entryEnter(); // release class (group b): never refuse
+        defer if (entered) self.entryExit();
         return self.threaded_io.vtable.fileClose(self.threaded_io.userdata, files);
     }
     fn fileWritePositional(userdata: ?*anyopaque, file: Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) Io.File.WritePositionalError!usize {
@@ -4000,8 +4091,8 @@ const fwd = struct {
     }
     fn fileUnlock(userdata: ?*anyopaque, file: Io.File) void {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return;
-        defer self.entryExit();
+        const entered = self.entryEnter(); // release class (group b): never refuse
+        defer if (entered) self.entryExit();
         return self.threaded_io.vtable.fileUnlock(self.threaded_io.userdata, file);
     }
     fn fileDowngradeLock(userdata: ?*anyopaque, file: Io.File) Io.File.DowngradeLockError!void {
@@ -4030,8 +4121,8 @@ const fwd = struct {
     }
     fn fileMemoryMapDestroy(userdata: ?*anyopaque, map: *Io.File.MemoryMap) void {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return;
-        defer self.entryExit();
+        const entered = self.entryEnter(); // release class (group b): never refuse
+        defer if (entered) self.entryExit();
         return self.threaded_io.vtable.fileMemoryMapDestroy(self.threaded_io.userdata, map);
     }
     fn fileMemoryMapSetLength(userdata: ?*anyopaque, map: *Io.File.MemoryMap, length: usize) Io.File.MemoryMap.SetLengthError!void {
@@ -4078,8 +4169,8 @@ const fwd = struct {
     }
     fn unlockStderr(userdata: ?*anyopaque) void {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return;
-        defer self.entryExit();
+        const entered = self.entryEnter(); // release class (group b): never refuse
+        defer if (entered) self.entryExit();
         return self.threaded_io.vtable.unlockStderr(self.threaded_io.userdata);
     }
     fn processCurrentPath(userdata: ?*anyopaque, buffer: []u8) std.process.CurrentPathError!usize {
@@ -4120,8 +4211,10 @@ const fwd = struct {
     }
     fn childKill(userdata: ?*anyopaque, child: *std.process.Child) void {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return;
-        defer self.entryExit();
+        // Release class (group b): never refuse; counted pre-gate only. The
+        // Born-route override (process_route.childKill) handles Born children.
+        const entered = self.entryEnter();
+        defer if (entered) self.entryExit();
         return self.threaded_io.vtable.childKill(self.threaded_io.userdata, child);
     }
     fn progressParentFile(userdata: ?*anyopaque) std.Progress.ParentFileError!Io.File {
@@ -4132,7 +4225,7 @@ const fwd = struct {
     }
     fn now(userdata: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return deadResult(Io.Timestamp);
+        if (!self.entryEnter()) return deadRefuse("now", Io.Timestamp);
         defer self.entryExit();
         return self.threaded_io.vtable.now(self.threaded_io.userdata, clock);
     }
@@ -4150,7 +4243,7 @@ const fwd = struct {
     }
     fn random(userdata: ?*anyopaque, buffer: []u8) void {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return;
+        if (!self.entryEnter()) return deadRefuse("random", void);
         defer self.entryExit();
         return self.threaded_io.vtable.random(self.threaded_io.userdata, buffer);
     }
@@ -4268,8 +4361,10 @@ const fwd016 = if (!is_017) struct {
     }
     fn netClose(userdata: ?*anyopaque, handles: []const Io.net.Socket.Handle) void {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return;
-        defer self.entryExit();
+        // Release class (group b): never refuse; counted pre-gate only. This is
+        // the pure Threaded forward; the Born route override is net01x.netClose.
+        const entered = self.entryEnter();
+        defer if (entered) self.entryExit();
         return self.threaded_io.vtable.netClose(self.threaded_io.userdata, handles);
     }
 } else struct {};
@@ -4290,8 +4385,9 @@ const fwd017 = if (is_017) struct {
     }
     fn netClose(userdata: ?*anyopaque, sockets: []const Io.net.Socket) void {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return;
-        defer self.entryExit();
+        // Release class (group b): never refuse; counted pre-gate only.
+        const entered = self.entryEnter();
+        defer if (entered) self.entryExit();
         return self.threaded_io.vtable.netClose(self.threaded_io.userdata, sockets);
     }
 } else struct {};
@@ -4618,7 +4714,7 @@ const time_route = struct {
     /// for an unavailable clock (the slot is infallible).
     fn now(userdata: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return deadResult(Io.Timestamp);
+        if (!self.entryEnter()) return deadRefuse("now", Io.Timestamp);
         defer self.entryExit();
         if (clock == .awake) {
             const ns = born.nowNs() catch return .zero;
@@ -4786,8 +4882,14 @@ const process_route = struct {
 
     fn childKill(userdata: ?*anyopaque, child: *std.process.Child) void {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return;
-        defer self.entryExit();
+        // Release class (review 690 B1): never refuse. Counted pre-gate; the
+        // pre-gate path is unchanged. Post-gate the loop is joined, so a
+        // Born-owned child gets the descriptor SIGTERM (a plain syscall) and
+        // its caller stdio closed, but no proc-queue submission;
+        // childRegistryCloseAll reaps it at deinit. Threaded-owned children
+        // forward to Threaded.
+        const entered = self.entryEnter();
+        defer if (entered) self.entryExit();
         if (self.capabilities.process != .born_evented) {
             if (process_stats_enabled) _ = self.proc_stats.threaded_kill.fetchAdd(1, .monotonic);
             return fwd.childKill(userdata, child);
@@ -4804,6 +4906,13 @@ const process_route = struct {
             if (self.childSnapshot(found.index, found.generation)) |cs| {
                 var bc = cs.child;
                 bc.kill(compat.signalNumber(std.posix.SIG.TERM)) catch {};
+            }
+            if (!entered) {
+                // Post-gate: skip the dead proc queue; close the caller's stdio
+                // ends and invalidate the id (review R1) so no stale id survives.
+                closeChildStdio(child);
+                child.id = null;
+                return;
             }
             var op: ProcOp = .{ .kind = .kill, .child_index = found.index, .child_gen = found.generation };
             self.procWaitUncancelable(&op);
@@ -5211,11 +5320,17 @@ const net016 = if (!is_017) struct {
 
     fn netClose(userdata: ?*anyopaque, handles: []const Io.net.Socket.Handle) void {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return;
-        defer self.entryExit();
+        // Release class (review 690 B1): never refuse. Counted pre-gate; the
+        // pre-gate path is unchanged. Post-gate the loop is joined, so a
+        // Born-owned slot is skipped (the loop's retireAll closes it at deinit,
+        // no leak) instead of submitting to the dead net queue; Threaded-owned
+        // handles still forward to Threaded.
+        const entered = self.entryEnter();
+        defer if (entered) self.entryExit();
         for (handles) |h| {
             switch (self.sockClassify(h)) {
                 .live => |index| {
+                    if (!entered) continue;
                     var op: NetOp = .{ .kind = .close, .sock_index = index, .payload = .{ .close = {} } };
                     self.netCloseWait(&op);
                 },
@@ -5302,11 +5417,15 @@ const net016 = if (!is_017) struct {
 const net017 = if (is_017) struct {
     fn netClose(userdata: ?*anyopaque, sockets: []const Io.net.Socket) void {
         const self = shimFrom(userdata);
-        if (!self.entryEnter()) return;
-        defer self.entryExit();
+        // Release class (review 690 B1): never refuse. Post-gate a Born-owned
+        // slot is skipped (the loop's retireAll closes it); Threaded-owned
+        // sockets forward to Threaded. See net016.netClose.
+        const entered = self.entryEnter();
+        defer if (entered) self.entryExit();
         for (sockets) |s| {
             switch (self.sockClassify(s.handle)) {
                 .live => |index| {
+                    if (!entered) continue;
                     var op: NetOp = .{ .kind = .close, .sock_index = index, .payload = .{ .close = {} } };
                     self.netCloseWait(&op);
                 },
@@ -5992,7 +6111,7 @@ test "connect deadline fire drains the pending ConnectEx before freeing (Windows
     const s = state.sockAt(index).?;
     s.generation +%= 1;
     s.occupied = true;
-    s.closing = false;
+    s.closing.store(false, .monotonic);
     s.index = index;
     s.pending_connect = null;
     s.pending_read = null;
@@ -6021,7 +6140,7 @@ test "connect deadline fire drains the pending ConnectEx before freeing (Windows
     try std.testing.expectEqual(@as(?NetError, .timeout), op.result.err);
     try std.testing.expectEqual(@as(u32, 1), op.state.load(.acquire));
     try std.testing.expect(!op.outcome_canceled);
-    try std.testing.expect(s.closing);
+    try std.testing.expect(s.closing.load(.acquire));
     try std.testing.expectEqual(@as(?*NetOp, null), s.pending_connect);
     try std.testing.expect(!s.deadline_armed);
     try std.testing.expect(s.occupied);
@@ -6080,7 +6199,7 @@ test "registryCloseAll drains two sockets' completions to their owners (Windows)
         const s = state.sockAt(index.*).?;
         s.generation +%= 1;
         s.occupied = true;
-        s.closing = false;
+        s.closing.store(false, .monotonic);
         s.index = index.*;
         s.pending_connect = null;
         s.pending_read = null;
@@ -7386,7 +7505,7 @@ test "close defers while a consumer holds the socket, then finalizes on drain (#
     try std.testing.expectEqual(@as(?NetError, .route_dead), rop.result.err);
     try std.testing.expectEqual(@as(u32, 1), rop.state.load(.acquire));
     try std.testing.expect(s.occupied);
-    try std.testing.expect(s.closing);
+    try std.testing.expect(s.closing.load(.acquire));
     try std.testing.expectEqual(@as(?*NetOp, &close_op), s.pending_close);
     try std.testing.expectEqual(@as(u32, 0), close_op.state.load(.acquire));
     try std.testing.expect(state.has_deferred_close.load(.acquire));
@@ -7447,7 +7566,7 @@ test "a reused socket slot starts with clean teardown state (#115)" {
     const index2 = try state.sockAllocLocked();
     try std.testing.expectEqual(index, index2);
     const s2 = state.sockAt(index2).?;
-    try std.testing.expect(!s2.closing);
+    try std.testing.expect(!s2.closing.load(.acquire));
     try std.testing.expectEqual(@as(u32, 0), s2.users.load(.acquire));
     try std.testing.expectEqual(@as(?*NetOp, null), s2.pending_close);
     s2.generation +%= 1;
@@ -7491,4 +7610,252 @@ test "entry gate refuses consumer thunks once closing and drains to zero (#113)"
     // A refused thunk returns its dead-route error without touching route state.
     try std.testing.expectError(error.Canceled, deadResult(Io.Cancelable!void));
     try std.testing.expectError(error.Unexpected, deadResult(std.process.SpawnError!std.process.Child));
+}
+
+test "B1a: error-bearing thunks refuse with a dead error after the gate closes (#117)" {
+    // Group (a): every error-union/error-set thunk keeps the dead-route error.
+    // Post-gate the refusal returns before any forward, so the count stays zero.
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    state.entryCloseAndDrain();
+    const ud: ?*anyopaque = @ptrCast(&state);
+
+    try std.testing.expectError(error.Canceled, fwd.sleep(ud, .none));
+    try std.testing.expectError(error.Canceled, fwd.checkCancel(ud));
+    var word: u32 = 0;
+    try std.testing.expectError(error.Canceled, fwd.futexWait(ud, &word, 1, .none));
+    try std.testing.expectError(error.Canceled, fwd.groupAwait(ud, undefined, undefined));
+    // An error set that declares Unexpected picks it (not a fabricated success).
+    try std.testing.expectError(error.Unexpected, fwd.fileLength(ud, undefined));
+
+    try std.testing.expect(state.entry.load(.acquire) & Shim.entry_closing != 0);
+    try std.testing.expectEqual(@as(u32, 0), state.entry.load(.acquire) & Shim.entry_count_mask);
+}
+
+test "B1b: a release thunk still forwards after the gate closes (#117)" {
+    // Group (b): wake/release never refuses. futexWake post-gate must still wake
+    // a waiter (refusing it would hang entryCloseAndDrain). Verify the forward
+    // runs: a waiter on `word` is woken by a post-gate futexWake.
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    const ud: ?*anyopaque = @ptrCast(&state);
+    var word: std.atomic.Value(u32) = .init(0);
+
+    const Waiter = struct {
+        fn run(tio: Io, w: *std.atomic.Value(u32)) void {
+            // Block until the value changes from 0 (uncancelable, like a mutex).
+            tio.vtable.futexWaitUncancelable(tio.userdata, &w.raw, 0);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Waiter.run, .{ state.threaded_io, &word });
+    // Close the gate (deinit-style), then release: store the new value and wake.
+    state.entryCloseAndDrain();
+    word.store(1, .release);
+    fwd.futexWake(ud, &word.raw, 1); // post-gate: must forward, not refuse
+    t.join(); // returns only if the wake forwarded; a refusal would hang here
+    try std.testing.expectEqual(@as(u32, 1), word.load(.acquire));
+}
+
+test "B1b: futexWake during deinit drains a counted waiter without hanging (#117)" {
+    // The deadlock regression claude named: a COUNTED consumer parked in
+    // futexWaitUncancelable whose waker arrives after the gate closes. The drain
+    // waits for the counted call; the post-gate futexWake must forward to wake
+    // it, or the drain hangs forever. Bounded by a watchdog so a refusal fails
+    // the test instead of hanging the suite.
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    const ud: ?*anyopaque = @ptrCast(&state);
+    var word: std.atomic.Value(u32) = .init(0);
+    var done: std.atomic.Value(u32) = .init(0);
+
+    const Counted = struct {
+        fn run(s: *Shim, w: *std.atomic.Value(u32), d: *std.atomic.Value(u32)) void {
+            // A counted consumer thunk (claims an entry slot, like a real call).
+            if (!s.entryEnter()) return;
+            defer s.entryExit();
+            s.threaded_io.vtable.futexWaitUncancelable(s.threaded_io.userdata, &w.raw, 0);
+            d.store(1, .release);
+            s.threaded_io.vtable.futexWake(s.threaded_io.userdata, &d.raw, 1);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Counted.run, .{ &state, &word, &done });
+    // Wait until the counted waiter has claimed its slot (entry count == 1).
+    const tio = state.threaded_io;
+    var spins: u32 = 0;
+    while (state.entry.load(.acquire) & Shim.entry_count_mask == 0) : (spins += 1) {
+        if (spins > 1_000_000) return error.TestUnexpectedResult;
+        std.atomic.spinLoopHint();
+    }
+    // Close the gate: the drain now waits for the counted waiter to return.
+    _ = state.entry.fetchOr(Shim.entry_closing, .acq_rel);
+    // Outside-thread wake during deinit (post-gate). Must forward (group b).
+    word.store(1, .release);
+    fwd.futexWake(ud, &word.raw, 1);
+    // Watchdog: the waiter signals `done` once it returns. If futexWake were
+    // refused, the waiter never wakes and this bounded wait errors -> fail.
+    const deadline = Io.Timeout{ .duration = .{ .raw = .fromNanoseconds(5 * std.time.ns_per_s), .clock = .awake } };
+    tio.vtable.futexWait(tio.userdata, &done.raw, 0, deadline) catch return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u32, 1), done.load(.acquire));
+    t.join();
+    // The counted call returned; the drain completes immediately.
+    state.entryCloseAndDrain();
+    try std.testing.expectEqual(@as(u32, 0), state.entry.load(.acquire) & Shim.entry_count_mask);
+}
+
+test "B1c: infallible value producers take the panic refusal path after deinit (#117)" {
+    // Group (c): async/await/cancel/now/random/etc. have no error channel, so a
+    // post-gate refusal must panic naming the contract, never return a fabricated
+    // value (null future, unwritten result, stale random bytes, zero timestamp).
+    // The 0.16 standalone test runner has no --test-filter, so the real @panic
+    // abort cannot be asserted in-suite portably; deadRefuse instead records the
+    // exact contract message under a test-only hook and the test asserts the
+    // refusal path fired. Production aborts via deadPanic (also covered by the
+    // stress suite and #108-style external rc=134 checks).
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    state.entryCloseAndDrain();
+    const ud: ?*anyopaque = @ptrCast(&state);
+
+    const Hook = struct {
+        var captured: ?[]const u8 = null;
+        fn record(msg: []const u8) void {
+            captured = msg;
+        }
+    };
+    test_dead_panic_hook = &Hook.record;
+    defer test_dead_panic_hook = null;
+
+    // Uniform void wrappers so the cases fit one table; args are unused post-gate
+    // (the refusal precedes the forward), so undefined placeholders are safe.
+    const W = struct {
+        fn async_(u: ?*anyopaque) void {
+            _ = fwd.async(u, undefined, undefined, undefined, undefined, undefined);
+        }
+        fn await_(u: ?*anyopaque) void {
+            fwd.await(u, undefined, undefined, undefined);
+        }
+        fn cancel_(u: ?*anyopaque) void {
+            fwd.cancel(u, undefined, undefined, undefined);
+        }
+        fn groupAsync_(u: ?*anyopaque) void {
+            fwd.groupAsync(u, undefined, undefined, undefined, undefined);
+        }
+        fn recancel_(u: ?*anyopaque) void {
+            fwd.recancel(u);
+        }
+        fn swap_(u: ?*anyopaque) void {
+            _ = fwd.swapCancelProtection(u, undefined);
+        }
+        fn now_(u: ?*anyopaque) void {
+            _ = fwd.now(u, undefined);
+        }
+        fn random_(u: ?*anyopaque) void {
+            fwd.random(u, undefined);
+        }
+        fn futexWaitU_(u: ?*anyopaque) void {
+            fwd.futexWaitUncancelable(u, undefined, undefined);
+        }
+    };
+    const Case = struct { name: []const u8, call: *const fn (?*anyopaque) void };
+    const cases = [_]Case{
+        .{ .name = "async", .call = W.async_ },
+        .{ .name = "await", .call = W.await_ },
+        .{ .name = "cancel", .call = W.cancel_ },
+        .{ .name = "groupAsync", .call = W.groupAsync_ },
+        .{ .name = "recancel", .call = W.recancel_ },
+        .{ .name = "swapCancelProtection", .call = W.swap_ },
+        .{ .name = "now", .call = W.now_ },
+        .{ .name = "random", .call = W.random_ },
+        .{ .name = "futexWaitUncancelable", .call = W.futexWaitU_ },
+    };
+    for (cases) |c| {
+        Hook.captured = null;
+        c.call(ud);
+        const msg = Hook.captured orelse return error.TestUnexpectedResult;
+        const expect = try std.fmt.allocPrint(
+            std.testing.allocator,
+            "Io.{s} used during or after deinit",
+            .{c.name},
+        );
+        defer std.testing.allocator.free(expect);
+        try std.testing.expectEqualStrings(expect, msg);
+    }
+}
+
+test "close in flight must not let a resolved handle read a recycled fd (#115 poison)" {
+    // Bug reproduction (fails on master eb9b6a4, passes here). A consumer
+    // resolves a Born handle, then a close drives. On master lookupBorn is
+    // non-counting, so closeDrive closes the descriptor immediately even though
+    // the consumer still holds the handle; the fd number is then recycled by a
+    // fresh socketpair, and the next read thunk forwards to Threaded onto the
+    // recycled fd and reads ITS data (a wrong-socket read). Here the counting
+    // lookup holds `users`, closeDrive defers, and the read refuses `.closing`
+    // with Unexpected without touching the descriptor. Uses only API common to
+    // master and this branch (lookupBorn's result is discarded; it compiles
+    // against both the ?u32 and the counting SockLookup signatures).
+    if (is_windows) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    state.port = &port;
+    try testNetGrow(&state, 1);
+    defer state.netFreeChunks();
+    try state.registryInit();
+    defer state.registryDeinit();
+
+    const fd = try compat.socket(compat.AF.UNIX, compat.SOCK.STREAM, 0);
+    defer compat.close(fd);
+    const index = try state.sockAllocLocked();
+    const s = state.sockAt(index).?;
+    s.generation +%= 1;
+    s.occupied = true;
+    s.index = index;
+    s.handle = fd;
+    s.plain.sock = fd; // sockRetire's POSIX deinit closes this
+    try state.registerHandle(fd, index);
+
+    // A consumer resolves the handle (branch: claims a counting hold; master:
+    // plain lookup). The result is intentionally discarded — the hold, where it
+    // exists, must keep the descriptor alive across the close.
+    _ = state.lookupBorn(fd);
+
+    var close_op: NetOp = .{ .kind = .close, .sock_index = index, .payload = .{ .close = {} } };
+    close_op.slot_index = try state.netAllocSlotLocked();
+    state.netSlotAt(close_op.slot_index).op = &close_op;
+    state.closeDrive(&close_op);
+
+    // Recycle the fd number with a fresh connected pair carrying a marker. On
+    // master fd was just closed, so the lowest-free fd (sp[0]) equals fd; here
+    // fd is still open (deferred close), so sp[0] is a different number.
+    var sp: [2]compat.fd_t = undefined;
+    if (std.c.socketpair(compat.AF.UNIX, compat.SOCK.STREAM, 0, &sp) != 0)
+        return error.TestUnexpectedResult;
+    defer {
+        compat.close(sp[0]);
+        compat.close(sp[1]);
+    }
+    _ = try compat.write(sp[1], "RECYCLED");
+
+    // A read arrives on the original handle. It must refuse with Unexpected,
+    // never forward onto a closed/recycled descriptor. Master forwards and
+    // returns the marker bytes (success), failing this assertion. The read
+    // slot is netRead on 0.16 and operate(.net_read) on 0.17.
+    var buf: [64]u8 = undefined;
+    var data = [_][]u8{&buf};
+    const ud: ?*anyopaque = @ptrCast(&state);
+    if (is_017) {
+        const result = try net017.operate(ud, .{ .net_read = .{ .socket_handle = fd, .data = &data } });
+        switch (result) {
+            .net_read => |r| try std.testing.expectError(error.Unexpected, r),
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        try std.testing.expectError(error.Unexpected, net016.netRead(ud, fd, &data));
+    }
 }
