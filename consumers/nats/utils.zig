@@ -545,24 +545,19 @@ const suite_lock = if (builtin.os.tag == .windows) struct {
     // acquire in this process would also succeed; the guard keeps one hold.
     const path = "/tmp/born-nats-e2e.lock";
     const wait_limit_ns: i96 = 15 * std.time.ns_per_min; // 900 s, half the job timeout
-    const alarm_interval_ns: i96 = std.time.ns_per_s;
-    const itimer_real: c_int = 0; // ITIMER_REAL
-
-    // setitimer is not declared in std for the BSDs; the layout matches
-    // <sys/time.h> (two timevals: repeating interval, initial value).
-    const Itimerval = extern struct {
-        it_interval: std.c.timeval,
-        it_value: std.c.timeval,
-    };
-    extern "c" fn setitimer(which: c_int, new: *const Itimerval, old: ?*Itimerval) c_int;
 
     var lock_fd: ?std.posix.fd_t = null;
 
     fn acquire() !void {
         if (lock_fd != null) return;
         const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDWR, .CREAT = true }, 0o666);
-        errdefer _ = std.c.close(fd);
-        try flockBounded(fd, path, wait_limit_ns);
+        flockBounded(fd, path, wait_limit_ns) catch |err| {
+            // On timeout a detached helper may still acquire on this fd;
+            // leave it open (the kernel releases the lock at process exit).
+            // Other errors leave no live helper behind.
+            if (err != error.SuiteLockTimeout) _ = std.c.close(fd);
+            return err;
+        };
         lock_fd = fd;
         log.info("e2e suite lock acquired ({s})", .{path});
     }
@@ -583,27 +578,46 @@ const suite_lock = if (builtin.os.tag == .windows) struct {
         }
     }
 
-    fn nsToTimeval(ns: i96) std.c.timeval {
-        return .{
-            .sec = @intCast(@divTrunc(ns, std.time.ns_per_s)),
-            .usec = @intCast(@divTrunc(@mod(ns, std.time.ns_per_s), std.time.ns_per_us)),
-        };
+    // Heap-allocated: on timeout the helper is detached and may outlive the
+    // call frame. done: 0 pending, 1 acquired, 2 failed; err is written
+    // before the release store of done.
+    const WaitState = struct {
+        fd: std.posix.fd_t,
+        io: std.Io,
+        err: std.c.E = .SUCCESS,
+        done: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    };
+
+    fn lockHelper(st: *WaitState) void {
+        while (true) {
+            switch (std.posix.errno(std.c.flock(st.fd, std.c.LOCK.EX))) {
+                .SUCCESS => {
+                    st.done.store(1, .release);
+                    std.Io.futexWake(st.io, u32, &st.done.raw, 1);
+                    return;
+                },
+                .INTR => continue, // retry; the caller's deadline bounds the wait
+                else => |e| {
+                    st.err = e;
+                    st.done.store(2, .release);
+                    std.Io.futexWake(st.io, u32, &st.done.raw, 1);
+                    return;
+                },
+            }
+        }
     }
 
-    // Empty: the alarm exists only to interrupt the blocking flock with
-    // EINTR so the wait can re-check its deadline.
-    fn alarmHandler(sig: std.posix.SIG) callconv(.c) void {
-        _ = sig;
-    }
-
-    /// Bounded exclusive flock. A non-blocking try first; on contention the
-    /// thread blocks in flock(2) (a kernel lock wait, not a sleep loop) while
-    /// a repeating ITIMER_REAL alarm interrupts it with EINTR to re-check a
-    /// monotonic deadline. The wait is bounded by limit_ns plus one alarm
-    /// interval. SIGALRM is blocked on this thread outside the flock call and
-    /// left blocked on return, so every thread the fixture spawns later
-    /// inherits the block and the process-directed alarm can only land on the
-    /// thread inside flock. The fixture uses SIGALRM for nothing else.
+    /// Bounded exclusive flock, no signals (review 697): a process-directed
+    /// alarm can land on any thread that does not block it, including the
+    /// fixture's long-lived Threaded workers, leaving the flock uninterruptible
+    /// and EINTR-ing unrelated syscalls. A non-blocking try first; on
+    /// contention a helper thread blocks in flock(2) (a kernel lock wait, not
+    /// a sleep loop) and reports through a futex word, while the caller waits
+    /// on that word against a CLOCK_MONOTONIC deadline. On timeout the helper
+    /// is detached and its state and fd are intentionally leaked: if it later
+    /// acquires, the kernel releases the lock when this process exits. The
+    /// caller is a failed leg about to exit, so the hold is bounded by the
+    /// process lifetime.
     fn flockBounded(fd: std.posix.fd_t, label: []const u8, limit_ns: i96) !void {
         switch (std.posix.errno(std.c.flock(fd, std.c.LOCK.EX | std.c.LOCK.NB))) {
             .SUCCESS => return,
@@ -615,67 +629,34 @@ const suite_lock = if (builtin.os.tag == .windows) struct {
         }
         log.info("e2e ports held by another suite; waiting on the suite lock ({s})", .{label});
 
-        var alrm: std.posix.sigset_t = std.posix.sigemptyset();
-        std.posix.sigaddset(&alrm, .ALRM);
-        std.posix.sigprocmask(std.posix.SIG.BLOCK, &alrm, null);
-
-        var old_act: std.posix.Sigaction = undefined;
-        const act: std.posix.Sigaction = .{
-            .handler = .{ .handler = &alarmHandler },
-            .flags = 0, // no SA_RESTART: the alarm must interrupt flock
-            .mask = std.posix.sigemptyset(),
+        const st = try std.heap.page_allocator.create(WaitState);
+        st.* = .{ .fd = fd, .io = blockingIo() };
+        const th = std.Thread.spawn(.{}, lockHelper, .{st}) catch |err| {
+            std.heap.page_allocator.destroy(st);
+            log.err("suite lock helper spawn ({s}) failed: {s}", .{ label, @errorName(err) });
+            return error.SuiteLockFailed;
         };
-        std.posix.sigaction(.ALRM, &act, &old_act);
-
-        // On every exit: disarm, discard any pending alarm (so it cannot land
-        // on the restored SIG_DFL and kill the process), restore the old
-        // action, and keep SIGALRM blocked for the inheritance discipline.
-        defer {
-            const zero: Itimerval = .{
-                .it_interval = .{ .sec = 0, .usec = 0 },
-                .it_value = .{ .sec = 0, .usec = 0 },
-            };
-            _ = setitimer(itimer_real, &zero, null);
-            const ign: std.posix.Sigaction = .{
-                .handler = .{ .handler = std.posix.SIG.IGN },
-                .flags = 0,
-                .mask = std.posix.sigemptyset(),
-            };
-            std.posix.sigaction(.ALRM, &ign, null);
-            std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &alrm, null);
-            std.posix.sigprocmask(std.posix.SIG.BLOCK, &alrm, null);
-            std.posix.sigaction(.ALRM, &old_act, null);
-        }
 
         const deadline = monoNowNs() + limit_ns;
-        const timer: Itimerval = .{
-            .it_interval = nsToTimeval(alarm_interval_ns),
-            .it_value = nsToTimeval(@min(limit_ns, alarm_interval_ns)),
-        };
-        const timer_rc = setitimer(itimer_real, &timer, null);
-        if (timer_rc != 0) {
-            log.err("setitimer for the suite lock wait ({s}) failed: {s}", .{ label, std.enums.tagName(std.posix.E, std.posix.errno(timer_rc)) orelse "unknown" });
-            return error.SuiteLockFailed;
-        }
-
         while (true) {
-            std.posix.sigprocmask(std.posix.SIG.UNBLOCK, &alrm, null);
-            const rc = std.c.flock(fd, std.c.LOCK.EX);
-            const e = std.posix.errno(rc);
-            std.posix.sigprocmask(std.posix.SIG.BLOCK, &alrm, null);
-            switch (e) {
-                .SUCCESS => return,
-                .INTR => {
-                    if (monoNowNs() >= deadline) {
-                        log.err("e2e suite lock wait timed out after {d} s: {s}", .{ @divTrunc(limit_ns, std.time.ns_per_s), label });
-                        return error.SuiteLockTimeout;
-                    }
-                },
-                else => {
-                    log.err("flock({s}) failed while waiting: {s}", .{ label, std.enums.tagName(std.posix.E, e) orelse "unknown" });
-                    return error.SuiteLockFailed;
-                },
+            const w = st.done.load(.acquire);
+            if (w != 0) {
+                th.join();
+                const e = st.err;
+                std.heap.page_allocator.destroy(st);
+                if (w == 1) return;
+                log.err("flock({s}) failed while waiting: {s}", .{ label, std.enums.tagName(std.posix.E, e) orelse "unknown" });
+                return error.SuiteLockFailed;
             }
+            const remaining = deadline - monoNowNs();
+            if (remaining <= 0) {
+                th.detach(); // st and fd intentionally leaked; see doc comment
+                log.err("e2e suite lock wait timed out after {d} s: {s}", .{ @divTrunc(limit_ns, std.time.ns_per_s), label });
+                return error.SuiteLockTimeout;
+            }
+            // futexWaitTimeout returns normally on wake AND on timeout; the
+            // loop re-checks the word and the deadline (spurious wakes too).
+            try std.Io.futexWaitTimeout(st.io, u32, &st.done.raw, 0, ioTimeout(std.Io.Duration.fromNanoseconds(remaining)));
         }
     }
 };
@@ -707,11 +688,14 @@ const suite_lock_wait_test = if (builtin.os.tag == .windows) struct {
         const target = try std.posix.openat(std.posix.AT.FDCWD, path_z, .{ .ACCMODE = .RDWR }, 0o600);
         defer _ = std.c.close(target);
 
-        // Contended: the bounded wait must time out (exercising the SIGALRM
-        // EINTR path), not block forever.
+        // Contended: the bounded wait must time out (helper thread + futex
+        // deadline), not block forever. The timed-out helper is detached and
+        // may still acquire on the target's OFD after the holder releases.
         try std.testing.expectError(error.SuiteLockTimeout, suite_lock.flockBounded(target, path, 300 * std.time.ns_per_ms));
 
-        // Release the holder; the same fd now acquires.
+        // Release the holder; the same fd now acquires. flock does not
+        // self-contend within one OFD, so this succeeds whether or not the
+        // detached helper got there first.
         if (std.c.flock(holder, std.c.LOCK.UN) != 0) return error.Unexpected;
         try suite_lock.flockBounded(target, path, 300 * std.time.ns_per_ms);
         if (std.c.flock(target, std.c.LOCK.UN) != 0) return error.Unexpected;

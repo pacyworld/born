@@ -118,7 +118,10 @@ tarball, verified against a pinned SHA-256 and cached under
   version (three distinct dirs), and the core/example suites bind only
   port 0, never a fixed loopback port. Cold toolchain provision is atomic
   (private tmp dir + rename) so concurrent provisions cannot corrupt a
-  shared cache dir; the version guard rejects a wrong tree.
+  shared cache dir; the version guard rejects a wrong tree. A cache dir
+  left incomplete by pre-atomic provision code (present but without its
+  binary) is not auto-cleared: the version guard fails loudly on it, and
+  the dir must be removed once by hand.
 - The runtime jobs need no Zig. Each checks the executable's sha256
   against the build, prints the host kernel or OS version and the commit,
   and ends with a `runtime evidence (...)` line holding the test summary.
@@ -154,8 +157,12 @@ on Windows), serializing whole suites on the shared FreeBSD and Windows
 hosts. The wait is bounded at 15 minutes (half the 30-minute job timeout) and
 fails with a named error (`SuiteLockTimeout`, `SuiteLockFailed`,
 `SuiteLockCreateFailed`/`SuiteLockWaitFailed` on Windows) instead of hanging
-until the job timeout; acquisition logs a line. The kernel releases the lock
-when the holder exits, so a crashed or cancelled leg cannot wedge the host.
+until the job timeout; acquisition logs a line. POSIX uses no signals: a
+helper thread blocks in flock(2) and the caller waits on a futex word
+against a monotonic deadline; on timeout the helper is detached and the
+kernel releases any lock it later acquires when the failed leg exits. The
+kernel releases the lock when the holder exits, so a crashed or cancelled
+leg cannot wedge the host.
 Linux suite legs run in per-job containers with private network namespaces
 and a private `/tmp`, so the lock never contends there. Toolchain and
 nats-server caches provision atomically (private tmp dir + rename), as in
