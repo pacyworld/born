@@ -1120,9 +1120,13 @@ pub const Shim = struct {
         return @errorFromInt(code);
     }
 
-    /// Entry-gate bit layout: bit 31 = closing, bits 0..30 = in-flight count.
+    /// Entry-gate bit layout: bit 31 = closing, bit 30 = dead, bits 0..29 =
+    /// in-flight count. `closing` refuses new consumer entries; `dead` is set
+    /// only after the drain completes (before `threaded.deinit`) and stops
+    /// release thunks from counting, since Threaded is about to be freed.
     const entry_closing: u32 = 1 << 31;
-    const entry_count_mask: u32 = entry_closing - 1;
+    const entry_dead: u32 = 1 << 30;
+    const entry_count_mask: u32 = entry_dead - 1;
 
     /// Claim an in-flight slot at consumer-thunk entry, before any route mutex,
     /// `threaded_io` or descriptor touch. Returns false once `deinit` has set
@@ -1139,10 +1143,27 @@ pub const Shim = struct {
         }
     }
 
+    /// Claim an in-flight slot for a wake/release thunk. Unlike `entryEnter`,
+    /// this counts through the drain window (`closing` set, Threaded still
+    /// alive): release contracts must hold until `threaded.deinit` runs
+    /// (unlockStderr releasing a counted lockStderr waiter, groupCancel awaiting
+    /// its tasks, fileClose closing fds). Only `dead`, set after the drain,
+    /// makes the call uncounted. The CAS pairs the dead check with the increment
+    /// so no release slips in between the drain's zero-count check and its dead
+    /// store (review 6231).
+    fn releaseEnter(self: *Shim) bool {
+        var w = self.entry.load(.monotonic);
+        while (true) {
+            if (w & entry_dead != 0) return false;
+            std.debug.assert(w & entry_count_mask < entry_count_mask);
+            w = self.entry.cmpxchgWeak(w, w + 1, .acq_rel, .monotonic) orelse return true;
+        }
+    }
+
     /// Release an in-flight slot at consumer-thunk return. When the last caller
     /// exits, wake the teardown drain. The fetchSub touches only the count bits
-    /// (the closing bit, once set, stays set); the wake is address-keyed and
-    /// never reads the word, mirroring the retire wake discipline.
+    /// (the closing and dead bits, once set, stay set); the wake is address-keyed
+    /// and never reads the word, mirroring the retire wake discipline.
     fn entryExit(self: *Shim) void {
         const prev = self.entry.fetchSub(1, .acq_rel);
         if (prev & entry_count_mask == 1) {
@@ -1150,18 +1171,24 @@ pub const Shim = struct {
         }
     }
 
-    /// Teardown drain: set the closing gate, then wait until every in-flight
-    /// consumer thunk has returned. Event-driven (futex on the entry word, no
-    /// timer or poll): no call can enter after the gate is set, so the count
-    /// only falls to zero. `threaded_io` is still live here (before
-    /// `threaded.deinit`); the loop has already retired the parked operations
-    /// that those thunks were waiting on, so each returns and decrements.
+    /// Teardown drain: set the closing gate, wait until every in-flight thunk
+    /// has returned, then set `dead` before `threaded.deinit`. Event-driven
+    /// (futex on the entry word, no timer or poll). Consumer entries refuse once
+    /// `closing` is set, but release thunks still count through the drain window,
+    /// so the count can rise again until `dead` is stored. The final CAS pairs
+    /// the zero-count check with the dead store: a release that observes !dead
+    /// increments first, failing the CAS, and the drain waits for it too.
+    /// `threaded_io` is live throughout (before `threaded.deinit`); the loop has
+    /// already retired the parked operations the thunks were waiting on.
     fn entryCloseAndDrain(self: *Shim) void {
-        _ = self.entry.fetchOr(entry_closing, .acq_rel);
+        var w = self.entry.fetchOr(entry_closing, .acq_rel) | entry_closing;
         while (true) {
-            const w = self.entry.load(.acquire);
-            if (w & entry_count_mask == 0) return;
+            if (w & entry_count_mask == 0) {
+                w = self.entry.cmpxchgWeak(w, w | entry_dead, .acq_rel, .acquire) orelse return;
+                continue;
+            }
             self.threaded_io.vtable.futexWaitUncancelable(self.threaded_io.userdata, &self.entry.raw, w);
+            w = self.entry.load(.acquire);
         }
     }
 
@@ -3680,9 +3707,10 @@ const fwd = struct {
     fn crashHandler(userdata: ?*anyopaque) void {
         const self = shimFrom(userdata);
         // Wake/release class (review 690 B1 group b): never refuse. Counted
-        // pre-gate so the drain protects an in-flight call; post-gate it still
-        // forwards (refusing a crash handler would strand teardown).
-        const entered = self.entryEnter();
+        // through the drain window so the drain protects an in-flight call;
+        // post-dead it still forwards uncounted (thread-local, stateless;
+        // refusing a crash handler would strand teardown).
+        const entered = self.releaseEnter();
         defer if (entered) self.entryExit();
         return self.threaded_io.vtable.crashHandler(self.threaded_io.userdata);
     }
@@ -3766,14 +3794,16 @@ const fwd = struct {
     }
     fn groupCancel(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) void {
         const self = shimFrom(userdata);
-        // Wake/release class (group b): never refuse; counted pre-gate only.
-        const entered = self.entryEnter();
+        // Wake/release class (group b): never refuse. Counted through the drain
+        // window so the forward waits for the group's running tasks before
+        // returning (the caller may free the group right after); only post-dead
+        // is it the no-op below.
+        const entered = self.releaseEnter();
         defer if (entered) self.entryExit();
-        // Post-gate no-op: Threaded.groupCancel waits on running tasks through
+        // Post-dead no-op: Threaded.groupCancel waits on running tasks through
         // the Threaded object (cancelThreads/signalAllCanceledSyscalls), which
         // deinit frees. deinit joins every worker, so no group task can still
-        // run after it and cancellation is vacuous; during the drain window
-        // deinit's join drains the tasks instead. The caller-owned group word
+        // run after it and cancellation is vacuous. The caller-owned group word
         // is left untouched.
         if (!entered) return;
         return self.threaded_io.vtable.groupCancel(self.threaded_io.userdata, group, token);
@@ -3812,9 +3842,10 @@ const fwd = struct {
         const self = shimFrom(userdata);
         // Wake/release class (group b): never refuse. A counted waiter blocked
         // in futexWaitUncancelable whose waker arrives during deinit MUST still
-        // be woken, or entryCloseAndDrain hangs forever (review 690 B1). The
-        // forward is a stateless futex wake on the caller's word, safe post-gate.
-        const entered = self.entryEnter();
+        // be woken, or entryCloseAndDrain hangs forever (review 690 B1). Counted
+        // through the drain window; the forward is a stateless futex wake on the
+        // caller's word, safe uncounted post-dead.
+        const entered = self.releaseEnter();
         defer if (entered) self.entryExit();
         return self.threaded_io.vtable.futexWake(self.threaded_io.userdata, ptr, max_waiters);
     }
@@ -3838,10 +3869,11 @@ const fwd = struct {
     }
     fn batchCancel(userdata: ?*anyopaque, batch: *Io.Batch) void {
         const self = shimFrom(userdata);
-        // Wake/release class (group b): never refuse; counted pre-gate only.
-        const entered = self.entryEnter();
+        // Wake/release class (group b): never refuse. Counted through the drain
+        // window so an in-flight cancel is drained before any free.
+        const entered = self.releaseEnter();
         defer if (entered) self.entryExit();
-        // Post-gate POSIX no-op: Threaded.batchCancel frees the batch's poll
+        // Post-dead POSIX no-op: Threaded.batchCancel frees the batch's poll
         // storage through t.allocator, which deinit frees; the caller-owned
         // storage leaks at instance teardown (bounded). The Windows path is
         // stateless (NtCancelIoFileEx on the caller's handles plus an
@@ -3912,7 +3944,9 @@ const fwd = struct {
     }
     fn dirClose(userdata: ?*anyopaque, dirs: []const Io.Dir) void {
         const self = shimFrom(userdata);
-        const entered = self.entryEnter(); // release class (group b): never refuse
+        // Release class (group b): never refuse; counted through the drain window,
+        // stateless close(2)/CloseHandle forward uncounted post-dead.
+        const entered = self.releaseEnter();
         defer if (entered) self.entryExit();
         return self.threaded_io.vtable.dirClose(self.threaded_io.userdata, dirs);
     }
@@ -4020,7 +4054,9 @@ const fwd = struct {
     }
     fn fileClose(userdata: ?*anyopaque, files: []const Io.File) void {
         const self = shimFrom(userdata);
-        const entered = self.entryEnter(); // release class (group b): never refuse
+        // Release class (group b): never refuse; counted through the drain window,
+        // stateless close(2)/CloseHandle forward uncounted post-dead.
+        const entered = self.releaseEnter();
         defer if (entered) self.entryExit();
         return self.threaded_io.vtable.fileClose(self.threaded_io.userdata, files);
     }
@@ -4122,7 +4158,9 @@ const fwd = struct {
     }
     fn fileUnlock(userdata: ?*anyopaque, file: Io.File) void {
         const self = shimFrom(userdata);
-        const entered = self.entryEnter(); // release class (group b): never refuse
+        // Release class (group b): never refuse; counted through the drain window,
+        // stateless flock/NtUnlockFile forward uncounted post-dead.
+        const entered = self.releaseEnter();
         defer if (entered) self.entryExit();
         return self.threaded_io.vtable.fileUnlock(self.threaded_io.userdata, file);
     }
@@ -4152,9 +4190,10 @@ const fwd = struct {
     }
     fn fileMemoryMapDestroy(userdata: ?*anyopaque, map: *Io.File.MemoryMap) void {
         const self = shimFrom(userdata);
-        const entered = self.entryEnter(); // release class (group b): never refuse
+        // Release class (group b): never refuse; counted through the drain window.
+        const entered = self.releaseEnter();
         defer if (entered) self.entryExit();
-        // Post-gate: a file-backed mapping (section non-null) destroys through
+        // Post-dead: a file-backed mapping (section non-null) destroys through
         // munmap / NtUnmapViewOfSection + CloseHandle, stateless, so it still
         // forwards. An anonymous mapping (section null) frees through
         // t.allocator, which deinit frees; skip it (bounded leak at teardown).
@@ -4205,9 +4244,12 @@ const fwd = struct {
     }
     fn unlockStderr(userdata: ?*anyopaque) void {
         const self = shimFrom(userdata);
-        const entered = self.entryEnter(); // release class (group b): never refuse
+        // Release class (group b): never refuse. Counted through the drain
+        // window: a counted lockStderr waiter may still be blocked on
+        // t.stderr_mutex, so this MUST forward to release it or the drain hangs.
+        const entered = self.releaseEnter();
         defer if (entered) self.entryExit();
-        // Post-gate no-op: the stderr lock, lock count and buffered writer are
+        // Post-dead no-op: the stderr lock, lock count and buffered writer are
         // Threaded fields that deinit destroys, so there is nothing left to
         // unlock or flush. lockStderr refuses post-gate (group a), so no new
         // lock can contend with the skipped unlock.
@@ -4252,9 +4294,10 @@ const fwd = struct {
     }
     fn childKill(userdata: ?*anyopaque, child: *std.process.Child) void {
         const self = shimFrom(userdata);
-        // Release class (group b): never refuse; counted pre-gate only. The
-        // Born-route override (process_route.childKill) handles Born children.
-        const entered = self.entryEnter();
+        // Release class (group b): never refuse; counted through the drain window,
+        // stateless kill forward uncounted post-dead. The Born-route override
+        // (process_route.childKill) handles Born children.
+        const entered = self.releaseEnter();
         defer if (entered) self.entryExit();
         return self.threaded_io.vtable.childKill(self.threaded_io.userdata, child);
     }
@@ -4402,9 +4445,10 @@ const fwd016 = if (!is_017) struct {
     }
     fn netClose(userdata: ?*anyopaque, handles: []const Io.net.Socket.Handle) void {
         const self = shimFrom(userdata);
-        // Release class (group b): never refuse; counted pre-gate only. This is
-        // the pure Threaded forward; the Born route override is net01x.netClose.
-        const entered = self.entryEnter();
+        // Release class (group b): never refuse; counted through the drain window,
+        // stateless close forward uncounted post-dead. This is the pure Threaded
+        // forward; the Born route override is net01x.netClose.
+        const entered = self.releaseEnter();
         defer if (entered) self.entryExit();
         return self.threaded_io.vtable.netClose(self.threaded_io.userdata, handles);
     }
@@ -4426,8 +4470,9 @@ const fwd017 = if (is_017) struct {
     }
     fn netClose(userdata: ?*anyopaque, sockets: []const Io.net.Socket) void {
         const self = shimFrom(userdata);
-        // Release class (group b): never refuse; counted pre-gate only.
-        const entered = self.entryEnter();
+        // Release class (group b): never refuse; counted through the drain window,
+        // stateless close forward uncounted post-dead.
+        const entered = self.releaseEnter();
         defer if (entered) self.entryExit();
         return self.threaded_io.vtable.netClose(self.threaded_io.userdata, sockets);
     }
@@ -7765,6 +7810,179 @@ test "B1b: futexWake during deinit drains a counted waiter without hanging (#117
     try std.testing.expectEqual(@as(u32, 0), state.entry.load(.acquire) & Shim.entry_count_mask);
 }
 
+test "B1b: drain-window unlockStderr releases a counted lockStderr waiter (#117)" {
+    // claude 6231: with closing set but Threaded still alive (the drain window),
+    // unlockStderr MUST forward. X holds the stderr lock; Y is a counted waiter
+    // blocked on t.stderr_mutex. A post-gate no-op never releases Y, so the drain
+    // hangs. releaseEnter counts the unlock through the drain window and forwards
+    // it; Y acquires and completes. Watchdog-bounded so a no-op fails, not hangs.
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    const ud: ?*anyopaque = @ptrCast(&state);
+    const tio = state.threaded_io;
+    var done: std.atomic.Value(u32) = .init(0);
+    var claimed: std.atomic.Value(u32) = .init(0);
+
+    // X (this thread) holds the stderr lock pre-gate.
+    _ = fwd.lockStderr(ud, null) catch return error.TestUnexpectedResult;
+
+    const Waiter = struct {
+        fn run(s: *Shim, iface: Io, d: *std.atomic.Value(u32), c: *std.atomic.Value(u32)) void {
+            // A counted pre-gate lockStderr waiter: claim the slot, signal it,
+            // then block on the real stderr mutex (held by X). The manual claim
+            // plus raw lock gives the provable claimed-before-gate handshake.
+            if (!s.entryEnter()) return;
+            defer s.entryExit();
+            c.store(1, .release);
+            iface.vtable.futexWake(iface.userdata, &c.raw, 1);
+            _ = iface.vtable.lockStderr(iface.userdata, null) catch {};
+            iface.vtable.unlockStderr(iface.userdata); // Y releases its own lock
+            d.store(1, .release);
+            iface.vtable.futexWake(iface.userdata, &d.raw, 1);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Waiter.run, .{ &state, tio, &done, &claimed });
+    // On any failure path, free Y and join it before threaded.deinit: a live
+    // waiter outliving `state` would dereference freed Threaded memory.
+    var joined = false;
+    defer {
+        if (!joined) {
+            // If Y never completed, X still holds the pre-gate lock (the no-op
+            // bug): release it raw so Y can finish and be joined.
+            if (done.load(.acquire) == 0) tio.vtable.unlockStderr(tio.userdata);
+            t.join();
+        }
+    }
+    // Wait until Y has claimed its slot (provably counted before the gate).
+    while (claimed.load(.acquire) == 0) {
+        tio.vtable.futexWait(tio.userdata, &claimed.raw, 0, .none) catch {};
+    }
+    // Close the gate: the drain window. Threaded is still alive.
+    _ = state.entry.fetchOr(Shim.entry_closing, .acq_rel);
+    // X unlocks AFTER the gate. Must forward (counted) to release Y.
+    fwd.unlockStderr(ud);
+    // Watchdog: Y signals done once it acquires and releases. A no-op unlock
+    // leaves Y blocked on the mutex forever, so this bounded wait fails.
+    const deadline = Io.Timeout{ .duration = .{ .raw = .fromNanoseconds(2 * std.time.ns_per_s), .clock = .awake } };
+    var attempts: u32 = 0;
+    while (done.load(.acquire) == 0) {
+        if (attempts >= 3) return error.TestUnexpectedResult;
+        attempts += 1;
+        tio.vtable.futexWait(tio.userdata, &done.raw, 0, deadline) catch {};
+    }
+    t.join();
+    joined = true;
+    // Both counted calls returned; the drain completes and sets dead.
+    state.entryCloseAndDrain();
+    try std.testing.expectEqual(@as(u32, 0), state.entry.load(.acquire) & Shim.entry_count_mask);
+    try std.testing.expect(state.entry.load(.acquire) & Shim.entry_dead != 0);
+}
+
+test "B1b: drain-window groupCancel returns only after its task finishes (#117)" {
+    // claude 6231: in the drain window groupCancel MUST forward and wait for the
+    // group's running tasks; a post-gate no-op returns at once, letting the caller
+    // free a group still in use. The task parks until released; C calls groupCancel
+    // post-gate. While the task is parked groupCancel must NOT return (a no-op
+    // would). Once the task is released and signals done, groupCancel returns, so
+    // done is provably set before the return. Watchdog-bounded throughout.
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    const ud: ?*anyopaque = @ptrCast(&state);
+    const tio = state.threaded_io;
+    var go: std.atomic.Value(u32) = .init(0);
+    var done: std.atomic.Value(u32) = .init(0);
+    var started: std.atomic.Value(u32) = .init(0);
+    var cancel_started: std.atomic.Value(u32) = .init(0);
+    var cancel_returned: std.atomic.Value(u32) = .init(0);
+    const deadline = Io.Timeout{ .duration = .{ .raw = .fromNanoseconds(5 * std.time.ns_per_s), .clock = .awake } };
+
+    const Ctx = struct {
+        iface: Io,
+        go: *std.atomic.Value(u32),
+        done: *std.atomic.Value(u32),
+        started: *std.atomic.Value(u32),
+    };
+    const Task = struct {
+        fn run(c: *const Ctx) void {
+            c.started.store(1, .release);
+            c.iface.vtable.futexWake(c.iface.userdata, &c.started.raw, 1);
+            // Park uncancelably until released: groupCancel must wait for this.
+            while (c.go.load(.acquire) == 0) {
+                c.iface.vtable.futexWaitUncancelable(c.iface.userdata, &c.go.raw, 0);
+            }
+            c.done.store(1, .release);
+            c.iface.vtable.futexWake(c.iface.userdata, &c.done.raw, 1);
+        }
+    };
+    var ctx: Ctx = .{ .iface = tio, .go = &go, .done = &done, .started = &started };
+    var group: Io.Group = .init;
+    // concurrent (not async) spawns a worker even on a single-core host, so the
+    // parked task never runs inline on this thread.
+    try group.concurrent(tio, Task.run, .{&ctx});
+    // Release the parked task on any exit (runs after the join defer below).
+    defer {
+        go.store(1, .release);
+        tio.vtable.futexWake(tio.userdata, &go.raw, 1);
+    }
+    // Wait until the task is running (num_running provably >= 1 before the gate).
+    var attempts: u32 = 0;
+    while (started.load(.acquire) == 0) {
+        if (attempts >= 3) return error.TestUnexpectedResult;
+        attempts += 1;
+        tio.vtable.futexWait(tio.userdata, &started.raw, 0, deadline) catch {};
+    }
+    // Close the gate: the drain window. Threaded is still alive.
+    _ = state.entry.fetchOr(Shim.entry_closing, .acq_rel);
+
+    const Canceler = struct {
+        fn run(u: ?*anyopaque, g: *Io.Group, cs: *std.atomic.Value(u32), cr: *std.atomic.Value(u32), iface: Io) void {
+            cs.store(1, .release);
+            iface.vtable.futexWake(iface.userdata, &cs.raw, 1);
+            fwd.groupCancel(u, g, @ptrCast(g));
+            cr.store(1, .release);
+            iface.vtable.futexWake(iface.userdata, &cr.raw, 1);
+        }
+    };
+    const tc = try std.Thread.spawn(.{}, Canceler.run, .{ ud, &group, &cancel_started, &cancel_returned, tio });
+    var joined = false;
+    defer {
+        if (!joined) {
+            go.store(1, .release);
+            tio.vtable.futexWake(tio.userdata, &go.raw, 1);
+            tc.join();
+        }
+    }
+    while (cancel_started.load(.acquire) == 0) {
+        tio.vtable.futexWait(tio.userdata, &cancel_started.raw, 0, .none) catch {};
+    }
+    // While the task is parked (go == 0), a forwarded groupCancel cannot return.
+    // A brief bounded wait must time out with cancel_returned still 0; a no-op
+    // returns at once, so cancel_returned is 1 while done is still 0 -> fail.
+    const probe = Io.Timeout{ .duration = .{ .raw = .fromNanoseconds(250 * std.time.ns_per_ms), .clock = .awake } };
+    tio.vtable.futexWait(tio.userdata, &cancel_returned.raw, 0, probe) catch {};
+    if (cancel_returned.load(.acquire) != 0) {
+        try std.testing.expectEqual(@as(u32, 1), done.load(.acquire));
+    }
+    // Release the task; the forwarded groupCancel now waits for it to finish.
+    go.store(1, .release);
+    tio.vtable.futexWake(tio.userdata, &go.raw, 1);
+    attempts = 0;
+    while (cancel_returned.load(.acquire) == 0) {
+        if (attempts >= 3) return error.TestUnexpectedResult;
+        attempts += 1;
+        tio.vtable.futexWait(tio.userdata, &cancel_returned.raw, 0, deadline) catch {};
+    }
+    // groupCancel returned; the task must have finished (signaled done) first.
+    try std.testing.expectEqual(@as(u32, 1), done.load(.acquire));
+    joined = true;
+    tc.join();
+    state.entryCloseAndDrain();
+    try std.testing.expectEqual(@as(u32, 0), state.entry.load(.acquire) & Shim.entry_count_mask);
+    try std.testing.expect(state.entry.load(.acquire) & Shim.entry_dead != 0);
+}
+
 test "B2: racing closer and releaser never lose the deferred-close wake (#117)" {
     // Store-buffer regression for the seq_cst ordering: closeDrive stores
     // closing then loads users; sockUserExit subtracts users then loads
@@ -7909,7 +8127,7 @@ test "B1b: release thunks after threaded.deinit touch no freed Threaded memory (
     // the embedded stack copy would only be scribbled by `t.* = undefined`).
     // The stateless forwards must still work; the thunks whose Threaded
     // implementation touches the object (groupCancel, batchCancel on POSIX,
-    // unlockStderr, anonymous fileMemoryMapDestroy) must take their post-gate
+    // unlockStderr, anonymous fileMemoryMapDestroy) must take their post-dead
     // no-op instead. The shim itself stays live on the stack.
     var state: Shim = undefined;
     testShim(&state);
@@ -7940,7 +8158,7 @@ test "B1b: release thunks after threaded.deinit touch no freed Threaded memory (
         fwd016.netClose(ud, &.{});
     }
 
-    // Post-gate no-ops: must return without touching the dead object, and
+    // Post-dead no-ops: must return without touching the dead object, and
     // must leave caller-owned state untouched.
     var group: Io.Group = Io.Group.init;
     var token: u8 = 0;
@@ -7962,7 +8180,7 @@ test "B1b: release thunks after threaded.deinit touch no freed Threaded memory (
     try std.testing.expectEqual(page, mm_anon.memory.len); // still ours: not destroyed
     std.heap.page_allocator.free(anon);
     // File-backed mapping (section non-null): the stateless munmap /
-    // INVALID_HANDLE_VALUE early-return path still forwards post-gate.
+    // INVALID_HANDLE_VALUE early-return path still forwards post-dead.
     const backed = try std.heap.page_allocator.alloc(u8, page);
     const backed_section: ?Io.File.MemoryMap.Section = if (comptime is_windows)
         std.os.windows.INVALID_HANDLE_VALUE
@@ -7972,8 +8190,8 @@ test "B1b: release thunks after threaded.deinit touch no freed Threaded memory (
     fwd.fileMemoryMapDestroy(ud, &mm_backed);
     if (is_windows) std.heap.page_allocator.free(backed); // early-return did not unmap
 
-    // The gate is intact and no counted call leaked in.
-    try std.testing.expectEqual(Shim.entry_closing, state.entry.load(.acquire));
+    // The gate is intact (closing + dead) and no counted call leaked in.
+    try std.testing.expectEqual(Shim.entry_closing | Shim.entry_dead, state.entry.load(.acquire));
 }
 
 test "B1c: infallible value producers take the panic refusal path after deinit (#117)" {
