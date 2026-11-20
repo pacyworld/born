@@ -1180,6 +1180,8 @@ pub const Shim = struct {
     /// increments first, failing the CAS, and the drain waits for it too.
     /// `threaded_io` is live throughout (before `threaded.deinit`); the loop has
     /// already retired the parked operations the thunks were waiting on.
+    /// Termination assumes finite drain-window releases: a caller looping on a
+    /// release thunk forever is misuse and would hold the count above zero.
     fn entryCloseAndDrain(self: *Shim) void {
         var w = self.entry.fetchOr(entry_closing, .acq_rel) | entry_closing;
         while (true) {
