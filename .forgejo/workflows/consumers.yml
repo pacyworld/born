@@ -71,8 +71,10 @@ jobs:
   # on 0.17.1 (born#109 tracks the port); the HTTP contract suite carries the
   # 0.17.1 consumer proof on both toolchains. The threaded route builds the
   # all-Threaded baseline/control executables (review 192 Q2/Q3: permanent
-  # legs, identical results required). max-parallel keeps the legs sequential
-  # on the shared host.
+  # legs, identical results required). Forgejo does not enforce
+  # strategy.max-parallel (it is not part of the workflow syntax), so legs
+  # run concurrently; the key is kept for forward compatibility. The e2e
+  # facade's host-global suite lock serializes the port-binding suites (#118).
   consumer-build:
     name: Consumer builds (zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }})
     runs-on: FreeBSD
@@ -214,8 +216,10 @@ jobs:
   # environ, so a bare name would resolve only against default_PATH, never
   # the step's PATH). No PATH plumbing is needed.
 
-  # FreeBSD runner: native kqueue. max-parallel keeps the legs sequential:
-  # the e2e topology binds fixed loopback ports (14222-14229).
+  # FreeBSD runner: native kqueue. The e2e topology binds fixed loopback
+  # ports (14222-14229). Forgejo does not enforce strategy.max-parallel, so
+  # legs run concurrently; the facade's host-global suite lock (held from
+  # up -d to down) serializes the suites on this shared host (#118).
   consumer-suite-freebsd:
     name: FreeBSD consumer suites (zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }})
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'

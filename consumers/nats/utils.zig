@@ -23,6 +23,7 @@
 // (review 192 carry-in 5).
 
 const std = @import("std");
+const builtin = @import("builtin");
 const nats = @import("nats");
 const consumer_env = @import("consumer_env");
 
@@ -456,7 +457,90 @@ fn portFree(io: std.Io, port: u16) bool {
     return false;
 }
 
+/// Host-global e2e suite lock (#118). The e2e topology binds fixed loopback
+/// ports (14222-14229, monitors 18222+), a host-global resource. Forgejo does
+/// not enforce strategy.max-parallel, so matrix legs and overlapping
+/// dispatches run concurrently on one runner host; without arbitration a
+/// leg's beforeAll sees a sibling leg's servers and fails with PortsNotFree.
+/// The lock is held from `up -d` (provisionUp) to `down` (provisionDown),
+/// serializing whole suites on the host. The kernel releases it when the
+/// holder exits, so a crashed or cancelled leg cannot wedge the host.
+/// stopAll's Child.kill reaps each server (Threaded childKill waits for
+/// exit), so the ports are free before the lock changes hands. Linux legs
+/// run in per-job containers with private network namespaces and a private
+/// /tmp, so the lock never contends there.
+const suite_lock = if (builtin.os.tag == .windows) struct {
+    // A named mutex in the Global namespace is host-wide across job
+    // sessions; like flock it is released by the kernel on holder death.
+    // WAIT_ABANDONED still grants ownership (the previous holder died).
+    const name = std.unicode.utf8ToUtf16LeStringLiteral("Global\\born-nats-e2e-suite");
+    const wait_object_0: u32 = 0x0;
+    const wait_abandoned: u32 = 0x80;
+    const infinite: u32 = 0xFFFFFFFF;
+
+    extern "kernel32" fn CreateMutexW(attrs: ?*anyopaque, initial_owner: c_int, mutex_name: ?[*:0]const u16) callconv(.winapi) ?*anyopaque;
+    extern "kernel32" fn WaitForSingleObject(handle: *anyopaque, milliseconds: u32) callconv(.winapi) u32;
+    extern "kernel32" fn ReleaseMutex(handle: *anyopaque) callconv(.winapi) c_int;
+    extern "kernel32" fn CloseHandle(handle: *anyopaque) callconv(.winapi) c_int;
+
+    var mutex: ?*anyopaque = null;
+
+    fn acquire() !void {
+        if (mutex != null) return;
+        const h = CreateMutexW(null, 0, name) orelse return error.Unexpected;
+        const status = WaitForSingleObject(h, 0);
+        if (status != wait_object_0 and status != wait_abandoned) {
+            log.info("e2e ports held by another suite; waiting on the suite lock", .{});
+            const waited = WaitForSingleObject(h, infinite);
+            if (waited != wait_object_0 and waited != wait_abandoned) {
+                _ = CloseHandle(h);
+                return error.Unexpected;
+            }
+        }
+        mutex = h;
+    }
+
+    fn release() void {
+        if (mutex) |h| {
+            _ = ReleaseMutex(h);
+            _ = CloseHandle(h);
+            mutex = null;
+        }
+    }
+} else struct {
+    // Same-user CI jobs share the file; 0666 keeps it openable if the runner
+    // account changes. flock is per open-file-description, so a second
+    // acquire in this process would also succeed; the guard keeps one hold.
+    const path = "/tmp/born-nats-e2e.lock";
+    var lock_fd: ?std.posix.fd_t = null;
+
+    fn acquire() !void {
+        if (lock_fd != null) return;
+        const fd = try std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDWR, .CREAT = true }, 0o666);
+        errdefer _ = std.c.close(fd);
+        switch (std.posix.errno(std.c.flock(fd, std.c.LOCK.EX | std.c.LOCK.NB))) {
+            .SUCCESS => {},
+            .AGAIN => { // EWOULDBLOCK == EAGAIN on both Linux and FreeBSD
+                log.info("e2e ports held by another suite; waiting on the suite lock", .{});
+                if (std.c.flock(fd, std.c.LOCK.EX) != 0) return error.Unexpected;
+            },
+            else => return error.Unexpected,
+        }
+        lock_fd = fd;
+    }
+
+    fn release() void {
+        if (lock_fd) |fd| {
+            _ = std.c.flock(fd, std.c.LOCK.UN);
+            _ = std.c.close(fd);
+            lock_fd = null;
+        }
+    }
+};
+
 fn provisionUp(allocator: std.mem.Allocator) !void {
+    try suite_lock.acquire();
+    errdefer suite_lock.release();
     try checkServerVersion(allocator);
     const io = blockingIo();
     for (required_free_ports) |port| {
@@ -483,6 +567,7 @@ fn provisionUp(allocator: std.mem.Allocator) !void {
 }
 
 fn provisionDown() !void {
+    defer suite_lock.release();
     stopAll();
     // deleteTree is a silent no-op when the path does not exist.
     try std.Io.Dir.cwd().deleteTree(blockingIo(), store_root);
