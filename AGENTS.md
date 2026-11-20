@@ -150,13 +150,17 @@ llvm-symbolizer --obj=born-tests.exe 0x<offset>
 These run weekly and on `workflow_dispatch`, never on push/PR, so they do not
 gate a commit. Both pin Zig 0.15.2 on the FreeBSD runner.
 
-- **Stress (#45 repro shape):** `bench/stress.sh BIN RUNS [HOGS]` runs the suite
-  RUNS times (default 500) with HOGS CPU busy-loops beside it, on FreeBSD and
-  Linux. HOGS defaults to `ncpu + ncpu/2` (~1.5x the core count, #45's original
-  load ratio) derived per host; pass HOGS via dispatch to override. It records
-  `vm.loadavg` (`/proc/loadavg` on Linux) at the start, each 50-run progress
-  line, and the end. Any failure is a release blocker. It targets the listener
-  exhaustion-resume race and `timer_test` under load.
+- **Stress (#45 repro shape):** `bench/stress.sh BIN RUNS [HOGS] [RUN_TIMEOUT_S]`
+  runs the suite RUNS times (default 500) with HOGS CPU busy-loops beside it, on
+  FreeBSD and Linux. HOGS defaults to `ncpu + ncpu/2` (~1.5x the core count,
+  #45's original load ratio) derived per host; pass HOGS via dispatch to
+  override. Each run is bounded by `timeout -k 10 RUN_TIMEOUT_S` (default
+  300 s); a run that exceeds the bound is a hang, recorded as its own failure
+  class (rc=124, tallied as `hangs=N` in the progress and evidence lines)
+  instead of wedging the stress run. It records `vm.loadavg` (`/proc/loadavg`
+  on Linux) at the start, each 50-run progress line, and the end. Any failure,
+  hang included, is a release blocker. It targets the listener exhaustion-resume
+  race and `timer_test` under load.
 - **Benchmark regression (#31):** `bench.yml` runs `bench/suite.sh` with
   `SYSCALLS=truss` on a quiet FreeBSD runner, then `bench/regress.sh` compares
   the median syscalls/req and p50/p99 latency against `bench/thresholds.txt`.
