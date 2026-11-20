@@ -688,6 +688,7 @@ jobs:
           } else { "Defender cmdlets unavailable" }
 
       - name: Run HTTP contract suite
+        timeout-minutes: 5
         run: |
           cd "consumer-http\windows-${{ matrix.optimize }}\bin"
           $expected = (Get-Content http-contract.exe.sha256 -Raw).Split(' ')[0].Trim().ToUpperInvariant()
@@ -695,9 +696,9 @@ jobs:
           if ($actual -ne $expected) { throw "http-contract.exe sha256 $actual does not match the build ($expected)" }
           "http-contract.exe: OK ($actual)"
           "host: $([System.Environment]::OSVersion.VersionString), commit $env:GITHUB_SHA, zig ${{ matrix.zig }} ${{ matrix.optimize }} ${{ matrix.route }}"
-          cmd /c "http-contract.exe > http-contract.log 2>&1"
+          $env:TEST_VERBOSE = "2"
+          & .\http-contract.exe 2>&1 | Tee-Object -FilePath http-contract.log
           $rc = $LASTEXITCODE
-          Get-Content http-contract.log
           if ($rc -ne 0) { throw "http-contract.exe exited with $rc" }
           $summary = Select-String -Path http-contract.log -Pattern '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$'
           if (-not $summary) { throw "http-contract.exe printed no passing summary line" }

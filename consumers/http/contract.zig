@@ -469,6 +469,18 @@ test "connection refusal maps to the connect error, not a hang" {
     // No timeout: Windows refusal completions can exceed two seconds; the
     // contract is that the refusal surfaces as the declared connect error
     // rather than hanging.
+    // DIAGNOSTIC (not for merge): probe the raw Io.net connect before
+    // client.request to isolate a connect hang from a post-connect hang.
+    const target: Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+    std.debug.print("refusal-diag: raw connect start port={d}\n", .{port});
+    if (target.connect(io, .{ .mode = .stream })) |stream| {
+        var s = stream;
+        s.close(io);
+        std.debug.print("refusal-diag: raw connect SUCCEEDED spuriously\n", .{});
+    } else |err| {
+        std.debug.print("refusal-diag: raw connect err={s}\n", .{@errorName(err)});
+    }
+    std.debug.print("refusal-diag: client.request start\n", .{});
     const uri = try std.Uri.parse(url);
     if (client.request(.GET, uri, .{})) |req| {
         var r = req;
