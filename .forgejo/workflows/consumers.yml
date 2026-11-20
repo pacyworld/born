@@ -306,6 +306,30 @@ jobs:
           grep -q '^route proof: PASS$' nats-e2e.log || { echo "nats-e2e printed no route proof PASS line"; exit 1; }
           echo "runtime evidence (x86_64-freebsd, kqueue, nats-e2e, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $summary"
 
+      # Post-mortem for e2e provisioning failures (PortsNotFree stale
+      # servers, ServicesNotHealthy): dump the port owners, any nats-server
+      # processes, and the per-service stderr logs the facade keeps under
+      # .zig-cache/nats-test-store. Diagnostics only; never masks the
+      # original failure.
+      - name: e2e failure diagnostics (port owners, server logs)
+        if: failure() && matrix.zig == '0.16.0'
+        run: |
+          echo "=== listeners on e2e ports ==="
+          sockstat -l | grep -E '\.(1422[2-9]|1622[2-4]|1822[2-9])[[:space:]]' || echo none
+          echo "=== nats-server processes ==="
+          ps aux | grep '[n]ats-server' || echo none
+          store="consumer-nats-e2e/freebsd-${{ matrix.optimize }}/bin/.zig-cache/nats-test-store"
+          echo "=== server logs under $store ==="
+          if [ -d "$store" ]; then
+            for f in "$store"/*.log; do
+              [ -f "$f" ] || continue
+              echo "--- $f ---"
+              tail -40 "$f"
+            done
+          else
+            echo "no store directory"
+          fi
+
       - name: Run HTTP contract suite
         run: |
           set -eu
@@ -545,6 +569,41 @@ jobs:
           $proof = Select-String -Path nats-e2e.log -Pattern '^route proof: PASS$'
           if (-not $proof) { throw "nats-e2e.exe printed no route proof PASS line" }
           "runtime evidence (x86_64-windows-gnu, IOCP, nats-e2e, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $($summary.Line)"
+
+      # Post-mortem for e2e provisioning failures (ServicesNotHealthy: the
+      # pinned server spawns but never listens): re-check the binary, list
+      # nats-server processes and e2e-port listeners, dump the per-service
+      # stderr logs the facade keeps under .zig-cache\nats-test-store, and
+      # surface recent Defender detections (quarantine can remove the exe
+      # after the provision-time version check). Diagnostics only; every
+      # probe is guarded so the step never masks the original failure.
+      - name: e2e failure diagnostics (server logs, binary, processes)
+        if: failure() && matrix.zig == '0.16.0'
+        run: |
+          $ErrorActionPreference = 'Continue'
+          "=== nats-server binary (NATS_SERVER=$env:NATS_SERVER) ==="
+          if ($env:NATS_SERVER -and (Test-Path $env:NATS_SERVER)) {
+            (Get-FileHash $env:NATS_SERVER -Algorithm SHA256).Hash
+            & $env:NATS_SERVER --version
+          } else { "NATS_SERVER unset or missing" }
+          "=== nats-server processes ==="
+          Get-Process nats-server -ErrorAction SilentlyContinue | Format-Table Id, StartTime, Path -AutoSize | Out-String
+          "=== listeners on e2e ports ==="
+          Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue |
+            Where-Object { ($_.LocalPort -ge 14222 -and $_.LocalPort -le 14229) -or ($_.LocalPort -ge 16222 -and $_.LocalPort -le 16224) -or ($_.LocalPort -ge 18222 -and $_.LocalPort -le 18229) } |
+            Format-Table LocalAddress, LocalPort, OwningProcess -AutoSize | Out-String
+          $store = "consumer-nats-e2e\windows-${{ matrix.optimize }}\bin\.zig-cache\nats-test-store"
+          "=== server logs under $store ==="
+          if (Test-Path $store) {
+            Get-ChildItem $store -File -ErrorAction SilentlyContinue | ForEach-Object {
+              "--- $($_.Name) ($($_.Length) bytes) ---"
+              if ($_.Extension -eq '.log') { Get-Content $_.FullName -Tail 60 -ErrorAction SilentlyContinue }
+            }
+          } else { "no store directory" }
+          "=== Defender recent detections ==="
+          if (Get-Command Get-MpThreatDetection -ErrorAction SilentlyContinue) {
+            Get-MpThreatDetection -ErrorAction SilentlyContinue | Select-Object -First 5 | Format-List | Out-String
+          } else { "Defender cmdlets unavailable" }
 
       - name: Run HTTP contract suite
         run: |
