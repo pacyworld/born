@@ -531,7 +531,8 @@ const suite_lock = if (builtin.os.tag == .windows) struct {
     // A named mutex in the Global namespace is host-wide across job
     // sessions; like flock it is released by the kernel on holder death.
     // WAIT_ABANDONED still grants ownership (the previous holder died).
-    const name = std.unicode.utf8ToUtf16LeStringLiteral("Global\\born-nats-e2e-suite");
+    const label = "Global\\born-nats-e2e-suite";
+    const name = std.unicode.utf8ToUtf16LeStringLiteral(label);
     const wait_limit_ms: u32 = 15 * 60 * 1000; // 900 s, half the job timeout
     const wait_object_0: u32 = 0x0;
     const wait_abandoned: u32 = 0x80;
@@ -545,43 +546,66 @@ const suite_lock = if (builtin.os.tag == .windows) struct {
 
     var mutex: ?*anyopaque = null;
 
-    fn logWin32(comptime what: []const u8, e: std.os.windows.Win32Error) void {
-        log.err("{s} for the e2e suite lock (Global\\born-nats-e2e-suite): {s} ({d})", .{
+    /// Owned mutex handle plus whether acquisition reported WAIT_ABANDONED
+    /// (the previous holder died owning it; ownership is still granted).
+    const Acquired = struct { handle: *anyopaque, abandoned: bool };
+
+    fn logWin32(comptime what: []const u8, lbl: []const u8, e: std.os.windows.Win32Error) void {
+        log.err("{s} for the e2e suite lock ({s}): {s} ({d})", .{
             what,
+            lbl,
             std.enums.tagName(std.os.windows.Win32Error, e) orelse "unknown",
             @intFromEnum(e),
         });
     }
 
-    fn acquire() !void {
-        if (mutex != null) return;
-        const h = CreateMutexW(null, 0, name) orelse {
-            logWin32("CreateMutexW failed", std.os.windows.GetLastError());
+    /// Create-or-open the named mutex and acquire ownership with a bounded
+    /// wait, returning the owned handle and whether a wait reported
+    /// WAIT_ABANDONED (the previous holder died owning it; ownership is still
+    /// granted). The caller releases and closes the handle. Pure: no global
+    /// state, so the regression test can exercise this exact path on a
+    /// throwaway per-pid name without disturbing the suite lock hold.
+    /// acquire() wraps this with the suite name and the global handle.
+    fn acquireMutex(mutex_name: [:0]const u16, limit_ms: u32, lbl: []const u8) !Acquired {
+        const h = CreateMutexW(null, 0, mutex_name) orelse {
+            logWin32("CreateMutexW failed", lbl, std.os.windows.GetLastError());
             return error.SuiteLockCreateFailed;
         };
         errdefer _ = CloseHandle(h);
         const status = WaitForSingleObject(h, 0);
         if (status == wait_failed) {
-            logWin32("WaitForSingleObject failed", std.os.windows.GetLastError());
+            logWin32("WaitForSingleObject failed", lbl, std.os.windows.GetLastError());
             return error.SuiteLockWaitFailed;
         }
+        var abandoned = status == wait_abandoned;
         if (status != wait_object_0 and status != wait_abandoned) {
-            log.info("e2e ports held by another suite; waiting on the suite lock", .{});
-            const waited = WaitForSingleObject(h, wait_limit_ms);
+            log.info("e2e ports held by another suite; waiting on the suite lock ({s})", .{lbl});
+            const waited = WaitForSingleObject(h, limit_ms);
             switch (waited) {
-                wait_object_0, wait_abandoned => {},
+                wait_object_0 => {},
+                wait_abandoned => abandoned = true,
                 wait_timeout => {
-                    log.err("e2e suite lock wait timed out after {d} ms: Global\\born-nats-e2e-suite", .{wait_limit_ms});
+                    log.err("e2e suite lock wait timed out after {d} ms: {s}", .{ limit_ms, lbl });
                     return error.SuiteLockTimeout;
                 },
                 else => {
-                    logWin32("WaitForSingleObject failed", std.os.windows.GetLastError());
+                    logWin32("WaitForSingleObject failed", lbl, std.os.windows.GetLastError());
                     return error.SuiteLockWaitFailed;
                 },
             }
         }
-        mutex = h;
-        log.info("e2e suite lock acquired (Global\\born-nats-e2e-suite)", .{});
+        return .{ .handle = h, .abandoned = abandoned };
+    }
+
+    fn acquire() !void {
+        if (mutex != null) return;
+        const r = try acquireMutex(name, wait_limit_ms, label);
+        mutex = r.handle;
+        if (r.abandoned) {
+            log.info("e2e suite lock acquired ({s}; previous holder died)", .{label});
+        } else {
+            log.info("e2e suite lock acquired ({s})", .{label});
+        }
     }
 
     fn release() void {
@@ -723,14 +747,120 @@ const suite_lock = if (builtin.os.tag == .windows) struct {
     }
 };
 
-/// Bounded-wait regression for the suite lock (#118, review 694 point 2).
-/// POSIX-only: a named Windows mutex is recursive per thread, so an
-/// in-process holder cannot contend with itself; the Windows bounded wait is
-/// exercised by the Windows CI legs instead. Uses a throwaway lock file, not
-/// the suite lock path, which provisionUp holds for the whole suite.
+/// Bounded-wait regression for the suite lock (#118, review 694 point 2;
+/// Windows coverage per #125 review 6376). Both kernels use a throwaway
+/// per-pid name, not the suite lock path/name, which provisionUp holds for
+/// the whole suite. POSIX contends two open file descriptions on one file;
+/// Windows contends two threads on one named mutex (ownership is per thread,
+/// so a same-thread holder would recurse rather than contend, hence the
+/// helper thread). Both exercise the production bounded-acquire path.
 const suite_lock_wait_test = if (builtin.os.tag == .windows) struct {
+    const Holder = struct {
+        io: std.Io,
+        name: [:0]const u16,
+        abandon: bool,
+        ready: std.atomic.Value(u32) = .init(0), // 0 pending, 1 holding, 2 create-failed
+        release_req: std.atomic.Value(u32) = .init(0),
+        released: std.atomic.Value(u32) = .init(0),
+    };
+
+    fn wake(io: std.Io, word: *std.atomic.Value(u32)) void {
+        std.Io.futexWake(io, u32, &word.raw, 1);
+    }
+
+    // Block until the word leaves the expected value (futex wake, no sleep
+    // loop); mirrors the POSIX lockHelper reporting channel.
+    fn waitWord(io: std.Io, word: *std.atomic.Value(u32), expected: u32) void {
+        while (word.load(.acquire) == expected) {
+            std.Io.futexWait(io, u32, &word.raw, expected) catch return;
+        }
+    }
+
+    fn holderMain(h: *Holder) void {
+        // Create-or-open without initial_owner, then take ownership with a
+        // zero-timeout checked wait: CreateMutexW ignores initial_owner when
+        // the mutex already exists (the abandoned phase's keepalive created
+        // it). The mutex is unowned in both phases so the wait succeeds at
+        // once; on failure signal ready=2 (the defer closes the handle). The
+        // check keeps ready=1 meaningful and the zero timeout avoids a hang.
+        const m = suite_lock.CreateMutexW(null, 0, h.name) orelse {
+            h.ready.store(2, .release);
+            wake(h.io, &h.ready);
+            return;
+        };
+        defer _ = suite_lock.CloseHandle(m);
+        if (suite_lock.WaitForSingleObject(m, 0) != suite_lock.wait_object_0) {
+            h.ready.store(2, .release);
+            wake(h.io, &h.ready);
+            return;
+        }
+        h.ready.store(1, .release);
+        wake(h.io, &h.ready);
+        if (h.abandon) return; // thread death without ReleaseMutex abandons
+        waitWord(h.io, &h.release_req, 0);
+        _ = suite_lock.ReleaseMutex(m);
+        h.released.store(1, .release);
+        wake(h.io, &h.released);
+    }
+
     fn run() !void {
-        return error.SkipZigTest;
+        const allocator = std.testing.allocator;
+        const io = blockingIo();
+        var name_buf: [96]u8 = undefined;
+        const lbl = try std.fmt.bufPrint(&name_buf, "Global\\born-nats-e2e-lock-test-{d}", .{std.os.windows.GetCurrentProcessId()});
+        const name = try std.unicode.utf8ToUtf16LeAllocZ(allocator, lbl);
+        defer allocator.free(name);
+
+        // Contended: the helper thread holds the mutex, so the main thread's
+        // short bounded acquire must time out (SuiteLockTimeout), not block
+        // forever and not recurse into the helper's hold.
+        var holder: Holder = .{ .io = io, .name = name, .abandon = false };
+        const th = try std.Thread.spawn(.{}, holderMain, .{&holder});
+        // Every exit releases the helper and joins it once, so a failing
+        // assertion leaves no stuck thread holding the mutex for the suite.
+        defer {
+            holder.release_req.store(1, .release);
+            wake(io, &holder.release_req);
+            th.join();
+        }
+        waitWord(io, &holder.ready, 0);
+        try std.testing.expectEqual(@as(u32, 1), holder.ready.load(.acquire));
+        try std.testing.expectError(error.SuiteLockTimeout, suite_lock.acquireMutex(name, 300, lbl));
+
+        // Release the helper; the same name now acquires cleanly (not
+        // abandoned: the helper released properly). The defer joins th.
+        holder.release_req.store(1, .release);
+        wake(io, &holder.release_req);
+        waitWord(io, &holder.released, 0);
+        const r1 = try suite_lock.acquireMutex(name, 300, lbl);
+        try std.testing.expect(!r1.abandoned);
+        _ = suite_lock.ReleaseMutex(r1.handle);
+        _ = suite_lock.CloseHandle(r1.handle);
+
+        // WAIT_ABANDONED grants ownership: a helper thread dies owning the
+        // mutex. A keepalive handle on the main thread keeps the mutex object
+        // alive across the helper's death so the abandonment is observable.
+        const keepalive = suite_lock.CreateMutexW(null, 0, name) orelse return error.Unexpected;
+        defer _ = suite_lock.CloseHandle(keepalive);
+        var abandoner: Holder = .{ .io = io, .name = name, .abandon = true };
+        const th2 = try std.Thread.spawn(.{}, holderMain, .{&abandoner});
+        // The abandoner exits on its own (no release request); join on every
+        // exit. The flag keeps the join single: the normal path joins before
+        // acquiring so the abandonment is observable, and a later failure must
+        // not join again.
+        var th2_joined = false;
+        errdefer {
+            if (!th2_joined) th2.join();
+        }
+        waitWord(io, &abandoner.ready, 0);
+        try std.testing.expectEqual(@as(u32, 1), abandoner.ready.load(.acquire));
+        th2.join(); // owning thread exited without ReleaseMutex -> abandoned
+        th2_joined = true;
+        // acquireMutex maps WAIT_ABANDONED to success and reports it.
+        const r2 = try suite_lock.acquireMutex(name, 300, lbl);
+        try std.testing.expect(r2.abandoned);
+        _ = suite_lock.ReleaseMutex(r2.handle);
+        _ = suite_lock.CloseHandle(r2.handle);
     }
 } else struct {
     fn run() !void {

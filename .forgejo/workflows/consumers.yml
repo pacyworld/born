@@ -642,6 +642,11 @@ jobs:
           New-Item -ItemType Directory -Force -Path tests | Out-Null
           Copy-Item -Recurse (Join-Path $env:GITHUB_WORKSPACE 'nats-configs') tests\configs
           "host: $([System.Environment]::OSVersion.VersionString), commit $env:GITHUB_SHA, zig ${{ matrix.zig }} ${{ matrix.optimize }} ${{ matrix.route }}"
+          # Surface the suite-lock regression test's diagnostics: name each
+          # test and disable passing-test log capture so the bounded wait's
+          # per-pid timeout line is visible (default capture hides it).
+          $env:TEST_VERBOSE = "1"
+          $env:TEST_LOG_CAPTURE = "0"
           cmd /c "nats-e2e.exe > nats-e2e.log 2>&1"
           $rc = $LASTEXITCODE
           Get-Content nats-e2e.log
