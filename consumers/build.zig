@@ -102,10 +102,12 @@ pub fn build(b: *std.Build) void {
     b.step("test-bin", "Install the consumer test executable without running it").dependOn(&install_unit.step);
 
     // e2e suite (design 7.2, Q4): the vendored upstream tests tree,
-    // hash-verified against the pin at configure time (carry-in 4), with
-    // exactly one difference in the generated tree: tests/utils.zig is the
-    // born-owned native-provisioning facade. Configs are verified too but
-    // read at runtime from the CWD (tests/configs), not compiled.
+    // hash-verified against the pin at configure time (carry-in 4). The
+    // generated tree replaces the born-owned overrides in e2e_overrides
+    // (the utils.zig provisioning facade and the #128 pending_msgs_test.zig
+    // race fix); the vendored originals stay byte-identical for provenance.
+    // Configs are verified too but read at runtime from the CWD
+    // (tests/configs), not compiled.
     const vendored = verifyVendoredTests(b);
     const e2e_root = generateE2eTree(b, vendored);
     const e2e_options = b.addOptions();
@@ -437,21 +439,53 @@ fn walkVerify(b: *std.Build, dir: std.Io.Dir, prefix: []const u8, entries: []con
 
 /// Generate the e2e tests tree from the verified bytes (review 665 N3: the
 /// tree that ran is the tree that was verified, by construction) plus the
-/// born-owned utils.zig facade, the only permitted difference (carry-in 4).
-/// Non-zig entries (configs) are verified but not copied: they are runtime
-/// reads relative to the CWD, which the run step sets to consumers/nats.
+/// born-owned overrides in e2e_overrides (carry-in 4 pattern). Non-zig
+/// entries (configs) are verified but not copied: they are runtime reads
+/// relative to the CWD, which the run step sets to consumers/nats.
 fn generateE2eTree(b: *std.Build, entries: []const VendoredEntry) std.Build.LazyPath {
     const wf = b.addWriteFiles();
     var all_tests: ?std.Build.LazyPath = null;
     for (entries) |e| {
         if (!std.mem.endsWith(u8, e.path, ".zig")) continue;
-        if (std.mem.eql(u8, e.path, "tests/utils.zig")) continue; // replaced by the facade
+        if (isOverridden(e.path)) continue; // replaced by a born-owned copy
         const lp = wf.add(e.path, e.bytes);
         if (std.mem.eql(u8, e.path, "tests/all_tests.zig")) all_tests = lp;
     }
     const root = buildRootPath(b);
-    const facade = std.Io.Dir.cwd().readFileAlloc(b.graph.io, b.pathJoin(&.{ root, "nats", "utils.zig" }), b.allocator, std.Io.Limit.limited(1 << 20)) catch |err|
-        std.debug.panic("consumers: cannot read nats/utils.zig facade ({s})", .{@errorName(err)});
-    _ = wf.add("tests/utils.zig", facade);
+    for (e2e_overrides) |o| {
+        // Review 724: the override must match the upstream bytes it was
+        // derived from. A missing vendored path or a changed hash means the
+        // pin moved; force a deliberate re-derive or drop instead of
+        // silently shadowing the new upstream file.
+        const base = for (entries) |e| {
+            if (std.mem.eql(u8, e.path, o.vendored)) break e;
+        } else std.debug.panic("consumers: override nats/{s} was derived from a different upstream {s}; re-derive it against the new pin or drop it", .{ o.owned, o.vendored });
+        if (!std.mem.eql(u8, o.base_sha256, base.hash[0..]))
+            std.debug.panic("consumers: override nats/{s} was derived from a different upstream {s}; re-derive it against the new pin or drop it", .{ o.owned, o.vendored });
+        const bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, b.pathJoin(&.{ root, "nats", o.owned }), b.allocator, std.Io.Limit.limited(1 << 20)) catch |err|
+            std.debug.panic("consumers: cannot read nats/{s} override ({s})", .{ o.owned, @errorName(err) });
+        _ = wf.add(o.vendored, bytes);
+    }
     return all_tests orelse @panic("consumers: vendored tree has no tests/all_tests.zig");
+}
+
+/// Born-owned overrides of vendored e2e files: the vendored original stays
+/// byte-identical for provenance and hash verification but is not compiled;
+/// the generated tree uses the born-owned copy from consumers/nats instead
+/// (carry-in 4). utils.zig is the native-provisioning facade (design 7.2,
+/// adjudicated Q4); pending_msgs_test.zig carries the #128 async-counter
+/// race fix, which must not drift the vendored upstream tree. base_sha256
+/// pins each override to the upstream bytes it was derived from (review
+/// 724): a pin bump that changes or removes the vendored file fails the
+/// build until the override is re-derived or dropped.
+const e2e_overrides = [_]struct { vendored: []const u8, owned: []const u8, base_sha256: []const u8 }{
+    .{ .vendored = "tests/utils.zig", .owned = "utils.zig", .base_sha256 = "bf61543fb6432aa90bddf15849175a4c164e2811f94ae96154f31184b3b973d2" },
+    .{ .vendored = "tests/pending_msgs_test.zig", .owned = "pending_msgs_test.zig", .base_sha256 = "beb4462f4bb69c254b4458d992d949fdd9b6c8a07f580aded3b7e741e2be0d98" },
+};
+
+fn isOverridden(vendored_path: []const u8) bool {
+    for (e2e_overrides) |o| {
+        if (std.mem.eql(u8, o.vendored, vendored_path)) return true;
+    }
+    return false;
 }

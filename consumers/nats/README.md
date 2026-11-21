@@ -16,12 +16,23 @@ byte-identical to the fetched tarball before vendoring.
 `manifest.sha256` records the upstream sha256 of every vendored file.
 `../build.zig` verifies every listed file at configure time and aborts on
 any mismatch or unlisted file (review 192 carry-in 4). The generated e2e
-tree is the verified vendored bytes with exactly one difference:
-`tests/utils.zig` is replaced by the born-owned facade in `utils.zig`
-(this directory), which implements the same public surface with native
-nats-server v2.15.0 provisioning instead of docker compose (design 7.2,
-adjudicated Q4). The vendored upstream `tests/utils.zig` is kept for
-provenance and hash verification; it is never compiled.
+tree is the verified vendored bytes with the born-owned overrides listed
+in `e2e_overrides` (`../build.zig`). Each vendored original is kept
+byte-identical for provenance and hash verification and is never compiled:
+
+- `tests/utils.zig` is replaced by the born-owned facade in `utils.zig`
+  (this directory), which implements the same public surface with native
+  nats-server v2.15.0 provisioning instead of docker compose (design 7.2,
+  adjudicated Q4).
+- `tests/pending_msgs_test.zig` is replaced by the born-owned copy in
+  `pending_msgs_test.zig` (this directory), which carries the #128 fix for
+  the async pending-counter race (see below). Its other tests are
+  unchanged from upstream.
+
+Each override entry pins the upstream sha256 it was derived from
+(`base_sha256`); `generateE2eTree` panics if the vendored path is missing
+from the verified tree or its hash differs, so a pin bump forces a
+deliberate re-derive or drop of each override (review 724).
 
 Runtime CWD contract (same as upstream): the e2e executable runs with a
 CWD containing `tests/configs/` (`TestUser.creds` is read relative to the
@@ -59,3 +70,28 @@ Tracking: born#118 (Windows nats evidence rows + W3). The upstream Zig
 issue body is prepared there; filing is pending while ziglang/zig
 restricts issue creation to collaborators, and the upstream link will be
 added here once filed.
+
+### Async pending-counter race in the vendored test (born#128)
+
+The upstream async test waits for `processed_count == 3` and then asserts
+`pending_msgs == 0` and `pending_bytes == 0`. The client's handler fiber
+(`src/subscription.zig` `handlerLoop`) calls the handler and only then
+`decrementPending`, so the counters can still be non-zero when the
+handler's last statement has run: the test infers a condition it does not
+wait for. The client is correct ("pending" includes the message in
+flight); the race is in the test. It surfaced on Windows with Zig 0.16.0
+on the born route in both Debug and ReleaseSafe (dispatch runs 483 and
+537).
+
+The born-owned copy waits bounded (200 x 10 ms) on `pending_msgs == 0`
+and `pending_bytes == 0` as its own condition, and prints
+`processed_count`, `pending_msgs` and `pending_bytes` with a label naming
+the assertion before each expect, so a future failure names its line. An
+"after processed wait" counter line prints between the processed wait and
+the pending wait (the observable race window), and the pending wait's
+iteration count prints after it; the `std.debug.print` output is
+intentional diagnostics. The final assertions are unchanged. The vendored
+original is not patched (same policy as W3 above). The override is pinned
+to the upstream hash it was derived from: a pin bump that changes the
+vendored file fails the build until the override is re-derived or dropped
+(review 724).
