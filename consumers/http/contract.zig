@@ -18,7 +18,9 @@
 // non-listening port; Windows refusal completions can exceed two seconds,
 // so no timeout is set); peer close mid-request surfaces a declared
 // peer-close error, never Unexpected, and the Born route stays alive (a
-// follow-up request on the same client succeeds).
+// follow-up request on the same client succeeds); fixture teardown is
+// deterministic and prompt even when a test fails early and never sends the
+// follow-up (interruptible accept, no join timeout, #126).
 
 const std = @import("std");
 const born_io = @import("born_io");
@@ -53,7 +55,9 @@ const Fixture = struct {
     behavior: Behavior,
     port: std.atomic.Value(u16) = .init(0),
     accepts: std.atomic.Value(u32) = .init(0),
+    events: std.atomic.Value(u32) = .init(0),
     failed: std.atomic.Value(bool) = .init(false),
+    exited: std.atomic.Value(bool) = .init(false),
     thread: ?std.Thread = null,
 
     fn start(f: *Fixture, behavior: Behavior) !void {
@@ -76,6 +80,77 @@ const Fixture = struct {
         if (f.thread) |t| t.join();
         f.thread = null;
     }
+
+    /// One wake connection: connect to the fixture's loopback port and close
+    /// immediately. A blocked accept returns a stream whose receiveHead sees
+    /// EOF (HttpConnectionClosing), so the fixture exits on its own. A refused
+    /// connect (listener already closed) is ignored.
+    fn wakeOnce(address: Io.net.IpAddress, io: Io) void {
+        if (address.connect(io, .{ .mode = .stream })) |stream| {
+            stream.close(io);
+        } else |_| {}
+    }
+
+    /// Number of accepts the behavior performs before it exits on EOF.
+    fn totalAccepts(behavior: Behavior) u32 {
+        return if (behavior == .peer_close_then_get) 2 else 1;
+    }
+
+    /// Record an event the teardown waiter cares about (an accept or the
+    /// fixture's exit) in the events futex word and wake any waiter. Every such
+    /// event MUST advance this word: waitReact compares-and-sleeps on it, so an
+    /// event that only set a separate flag (exited) without changing this word
+    /// would be a lost wakeup and hang teardown. The release publish pairs with
+    /// the waiter's acquire snapshot, so accepts is visible to the post-wait
+    /// check.
+    fn noteEvent(f: *Fixture, io: Io) void {
+        _ = f.events.fetchAdd(1, .release);
+        std.Io.futexWake(io, u32, &f.events.raw, 1);
+    }
+
+    /// Block until the fixture reacts to a wake: any accept or exit advances
+    /// the events word past the snapshot. Futex wait on events (noteEvent bumps
+    /// and wakes it on every accept and on exit), so the compare-and-sleep sees
+    /// the exit too; no sleep loop, no lost wakeup. accepts stays the count the
+    /// tests assert on.
+    fn waitReact(f: *Fixture, io: Io, snapshot: u32) void {
+        while (f.events.load(.acquire) == snapshot) {
+            std.Io.futexWait(io, u32, &f.events.raw, snapshot) catch return;
+        }
+    }
+
+    /// Wake any accept the fixture is blocked in, then join. The wake is a
+    /// loopback self-connect (closed immediately) on a dedicated plain Threaded
+    /// instance, independent of the client route under test: accept returns a
+    /// stream whose receiveHead sees EOF and the fixture exits on its own. No
+    /// join timeout, no leaked thread. Listener close cannot wake: FreeBSD
+    /// close() does not interrupt a blocked accept; Windows CloseHandle panics
+    /// std's netAcceptWindows (.CANCELLED => unreachable). shutdown() does not
+    /// wake on Windows (STATUS_INVALID_PARAMETER).
+    ///
+    /// Invariant: the events snapshot is taken before the exited check. An exit
+    /// before the snapshot is visible through the release/acquire pair, so
+    /// teardown joins directly with no connect; an exit after it advances events
+    /// past the snapshot, so waitReact returns. Either way teardown cannot hang.
+    /// A second wake is issued only if the fixture accepted again but has not
+    /// reached its final accept; after its last accept it exits on EOF itself,
+    /// so the regression path never pays a slow refused connect.
+    fn teardown(f: *Fixture) void {
+        const snapshot = f.events.load(.acquire);
+        const port = f.port.load(.monotonic);
+        if (port != 0 and !f.exited.load(.acquire)) {
+            var threaded = Io.Threaded.init(std.heap.page_allocator, .{});
+            defer threaded.deinit();
+            const io = threaded.io();
+            const address: Io.net.IpAddress = .{ .ip4 = .loopback(port) };
+            wakeOnce(address, io);
+            waitReact(f, io, snapshot);
+            if (!f.exited.load(.acquire) and f.accepts.load(.acquire) < totalAccepts(f.behavior)) {
+                wakeOnce(address, io);
+            }
+        }
+        f.join();
+    }
 };
 
 fn fixtureMain(f: *Fixture) void {
@@ -85,6 +160,10 @@ fn fixtureMain(f: *Fixture) void {
         std.log.err("http fixture ({s}) failed: {s}", .{ @tagName(f.behavior), @errorName(err) });
         f.failed.store(true, .monotonic);
     };
+    // fixtureMainInner's defer closed the listener before it returned, so the
+    // port is dead once this flag is set; teardown then skips the wake connect.
+    f.exited.store(true, .release);
+    f.noteEvent(threaded.io());
 }
 
 fn fixtureMainInner(f: *Fixture, io: Io) !void {
@@ -98,6 +177,7 @@ fn fixtureMainInner(f: *Fixture, io: Io) !void {
         // without responding: a peer close mid-request.
         var first = try listener.accept(io);
         _ = f.accepts.fetchAdd(1, .monotonic);
+        f.noteEvent(io);
         var rbuf: [64]u8 = undefined;
         var r = first.reader(io, &rbuf);
         // readSliceShort fills the destination or reads to end of stream.
@@ -111,6 +191,7 @@ fn fixtureMainInner(f: *Fixture, io: Io) !void {
 
     var stream = try listener.accept(io);
     _ = f.accepts.fetchAdd(1, .monotonic);
+    f.noteEvent(io);
     defer stream.close(io);
     try serveConnection(f, io, &stream, f.behavior == .keep_alive);
 }
@@ -271,7 +352,7 @@ test "GET round-trip: status, headers, body" {
     const io = testing.io;
     var f: Fixture = undefined;
     try f.start(.get);
-    defer f.join();
+    defer f.teardown();
     const port = try f.waitReady(io);
 
     const url = try urlFor(testing.allocator, port, "/hello");
@@ -299,7 +380,7 @@ test "POST request body is received and echoed" {
     const io = testing.io;
     var f: Fixture = undefined;
     try f.start(.post_echo);
-    defer f.join();
+    defer f.teardown();
     const port = try f.waitReady(io);
 
     const url = try urlFor(testing.allocator, port, "/echo");
@@ -325,7 +406,7 @@ test "chunked transfer-encoding both directions" {
     const io = testing.io;
     var f: Fixture = undefined;
     try f.start(.chunked_echo);
-    defer f.join();
+    defer f.teardown();
     const port = try f.waitReady(io);
 
     const url = try urlFor(testing.allocator, port, "/chunked");
@@ -362,14 +443,14 @@ test "keep-alive connection reuse across requests" {
     const io = testing.io;
     var f: Fixture = undefined;
     try f.start(.keep_alive);
-    defer f.join();
+    defer f.teardown();
     const port = try f.waitReady(io);
 
     const url = try urlFor(testing.allocator, port, "/keep");
     defer testing.allocator.free(url);
     var client: http.Client = .{ .allocator = testing.allocator, .io = io };
     // client.deinit closes the pool, which ends the fixture's accept loop;
-    // it must run before f.join (defer LIFO: join registered first).
+    // it must run before f.teardown (defer LIFO: teardown registered first).
     defer client.deinit();
 
     const uri = try std.Uri.parse(url);
@@ -395,7 +476,7 @@ test "large response body streaming (multi-buffer)" {
     const io = testing.io;
     var f: Fixture = undefined;
     try f.start(.large_response);
-    defer f.join();
+    defer f.teardown();
     const port = try f.waitReady(io);
 
     const url = try urlFor(testing.allocator, port, "/large");
@@ -423,7 +504,7 @@ test "large request body streaming" {
     const io = testing.io;
     var f: Fixture = undefined;
     try f.start(.large_request);
-    defer f.join();
+    defer f.teardown();
     const port = try f.waitReady(io);
 
     const url = try urlFor(testing.allocator, port, "/upload");
@@ -483,7 +564,7 @@ test "peer close mid-request: declared error, route stays alive" {
     const io = testing.io;
     var f: Fixture = undefined;
     try f.start(.peer_close_then_get);
-    defer f.join();
+    defer f.teardown();
     const port = try f.waitReady(io);
 
     const url = try urlFor(testing.allocator, port, "/close");
@@ -508,4 +589,118 @@ test "peer close mid-request: declared error, route stays alive" {
     try testing.expectEqualStrings(get_body, body);
     try testing.expectEqual(@as(u32, 2), f.accepts.load(.monotonic));
     try testing.expect(!f.failed.load(.monotonic));
+}
+
+test "fixture teardown is prompt when the follow-up never arrives (#126)" {
+    const io = testing.io;
+    var f: Fixture = undefined;
+    try f.start(.peer_close_then_get);
+    errdefer f.teardown();
+    const port = try f.waitReady(io);
+
+    const url = try urlFor(testing.allocator, port, "/close");
+    defer testing.allocator.free(url);
+    var client: http.Client = .{ .allocator = testing.allocator, .io = io };
+    defer client.deinit();
+
+    // Trigger the peer close, then never send the follow-up: the fixture is
+    // left blocked on its second accept. Any error from the first request is
+    // tolerated here; this test's contract is teardown promptness, not the
+    // peer-close error mapping (the sibling test owns that, and it fails on
+    // threaded Zig 0.16.0 Windows). On master the join below hangs forever;
+    // with the interruptible-accept fix it returns promptly on every kernel.
+    const uri = try std.Uri.parse(url);
+    expectPeerClose(&client, uri) catch {};
+
+    const t0 = Io.Timestamp.now(io, .awake);
+    f.teardown();
+    const elapsed_ns = Io.Timestamp.now(io, .awake).nanoseconds - t0.nanoseconds;
+    try testing.expect(elapsed_ns < 5 * std.time.ns_per_s);
+}
+
+test "fixture teardown has no lost-wakeup hang under interleaving (#126)" {
+    const io = testing.io;
+    // Regression bound for the teardown exit race: start a single-accept
+    // fixture, drive a full GET so it is finishing on its own, then teardown
+    // right as it exits. The no-hang guarantee comes from teardown's
+    // snapshot-before-exited-check ordering and the events word every accept
+    // and exit advances, not from the iteration count (most iterations take the
+    // exited fast path). teardown runs on a worker and each iteration is bounded
+    // by a futex timeout, so a reintroduced lost wakeup is a reportable failure,
+    // not a wedged suite.
+    const iterations = 3000;
+    const bound_ns: i96 = 5 * std.time.ns_per_s;
+    const gpa = std.heap.page_allocator;
+
+    const State = struct {
+        f: Fixture,
+        io: Io,
+        done: std.atomic.Value(u32) = .init(0),
+    };
+    const Worker = struct {
+        fn run(st: *State) void {
+            st.f.teardown();
+            st.done.store(1, .release);
+            std.Io.futexWake(st.io, u32, &st.done.raw, 1);
+        }
+    };
+
+    var i: usize = 0;
+    while (i < iterations) : (i += 1) {
+        const st = try gpa.create(State);
+        st.* = .{ .f = .{ .behavior = .get }, .io = io };
+        // Until the worker takes over, this frame owns teardown and the state.
+        var worker_owned = false;
+        defer {
+            if (!worker_owned) {
+                st.f.teardown();
+                gpa.destroy(st);
+            }
+        }
+        try st.f.start(.get);
+
+        const port = try st.f.waitReady(io);
+        const url = try urlFor(testing.allocator, port, "/");
+        defer testing.allocator.free(url);
+        var client: http.Client = .{ .allocator = testing.allocator, .io = io };
+        defer client.deinit();
+        const uri = try std.Uri.parse(url);
+        var req = try client.request(.GET, uri, .{});
+        defer req.deinit();
+        try req.sendBodiless();
+        var redirect_buf: [1024]u8 = undefined;
+        var resp = try req.receiveHead(&redirect_buf);
+        try testing.expectEqual(http.Status.ok, resp.head.status);
+        var transfer_buf: [4096]u8 = undefined;
+        const body = try readAll(resp.reader(&transfer_buf), testing.allocator);
+        defer testing.allocator.free(body);
+        try testing.expectEqualStrings(get_body, body);
+
+        // The fixture has served its one request and is exiting; teardown now
+        // races its exit path. The worker owns teardown from here.
+        const worker = try std.Thread.spawn(.{}, Worker.run, .{st});
+        worker_owned = true;
+        const deadline = Io.Timestamp.now(io, .awake).nanoseconds + bound_ns;
+        var finished = false;
+        while (true) {
+            if (st.done.load(.acquire) != 0) {
+                finished = true;
+                break;
+            }
+            const remaining = deadline - Io.Timestamp.now(io, .awake).nanoseconds;
+            if (remaining <= 0) break;
+            // Returns normally on wake AND on timeout; re-check the word and
+            // the deadline (spurious wakes too).
+            std.Io.futexWaitTimeout(io, u32, &st.done.raw, 0, .{ .duration = .{ .raw = std.Io.Duration.fromNanoseconds(remaining), .clock = .awake } }) catch break;
+        }
+        if (!finished) {
+            // Teardown hung: a lost wakeup. Detach the worker (it still
+            // references st, so st is intentionally leaked) and fail reportably.
+            worker.detach();
+            std.log.err("teardown lost-wakeup hang at iteration {d}/{d} (#126)", .{ i + 1, iterations });
+            return error.TeardownLostWakeup;
+        }
+        worker.join();
+        gpa.destroy(st);
+    }
 }
