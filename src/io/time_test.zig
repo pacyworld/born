@@ -31,6 +31,17 @@ fn elapsedNs(since: u64) error{Unsupported}!u64 {
     return (try born.nowNs()) - since;
 }
 
+/// Event-driven wait until `n` sleepers have submitted (#117, the #116
+/// pattern). A fixed sleep races thread startup under scheduler load; the
+/// hook counts actual submissions, so the wait is deterministic.
+fn waitSubmitted(io: Io, submitted: *std.atomic.Value(u32), n: u32) void {
+    while (true) {
+        const cur = submitted.load(.acquire);
+        if (cur >= n) return;
+        Io.futexWaitUncancelable(io, u32, &submitted.raw, cur);
+    }
+}
+
 test "time route constructs with the Born time vtable and deinits" {
     var port = try born.EvPort.init(std.testing.allocator);
     defer port.deinit();
@@ -164,9 +175,13 @@ test "time route sleep is cancelable through the Born timer path" {
     const interface = try initTimeIo(&port);
     defer born_io.deinit(interface);
 
+    // Wait for the worker's actual submission, not a fixed sleep (#117).
+    // Install before spawning so a fast submit cannot miss the bump.
+    var submitted: std.atomic.Value(u32) = .init(0);
+    shim.testTimeSubmitHook(interface, &submitted);
     var future = try Io.concurrent(interface, longSleeper, .{interface});
-    // Let the worker submit and arm its timer.
-    try Io.sleep(interface, .fromMilliseconds(50), .awake);
+    waitSubmitted(interface, &submitted, 1);
+    shim.testTimeSubmitHook(interface, null);
     const t0 = try born.nowNs();
     const result = future.cancel(interface);
     try expectError(error.Canceled, result);
@@ -201,8 +216,12 @@ test "time route group cancel drains Born sleepers and the group is reusable" {
 
     var done: std.atomic.Value(u32) = .init(0);
     var group: Io.Group = .init;
+    // Wait for all eight actual submissions, not a fixed sleep (#117).
+    var submitted: std.atomic.Value(u32) = .init(0);
+    shim.testTimeSubmitHook(interface, &submitted);
     for (0..8) |_| try group.concurrent(interface, longSleeperCounted, .{ interface, &done });
-    try Io.sleep(interface, .fromMilliseconds(30), .awake);
+    waitSubmitted(interface, &submitted, 8);
+    shim.testTimeSubmitHook(interface, null);
     group.cancel(interface);
     try expectEqual(@as(u32, 0), done.load(.acquire));
 
@@ -372,10 +391,13 @@ test "cancel list retires only the canceled sleeper" {
 
     var done: std.atomic.Value(u32) = .init(0);
     var group: Io.Group = .init;
+    // Wait for all eight actual submissions, not a fixed sleep (#117).
+    var submitted: std.atomic.Value(u32) = .init(0);
+    shim.testTimeSubmitHook(interface, &submitted);
     for (0..7) |_| try group.concurrent(interface, longSleeperCounted, .{ interface, &done });
     var future = try Io.concurrent(interface, longSleeperCounted, .{ interface, &done });
-    // Let every worker submit and arm its timer.
-    try Io.sleep(interface, .fromMilliseconds(50), .awake);
+    waitSubmitted(interface, &submitted, 8);
+    shim.testTimeSubmitHook(interface, null);
 
     const t0 = try born.nowNs();
     try expectError(error.Canceled, future.cancel(interface));
@@ -458,6 +480,14 @@ test "deinit stops the loop before Threaded and retires pending sleepers" {
     defer port.deinit();
     const interface = try initTimeIo(&port);
 
+    // Wait on the sleeper's actual submission (#117, the #116 pattern). A
+    // fixed sleep races thread startup under scheduler load: a sleeper whose
+    // first call lands after deinit freed the Shim faults in the entry gate
+    // itself, which no gate can guard. Once the count shows the submission,
+    // the sleeper holds an entry-gate count, so deinit's drain waits for it.
+    // Install before spawning so a fast submit cannot miss the bump.
+    var submitted: std.atomic.Value(u32) = .init(0);
+    shim.testTimeSubmitHook(interface, &submitted);
     var outcome: std.atomic.Value(u32) = .init(0);
     const thread = try std.Thread.spawn(.{}, struct {
         fn run(io: Io, out: *std.atomic.Value(u32)) void {
@@ -468,8 +498,8 @@ test "deinit stops the loop before Threaded and retires pending sleepers" {
             out.store(2, .release);
         }
     }.run, .{ interface, &outcome });
-    // Let the sleeper submit and arm its timer.
-    try Io.sleep(interface, .fromMilliseconds(50), .awake);
+    waitSubmitted(interface, &submitted, 1);
+    shim.testTimeSubmitHook(interface, null);
     const t0 = try born.nowNs();
     born_io.deinit(interface);
     try expect(try elapsedNs(t0) < 2 * s);

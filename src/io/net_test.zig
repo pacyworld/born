@@ -54,6 +54,17 @@ fn rawWrite(io: Io, h: Io.net.Socket.Handle, header: []const u8, data: []const [
     }
 }
 
+/// Event-driven wait until the shim has parked `n` Born ops (#116). A fixed
+/// sleep races thread startup under scheduler load and can flip the park
+/// order; the hook counts actual parks, so the wait is deterministic.
+fn waitParked(io: Io, parked: *std.atomic.Value(u32), n: u32) void {
+    while (true) {
+        const cur = parked.load(.acquire);
+        if (cur >= n) return;
+        Io.futexWaitUncancelable(io, u32, &parked.raw, cur);
+    }
+}
+
 /// Fill every iovec in `data` by looping low-level reads (a stream read returns
 /// a partial count whenever fewer bytes have arrived than the iovecs hold).
 /// Stops early on EOF; returns the total bytes read.
@@ -517,6 +528,8 @@ test "shutdown(.recv) completes a pending Born read with EOF (Blocker 1)" {
     // cancels it and the loop maps the abort to EOF. Either way the parked
     // read must complete with EOF (0 bytes), not hang or reset.
     var outcome: std.atomic.Value(u32) = .init(0); // 0 pending, 1 eof, 2 error
+    var parked = std.atomic.Value(u32).init(0);
+    shim.testParkHook(io, &parked);
     const thread = try std.Thread.spawn(.{}, struct {
         fn run(ioc: Io, h: Io.net.Socket.Handle, out: *std.atomic.Value(u32)) void {
             var buf: [8]u8 = undefined;
@@ -528,8 +541,8 @@ test "shutdown(.recv) completes a pending Born read with EOF (Blocker 1)" {
             out.store(if (n == 0) 1 else 2, .release);
         }
     }.run, .{ io, client.socket.handle, &outcome });
-    // Let the reader submit and park.
-    try Io.sleep(fixture.io(), .fromMilliseconds(50), .awake);
+    waitParked(fixture.io(), &parked, 1);
+    shim.testParkHook(io, null);
     try client.shutdown(io, .recv);
     thread.join();
     try expectEqual(@as(u32, 1), outcome.load(.acquire));
@@ -583,6 +596,8 @@ test "shutdown(.send) completes a pending Born write with an error (Windows)" {
     defer std.testing.allocator.free(big);
     @memset(big, 'x');
     var outcome: std.atomic.Value(u32) = .init(0); // 0 pending, 1 error, 2 full write
+    var parked = std.atomic.Value(u32).init(0);
+    shim.testParkHook(io, &parked);
     const thread = try std.Thread.spawn(.{}, struct {
         fn run(ioc: Io, h: Io.net.Socket.Handle, data: []const u8, out: *std.atomic.Value(u32)) void {
             var iov = [_][]const u8{data};
@@ -593,8 +608,8 @@ test "shutdown(.send) completes a pending Born write with an error (Windows)" {
             out.store(if (n == data.len) 2 else 1, .release);
         }
     }.run, .{ io, client.socket.handle, big, &outcome });
-    // Let the writer submit and park.
-    try Io.sleep(fixture.io(), .fromMilliseconds(50), .awake);
+    waitParked(fixture.io(), &parked, 1);
+    shim.testParkHook(io, null);
     try client.shutdown(io, .send);
     thread.join();
     try expectEqual(@as(u32, 1), outcome.load(.acquire));
@@ -657,6 +672,8 @@ test "close retires a pending Born read as Unexpected, not Canceled" {
     // surfaces Unexpected, never the caller's Canceled (#106, section 4.5).
     // Close itself completes (infallible).
     var outcome: std.atomic.Value(u32) = .init(0); // 0 pending, 1 unexpected, 2 other
+    var parked = std.atomic.Value(u32).init(0);
+    shim.testParkHook(io, &parked);
     const thread = try std.Thread.spawn(.{}, struct {
         fn run(ioc: Io, h: Io.net.Socket.Handle, out: *std.atomic.Value(u32)) void {
             var buf: [8]u8 = undefined;
@@ -668,7 +685,8 @@ test "close retires a pending Born read as Unexpected, not Canceled" {
             out.store(2, .release);
         }
     }.run, .{ io, client.socket.handle, &outcome });
-    try Io.sleep(fixture.io(), .fromMilliseconds(50), .awake);
+    waitParked(fixture.io(), &parked, 1);
+    shim.testParkHook(io, null);
     client.close(io);
     thread.join();
     try expectEqual(@as(u32, 1), outcome.load(.acquire));
@@ -1176,6 +1194,8 @@ test "deinit with two parked Born reads retires them and drains promptly" {
     defer peers[1].close(fio);
 
     var results: [2]std.atomic.Value(u32) = .{ .init(0), .init(0) }; // 0 pending, 1 canceled, 2 other
+    var parked = std.atomic.Value(u32).init(0);
+    shim.testParkHook(io, &parked);
     var threads: [2]std.Thread = undefined;
     for (&clients, &results, &threads) |*c, *r, *t| {
         t.* = try std.Thread.spawn(.{}, struct {
@@ -1190,7 +1210,8 @@ test "deinit with two parked Born reads retires them and drains promptly" {
             }
         }.run, .{ io, c.socket.handle, r });
     }
-    try Io.sleep(fio, .fromMilliseconds(50), .awake); // let both reads park
+    waitParked(fio, &parked, 2);
+    shim.testParkHook(io, null);
 
     const t0 = try born.nowNs();
     born_io.deinit(io);
@@ -1281,6 +1302,8 @@ test "a concurrent read on a parked Born read returns Unexpected" {
     defer server.deinit(fio);
 
     var result: std.atomic.Value(u32) = .init(0); // 0 pending, 1 got byte, 2 error
+    var parked = std.atomic.Value(u32).init(0);
+    shim.testParkHook(io, &parked);
     var got: [1]u8 = undefined;
     const thread = try std.Thread.spawn(.{}, struct {
         fn run(ioc: Io, h: Io.net.Socket.Handle, buf: []u8, out: *std.atomic.Value(u32)) void {
@@ -1292,7 +1315,8 @@ test "a concurrent read on a parked Born read returns Unexpected" {
             out.store(if (n == 1) 1 else 2, .release);
         }
     }.run, .{ io, client.socket.handle, got[0..], &result });
-    try Io.sleep(fio, .fromMilliseconds(50), .awake); // let the first read park
+    waitParked(fio, &parked, 1);
+    shim.testParkHook(io, null);
 
     // A second concurrent read is rejected with Unexpected.
     var buf2: [1]u8 = undefined;
