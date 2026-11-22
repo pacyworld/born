@@ -1090,6 +1090,14 @@ pub const Shim = struct {
     /// because the test installs/clears it while the loop runs. Guarded by
     /// `builtin.is_test`, so the signal is comptime-dead outside test builds.
     test_net_parked: std.atomic.Value(usize) = .init(0),
+    /// Test-only sleep-submit counter address (#117): when non-zero, the sleep
+    /// submit path bumps the pointed-to counter each time a sleeper submits
+    /// and wakes its waiters, so tests synchronize on the actual submission
+    /// instead of a fixed sleep that races thread startup under scheduler
+    /// load. Atomic because the test installs/clears it while the loop runs.
+    /// Guarded by `builtin.is_test`, so the signal is comptime-dead outside
+    /// test builds.
+    test_time_submitted: std.atomic.Value(usize) = .init(0),
     /// Test-only deferred-close wake counter (#117 B2): bumped at the
     /// sockUserExit slow path's port.wake, so the racing closer/releaser test
     /// asserts "a deferred close implies a wake" without a running loop.
@@ -2609,6 +2617,18 @@ pub const Shim = struct {
         self.threaded_io.vtable.futexWake(self.threaded_io.userdata, &c.raw, 1);
     }
 
+    /// Test-only sleep-submit signal (#117): bump the installed counter and
+    /// wake its waiters. Called from the sleep submit path on every platform.
+    /// Comptime-dead outside test builds.
+    fn testTimeSubmitSignal(self: *Shim) void {
+        if (!builtin.is_test) return;
+        const addr = self.test_time_submitted.load(.acquire);
+        if (addr == 0) return;
+        const c: *std.atomic.Value(u32) = @ptrFromInt(addr);
+        _ = c.fetchAdd(1, .release);
+        self.threaded_io.vtable.futexWake(self.threaded_io.userdata, &c.raw, 1);
+    }
+
     fn armRead(self: *Shim, state: *SocketState) void {
         if (is_windows) return; // readNb already posted WSARecv
         if (!state.read_armed) {
@@ -3565,6 +3585,13 @@ pub fn deinit(interface: Io) void {
 pub fn testParkHook(interface: Io, hook: ?*std.atomic.Value(u32)) void {
     if (!builtin.is_test) return;
     shimFrom(interface.userdata).test_net_parked.store(if (hook) |h| @intFromPtr(h) else 0, .release);
+}
+
+/// Test-only: install the sleep-submit counter hook (#117), or null to clear
+/// it. Comptime-dead outside test builds. See `Shim.test_time_submitted`.
+pub fn testTimeSubmitHook(interface: Io, hook: ?*std.atomic.Value(u32)) void {
+    if (!builtin.is_test) return;
+    shimFrom(interface.userdata).test_time_submitted.store(if (hook) |h| @intFromPtr(h) else 0, .release);
 }
 
 /// The first route-level failure latched by any Born route: a port `wait`
@@ -4747,6 +4774,7 @@ const time_route = struct {
 
         var op: SleepOp = .{ .deadline_ns = deadline_ns };
         const submitted = self.submit(&op) orelse return error.Canceled;
+        self.testTimeSubmitSignal();
         if (submitted.was_empty) {
             if (time_stats_enabled) _ = self.stats.wakes.fetchAdd(1, .monotonic);
             self.port.wake();
