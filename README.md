@@ -106,6 +106,7 @@ OS per primitive, and lists real runs only.
 | epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | born.io network route, nats.zig consumer e2e suite (native nats-server v2.15.0) | [run 364](https://pacyworld.dev/pacyworld/born/actions/runs/364), Zig 0.16.0 born [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/16) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/20) and all-Threaded baseline [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/18) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/22), against the pinned v2.15.0 binary (linux-amd64 tarball sha256 verified) spawned by the absolute NATS_SERVER path (W1 facade fix): 177 passed, 0 skipped, 0 failed each; born connect=192 with threaded connect=0 (fixture-side threaded r=5 w=4 only), baseline counters zero with identical results, route proof PASS | 2026-11-19 | [7f93288](https://pacyworld.dev/pacyworld/born/commit/7f932884b80f8382a9dc29e0729c6c1e5d8a1b40) |
 | epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | born.io network route, std.http.Client contract suite | [run 364](https://pacyworld.dev/pacyworld/born/actions/runs/364), Zig 0.16.0 born [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/16) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/20) and all-Threaded control [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/18) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/22), plus 0.17.1 born [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/17) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/21) and control [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/19) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/23) (0.17.1 runs http only): 8 passed, 0 skipped, 0 failed each; born connect=8 with all threaded counters zero, control identical results, route proof PASS | 2026-11-19 | [7f93288](https://pacyworld.dev/pacyworld/born/commit/7f932884b80f8382a9dc29e0729c6c1e5d8a1b40) |
 | IOCP, Windows Server 2022 build 20348 (CI Windows runner) | born.io network route, std.http.Client contract suite (0.17.1 only) | [run 364](https://pacyworld.dev/pacyworld/born/actions/runs/364), Zig 0.17.1 born [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/25) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/29) and all-Threaded control [Debug](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/27) / [ReleaseSafe](https://pacyworld.dev/pacyworld/born/actions/runs/364/jobs/31): 8 passed, 0 skipped, 0 failed each; born connect=8 with all threaded counters zero, control identical results, route proof PASS. The Windows 0.16.0 nats rows are pending the runner trust-store fix | 2026-11-19 | [7f93288](https://pacyworld.dev/pacyworld/born/commit/7f932884b80f8382a9dc29e0729c6c1e5d8a1b40) |
+| IOCP, Windows 11 build 26100 (manual host) | born.io network route, Zig 0.16.0 threaded Windows AFD terminal-error compensation (#126) | nats-unit.exe and http-contract.exe Debug and ReleaseSafe on Zig 0.16.0 over OpenSSH, all-Threaded route with the shim compensation: unit 119 passed, 2 skipped, 0 failed and http 10 passed, 0 skipped, 0 failed each; the refused connect maps to ConnectionRefused and the peer close to ConnectionResetByPeer, route proof PASS; the W3 (#118) known-failing allowances are removed | 2026-11-23 | [2f94e5a](https://pacyworld.dev/pacyworld/born/commit/2f94e5aea10aadf06184a050085035eff7f2c192) |
 
 Commit 3ed3785 changes only the CI workflow; its library and tests are
 those of master d1017b8. Skips identify platform exclusions or primitives
@@ -132,6 +133,17 @@ runner trust-store fix: the nats-server download fails on the missing
 ISRG Root X1 root certificate before any test runs, so those legs carry
 no runtime evidence yet. The commit adding these rows changes only this
 README; its library, tests and CI are those of 7f93288.
+
+The Windows threaded compensation row records the #126 shim on the
+all-Threaded route: a zero-length AFD SEND probe recovers the socket's
+sticky terminal state behind error.Unexpected on read/write/send, and the
+shim's own connect keeps the CONNECT NTSTATUS observable, so the refused
+connect and the peer close map to their declared errors instead of
+Unexpected. The born-route suites on the same host stay green (unit
+119 passed, 2 skipped, 0 failed; http 10 passed, 0 skipped, 0 failed; e2e
+178 passed, 0 skipped, 0 failed, ReleaseSafe), confirming no born-route
+regression. The commit adding this row changes only this README; its
+library, tests and CI are those of 2f94e5a.
 
 The examples smoke rows record the example integration suite
 (examples/smoke.zig) through the shared echo engine; Windows skips the
