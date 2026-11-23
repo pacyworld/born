@@ -541,14 +541,21 @@ exercise each implemented backend. Windows Unix domain sockets return
 `EvPort.addTimer(id, udata, after_ns, .once or .repeat)` and `cancelTimer(id)`
 deliver `Event{ .timer = true, .fired = n }` through `wait()`. `after_ns` is
 nanoseconds; the kernel rounds the deadline up to its own timer resolution,
-so a deadline never fires early. `after_ns` above `born.timer_after_ns_max`
+so a deadline never fires early within that resolution. A deadline beyond a
+kernel's representable maximum saturates to that maximum rather than firing
+immediately (see below). `after_ns` above `born.timer_after_ns_max`
 is `error.InvalidArgument`; the ceiling itself (about 292 years) is accepted
-by every supported kernel, proven by a contract test that arms it and a
-60-day deadline and asserts no error event.
+by every runtime-tested kernel (FreeBSD, Linux, Windows, macOS, NetBSD),
+proven by a contract test that arms it and a 60-day deadline and asserts no
+error event and no immediate firing. OpenBSD is source-verified only
+(`tvtohz` saturates at `INT_MAX`).
 
 Resolution per platform:
 
-- FreeBSD kqueue: sbintime precision, sub-millisecond.
+- FreeBSD kqueue: sbintime precision, sub-millisecond. Deadlines above about
+  34 years saturate to that cap: the kernel adds the current uptime to the
+  sbintime deadline, so born leaves headroom below the ~68-year sbintime
+  maximum to keep that add from overflowing and firing at once.
 - macOS kqueue: mach absolute time, sub-millisecond.
 - NetBSD and OpenBSD kqueue: one callout tick (1/hz, commonly 10 ms at
   hz 100 or 1 ms at hz 1000). A sub-millisecond delay rounds up to a whole

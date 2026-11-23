@@ -47,6 +47,10 @@
 //! at comptime. The firing's `data` is the expiration count on every target,
 //! independent of the unit flag. NetBSD and OpenBSD round the deadline up to
 //! a callout tick (1/hz); FreeBSD and macOS arm at sub-millisecond precision.
+//! FreeBSD caps the deadline at half the sbintime seconds range (~34 years):
+//! the kernel adds the current uptime to the sbintime deadline, and a value
+//! at SBT_MAX (~68 years) overflows that add, wraps into the past and fires
+//! at once. Larger deadlines saturate to the cap, never fire immediately.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -88,6 +92,15 @@ const note_useconds: @FieldType(Kevent, "fflags") = switch (builtin.os.tag) {
 fn ceilUs(ns: u64) u64 {
     return ns / std.time.ns_per_us + @intFromBool(ns % std.time.ns_per_us != 0);
 }
+
+/// FreeBSD deadline cap in nanoseconds: half the sbintime seconds range
+/// (~34 years). The kernel converts the deadline to sbintime (32.32 fixed
+/// point) and adds the current uptime to it (filt_timerstart:
+/// next = to + sbinuptime()). A deadline at SBT_MAX (~68 years) overflows
+/// that add, wraps into the past and fires at once. Half the range leaves
+/// headroom for any uptime below the same bound; larger deadlines saturate
+/// to this cap instead of firing immediately.
+const freebsd_after_ns_max: u64 = ((@as(u64, std.math.maxInt(i64)) >> 32) / 2) * std.time.ns_per_s;
 
 /// Per-port timer bookkeeping, a field of EvPort (`timers`).
 pub const State = struct {
@@ -153,7 +166,8 @@ fn change(id: u32, flags: @FieldType(Kevent, "flags"), udata: ?*anyopaque, after
     kev.flags = flags;
     if (note_nseconds) |unit| {
         kev.fflags = unit;
-        kev.data = @intCast(after_ns);
+        const ns = if (builtin.os.tag == .freebsd) @min(after_ns, freebsd_after_ns_max) else after_ns;
+        kev.data = @intCast(ns);
     } else {
         kev.fflags = note_useconds;
         kev.data = @intCast(ceilUs(after_ns));

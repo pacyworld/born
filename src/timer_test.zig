@@ -269,17 +269,27 @@ test "timer: the kernel accepts the ceiling and a 60-day deadline" {
     var a: u8 = 0;
     // Runtime proof of the uniform ceiling: the arm must be accepted by the
     // kernel, not refused as a deferred .err event (which the shim would
-    // latch into a canceled sleep). wait(…, 0) submits the staged arm on
-    // kqueue and harvests any refusal on every backend. 60 days exceeds the
-    // old u32-ms ceiling (~49.7 days); the ceiling itself is ~292 years.
-    // A kernel that cannot represent a value saturates it (FreeBSD SBT_MAX)
-    // rather than refusing; either way no .err may surface.
+    // latch into a canceled sleep), and must not fire early. wait(…, 0)
+    // submits the staged arm on kqueue and harvests any refusal on every
+    // backend; a real window then proves no wrapped near-zero deadline fires
+    // at once. 60 days exceeds the old u32-ms ceiling (~49.7 days); the
+    // ceiling itself is ~292 years. A kernel that cannot represent a value
+    // saturates it rather than refusing; born caps FreeBSD below SBT_MAX so
+    // the kernel's uptime add cannot wrap the deadline into the past.
     const sixty_days: u64 = 60 * 24 * 60 * 60 * std.time.ns_per_s;
     for ([_]u64{ born.timer_after_ns_max, sixty_days }) |delay| {
         try addOrSkip(&port, 12, &a, delay, .once);
         var events: [4]Event = undefined;
         const n = try port.wait(&events, 0);
         for (events[0..n]) |ev| try std.testing.expect(!ev.err);
+        // An overflowing conversion would wrap the deadline to near zero and
+        // fire immediately with no .err. Nothing for this udata may arrive
+        // while the deadline is decades away.
+        const m = try port.wait(&events, 50);
+        for (events[0..m]) |ev| {
+            try std.testing.expect(!ev.err);
+            try std.testing.expect(ev.udata != @as(?*anyopaque, &a));
+        }
         port.cancelTimer(12);
         // Flush the staged cancel before re-arming the same id.
         _ = try port.wait(&events, 0);
