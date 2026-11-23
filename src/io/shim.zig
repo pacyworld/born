@@ -1083,6 +1083,12 @@ pub const Shim = struct {
     /// (born#111). Reset by the retirement. The check is guarded by
     /// `builtin.is_test`, so the hook is comptime-dead outside test builds.
     test_proc_frame_reuse: ?u32 = null,
+    /// Test-only reuse injection (#114): when non-null, childCleanup calls it
+    /// with the just-freed slot index after the unlock and before the close,
+    /// simulating a worker that reserves and publishes the same slot in that
+    /// window. Reset by childCleanup. The check is guarded by `builtin.is_test`,
+    /// so the hook is comptime-dead outside test builds.
+    test_child_cleanup_reuse: ?*const fn (*Shim, u32) void = null,
     /// Test-only park counter address (#116): when non-zero, the read/write
     /// drive paths bump the pointed-to counter each time an op parks and wake
     /// its waiters, so tests synchronize on the actual park instead of a
@@ -3227,11 +3233,13 @@ pub const Shim = struct {
 
     /// Full teardown of an exited (or arm-failed) child on the loop thread:
     /// end the watch, drop the pid mapping BEFORE the reaping close so a
-    /// recycled pid never resolves to this dying slot, close the descriptor
-    /// (FreeBSD reaps the exited child on the spot; Linux harvest already
-    /// reaped, so close just ends it), release the slot. The parent pipe
-    /// ends belong to the caller's `Child` (review R1); the wait/kill thunk
-    /// closes and nulls them on the caller thread.
+    /// recycled pid never resolves to this dying slot, release the slot, then
+    /// close a local copy of the descriptor taken under the mutex. The slot
+    /// may be reserved and published by a worker the instant it goes free, so
+    /// the close never runs through the slot (#114). FreeBSD reaps the exited
+    /// child on the spot; Linux harvest already reaped, so close just ends it.
+    /// The parent pipe ends belong to the caller's `Child` (review R1); the
+    /// wait/kill thunk closes and nulls them on the caller thread.
     fn childCleanup(self: *Shim, child: *ChildState) void {
         // A unit test may close the descriptor itself and invalidate the
         // handle to -1 (N3); skip the port teardown then, since purgeFd casts
@@ -3243,9 +3251,20 @@ pub const Shim = struct {
         }
         self.proc_queue.mutex.lockUncancelable(self.threaded_io);
         if (!child.abandoned) _ = self.child_registry.map.fetchRemove(child.child.pid);
-        self.childFreeLocked(child.index);
+        // Copy the descriptor and index out before releasing the slot: a
+        // worker may reserve and publish this slot the instant it goes free,
+        // so the close below runs on a local, never through the slot (#114).
+        var dead = child.child;
+        const index = child.index;
+        self.childFreeLocked(index);
         self.proc_queue.mutex.unlock(self.threaded_io);
-        child.child.close();
+        if (builtin.is_test) {
+            if (self.test_child_cleanup_reuse) |hook| {
+                self.test_child_cleanup_reuse = null;
+                hook(self, index);
+            }
+        }
+        dead.close();
     }
 
     /// Abandon a canceled wait (6.3): unpublish the pid, but keep the
@@ -6998,6 +7017,87 @@ test "child provenance lookup hits a published child and misses once unpublished
     // The slot stays occupied until childFreeLocked (the close has not run).
     try std.testing.expect(state.childAt(r.index).?.occupied);
     state.childRelease(r.index);
+}
+
+test "childCleanup closes a local copy, not a reused slot (#114)" {
+    // #114: childCleanup releases the slot under the proc queue mutex, then
+    // closes the descriptor. A worker can reserve and publish the same slot
+    // in the window between the unlock and the close; closing through the
+    // slot then closes the new occupant's descriptor and writes -1 into it,
+    // leaking the old one. The test-only seam reserves and publishes a second
+    // real child into the freed slot in that exact window. Mutation: closing
+    // through the slot (child.child.close(), as on master) must fail the
+    // closed-first-descriptor and intact-second-handle assertions.
+    if (comptime !process_supported) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    state.port = &port;
+    try state.childRegistryInit();
+    defer state.childRegistryDeinit();
+    defer state.procFreeChunks();
+
+    // The first child has already exited, so Child.close reaps it synchronously
+    // on both OSes. A still-running Linux child would hand its pidfd to the
+    // born-reaper thread (SIGKILL + WNOHANG sees it still exiting), keeping the
+    // descriptor open and defeating the closed-fd probe below.
+    const first = try testSpawnSh("exit 0");
+    // Establish the exit without reaping, so the premise is never a race:
+    // Linux WNOWAIT waitid(P_PIDFD), FreeBSD wait6(P_PID, WNOWAIT).
+    if (comptime is_linux) {
+        var info: std.os.linux.siginfo_t = undefined;
+        while (compat.linuxErrno(compat.waitid(.PIDFD, first.handle, &info, std.os.linux.W.EXITED | std.os.linux.W.NOWAIT)) == .INTR) {}
+    }
+    if (comptime is_freebsd) {
+        var status: c_int = 0;
+        while (true) {
+            const rc = freebsd_wait.wait6(0, @intCast(first.pid), &status, std.c.W.EXITED | std.c.W.NOWAIT, null, null);
+            if (rc >= 0) break;
+            if (std.posix.errno(@as(isize, rc)) != .INTR) break;
+        }
+    }
+    const r = try state.childReserve();
+    try state.childPublish(r.index, first);
+
+    // The seam runs between childCleanup's unlock and its close. The freed
+    // slot is the free-list head, so childReserve reuses it; publish a second
+    // real child there, exactly as a racing worker would.
+    const Reuse = struct {
+        var second: born.process.Child = undefined;
+        var reused_index: u32 = std.math.maxInt(u32);
+        fn hook(shim: *Shim, _: u32) void {
+            const rr = shim.childReserve() catch unreachable;
+            shim.childPublish(rr.index, second) catch unreachable;
+            reused_index = rr.index;
+        }
+    };
+    Reuse.second = try testSpawnSh("sleep 30");
+    state.test_child_cleanup_reuse = &Reuse.hook;
+
+    state.childCleanup(state.childAt(r.index).?);
+    try std.testing.expect(state.test_child_cleanup_reuse == null); // hook fired and reset
+    try std.testing.expectEqual(r.index, Reuse.reused_index);
+
+    // The first descriptor was closed by the cleanup. Raw fcntl returns -1 on
+    // a closed fd (compat.fcntl treats BADF as unreachable, so it cannot probe).
+    try std.testing.expectEqual(@as(c_int, -1), std.c.fcntl(first.handle, std.c.F.GETFD));
+    // The second child's descriptor is intact and still published in the slot.
+    try std.testing.expect(std.c.fcntl(Reuse.second.handle, std.c.F.GETFD) != -1);
+    const reused = state.childAt(r.index).?;
+    try std.testing.expect(reused.occupied);
+    try std.testing.expectEqual(Reuse.second.handle, reused.child.handle);
+    try std.testing.expectEqual(Reuse.second.pid, reused.child.pid);
+    try std.testing.expect(state.lookupChild(Reuse.second.pid) != null);
+    try std.testing.expect(state.lookupChild(first.pid) == null);
+
+    // Clean up the second child on the caller thread (kill, blocking reap,
+    // close, release), leaving no zombie and no occupied slot.
+    var kop: ProcOp = .{ .kind = .kill, .child_index = r.index, .child_gen = reused.generation };
+    try std.testing.expect(state.childDeadClaim(&kop, compat.signalNumber(std.posix.SIG.KILL)));
+    try std.testing.expect(!state.childAt(r.index).?.occupied);
+    try std.testing.expect(state.lookupChild(Reuse.second.pid) == null);
 }
 
 test "child reservation refuses at the registry ceiling with SystemResources" {
