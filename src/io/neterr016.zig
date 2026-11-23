@@ -1,10 +1,11 @@
 //! Windows AFD terminal-error compensation for the Zig 0.16.0 threaded route
-//! (born#126). Upstream 0.16.0 collapses most non-SUCCESS AFD statuses to
-//! error.Unexpected; 0.17.1 corrected the connect/read/write switches. This
-//! module recovers a socket's sticky terminal state with a zero-length AFD
-//! SEND probe and maps it into the 0.16 error sets, and performs the shim's
-//! own connect so the CONNECT NTSTATUS stays observable (std 0.16 closes the
-//! handle and discards the status before its error returns).
+//! (born#126): upstream 0.16.0 collapses most non-SUCCESS AFD statuses to
+//! error.Unexpected. Every AFD ioctl here runs through the Threaded vtable's
+//! `operate` with `.device_io_control` (nonblocking), inheriting std's APC
+//! submission, alertable wait, cancel and drain. A zero-length AFD SEND probe
+//! recovers a socket's sticky terminal state for the read/write/send slots,
+//! and the shim's own connect keeps the CONNECT NTSTATUS observable (std 0.16
+//! closes the handle and discards the status before its error returns).
 //!
 //! Comptime-dead outside Windows + 0.16: every export is referenced only from
 //! the shim's `is_windows and !is_017` branches, so the Windows-specific bodies
@@ -21,54 +22,36 @@ const HANDLE = windows.HANDLE;
 const NTSTATUS = windows.NTSTATUS;
 const Handle = Io.net.Socket.Handle;
 
-extern "kernel32" fn CreateEventW(?*anyopaque, windows.BOOL, windows.BOOL, ?[*:0]const u16) callconv(.winapi) ?HANDLE;
-
-/// Probe wait bound: terminal states complete immediately; one second is a
-/// safety net for a non-terminal socket that would otherwise pend.
-const probe_timeout_100ns: i64 = -10_000_000;
-/// Connect wait bound: a TCP connect resolves well inside this; on expiry the
-/// pending CONNECT is cancelled and drained and the slot reports Timeout.
-const connect_timeout_100ns: i64 = -300_000_000;
-/// Setup ioctl (SOCKOPT/BIND) wait bound.
-const setup_timeout_100ns: i64 = -10_000_000;
-
-/// Event-based AFD ioctl with a bounded wait. Returns the final iosb status,
-/// or null if the wait expired (the ioctl is cancelled and its completion
-/// drained before returning). The iosb/event storage stays live until the
-/// completion is drained; the caller's in/out buffers must outlive this call.
-fn afdIoctlEvent(
-    handle: HANDLE,
-    code: windows.CTL_CODE,
-    in: ?*const anyopaque,
-    in_len: u32,
-    out: ?*anyopaque,
-    out_len: u32,
-    timeout_100ns: i64,
-) ?NTSTATUS {
-    var iosb: windows.IO_STATUS_BLOCK = undefined;
-    const event = CreateEventW(null, .TRUE, .FALSE, null) orelse return null;
-    defer windows.CloseHandle(event);
-    const rc = ntdll.NtDeviceIoControlFile(handle, event, null, null, &iosb, code, in, in_len, out, out_len);
-    if (rc == .PENDING) {
-        var timeout: windows.LARGE_INTEGER = timeout_100ns;
-        const w = ntdll.NtWaitForSingleObject(event, .FALSE, &timeout);
-        if (w != .SUCCESS) {
-            var cancel_iosb: windows.IO_STATUS_BLOCK = undefined;
-            _ = ntdll.NtCancelIoFileEx(handle, &iosb, &cancel_iosb);
-            _ = ntdll.NtWaitForSingleObject(event, .FALSE, null);
-            return null;
-        }
-    } else if (rc != .SUCCESS) {
-        return rc;
-    }
-    return iosb.u.Status;
+/// Submit one AFD ioctl through the Threaded `operate` slot and return the
+/// terminal iosb status. `.device_io_control` with `nonblocking = true` submits
+/// with an APC, waits alertably, and on a cancel request calls NtCancelIoFileEx
+/// and drains the ioctl to completion before returning `error.Canceled`; any
+/// other completion returns the raw iosb so the caller observes the terminal
+/// NTSTATUS. The in/out buffers must outlive this call: std drains to completion
+/// before returning, so the storage is never touched after it returns.
+fn afdIoctl(io: Io, handle: HANDLE, code: windows.CTL_CODE, in: []const u8, out: []u8) Io.Cancelable!NTSTATUS {
+    const result = try io.vtable.operate(io.userdata, .{ .device_io_control = .{
+        .file = .{ .handle = handle, .flags = .{ .nonblocking = true } },
+        .code = code,
+        .in = in,
+        .out = out,
+    } });
+    return result.device_io_control.u.Status;
 }
 
 /// Zero-length AFD SEND probe: reads the socket's CURRENT sticky terminal
 /// state without transferring data. A healthy idle socket completes SUCCESS;
 /// a reset/disconnected/timed-out socket completes with its terminal status.
 /// Error path only; a successful read/write/send is never probed.
-fn probeTerminal(handle: HANDLE) ?NTSTATUS {
+///
+/// Completion-port safety: std's deviceIoControl submits the ioctl with an APC
+/// and no event or completion-port association, so no IOCP completion packet is
+/// queued even if the handle were associated with a completion port. The probe
+/// only ever runs on Threaded-owned handles: on the Born route the provenance
+/// gate services Born-owned (IOCP-associated) handles on Born's reactor and
+/// forwards only registry-absent handles to fwd016, so a born-IOCP-owned handle
+/// never reaches this probe.
+fn probeTerminal(io: Io, handle: HANDLE) Io.Cancelable!NTSTATUS {
     var byte: [1]u8 = .{0};
     var bufs: [1]windows.AFD.WSABUF(.@"const") = .{.{ .len = 0, .buf = &byte }};
     var info: windows.AFD.SEND_INFO = .{
@@ -77,15 +60,18 @@ fn probeTerminal(handle: HANDLE) ?NTSTATUS {
         .AfdFlags = .{ .NO_FAST_IO = true, .OVERLAPPED = true },
         .TdiFlags = .{},
     };
-    return afdIoctlEvent(handle, windows.IOCTL.AFD.SEND, &info, @sizeOf(windows.AFD.SEND_INFO), null, 0, probe_timeout_100ns);
+    return afdIoctl(io, handle, windows.IOCTL.AFD.SEND, std.mem.asBytes(&info), &.{});
 }
 
-/// 0.16 Reader.Error mapping: the reset trio maps to ConnectionResetByPeer and
-/// IO_TIMEOUT to Timeout (Reader.Error carries Timeout, not ConnectionTimedOut).
-/// Non-sticky/unknown statuses (including SUCCESS) return null: stay Unexpected.
+/// 0.16 Reader.Error mapping: CONNECTION_RESET and REMOTE_DISCONNECT map to
+/// ConnectionResetByPeer, IO_TIMEOUT to Timeout (Reader.Error carries Timeout,
+/// not ConnectionTimedOut). LOCAL_DISCONNECT is excluded: it reports a local
+/// shutdown(send), not a peer reset, so it must not turn a read into
+/// ConnectionResetByPeer. Non-sticky/unknown statuses (including SUCCESS)
+/// return null: stay Unexpected.
 fn mapRead(status: NTSTATUS) ?Io.net.Stream.Reader.Error {
     return switch (status) {
-        .CONNECTION_RESET, .REMOTE_DISCONNECT, .LOCAL_DISCONNECT => error.ConnectionResetByPeer,
+        .CONNECTION_RESET, .REMOTE_DISCONNECT => error.ConnectionResetByPeer,
         .IO_TIMEOUT => error.Timeout,
         else => null,
     };
@@ -124,28 +110,34 @@ fn mapConnect(status: NTSTATUS) ?Io.net.IpAddress.ConnectError {
 }
 
 /// Recover the terminal error behind a threaded netRead error.Unexpected, or
-/// null when the socket holds no sticky terminal state (stay Unexpected).
-pub fn readError(handle: Handle) ?Io.net.Stream.Reader.Error {
-    const status = probeTerminal(handle) orelse return null;
+/// null when the socket holds no sticky terminal state (stay Unexpected). A
+/// canceled probe surfaces error.Canceled (Reader.Error carries it on 0.16).
+pub fn readError(io: Io, handle: Handle) ?Io.net.Stream.Reader.Error {
+    const status = probeTerminal(io, handle) catch return error.Canceled;
     return mapRead(status);
 }
 
 /// Recover the terminal error behind a threaded netWrite error.Unexpected.
-pub fn writeError(handle: Handle) ?Io.net.Stream.Writer.Error {
-    const status = probeTerminal(handle) orelse return null;
+pub fn writeError(io: Io, handle: Handle) ?Io.net.Stream.Writer.Error {
+    const status = probeTerminal(io, handle) catch return error.Canceled;
     return mapWrite(status);
 }
 
 /// Recover the terminal error behind a threaded netSend error.Unexpected.
-pub fn sendError(handle: Handle) ?Io.net.Socket.SendError {
-    const status = probeTerminal(handle) orelse return null;
+pub fn sendError(io: Io, handle: Handle) ?Io.net.Socket.SendError {
+    const status = probeTerminal(io, handle) catch return error.Canceled;
     return mapSend(status);
 }
 
 /// Open a raw AFD endpoint identical to std's openSocketAfd (NtCreateFile on
 /// \Device\Afd\Endpoint with FULL_EA_INFORMATION), so std's read/write/close
-/// accept the resulting handle.
-fn openSocketAfd(family: ws2.ADDRESS_FAMILY, mode: Io.net.Socket.Mode, protocol: ?Io.net.Protocol) !HANDLE {
+/// accept the resulting handle. NtCreateFile on the AFD endpoint completes
+/// synchronously; the status mapping mirrors std's openSocketAfd.
+fn openSocketAfd(family: ws2.ADDRESS_FAMILY, mode: Io.net.Socket.Mode, protocol: ?Io.net.Protocol) error{
+    AddressFamilyUnsupported,
+    ProtocolUnsupportedByAddressFamily,
+    Unexpected,
+}!HANDLE {
     const mp = try T.posixSocketModeProtocol(family, mode, protocol);
     var handle: HANDLE = undefined;
     var iosb: windows.IO_STATUS_BLOCK = undefined;
@@ -178,12 +170,17 @@ fn openSocketAfd(family: ws2.ADDRESS_FAMILY, mode: Io.net.Socket.Mode, protocol:
         &ea,
         @sizeOf(@TypeOf(ea)),
     );
-    if (rc != .SUCCESS) return error.Unexpected;
-    return handle;
+    return switch (rc) {
+        .SUCCESS => handle,
+        .PROTOCOL_NOT_SUPPORTED => error.AddressFamilyUnsupported,
+        .NO_SUCH_FILE => error.ProtocolUnsupportedByAddressFamily,
+        else => error.Unexpected,
+    };
 }
 
-/// Mirror std's connect setup: SO_REUSE_UNICASTPORT on the raw endpoint.
-fn setReuseUnicastport(handle: HANDLE) !void {
+/// Mirror std's connect setup: SO_REUSE_UNICASTPORT on the raw endpoint. The
+/// status mapping mirrors std's socketOptionAfd.
+fn setReuseUnicastport(io: Io, handle: HANDLE) error{ SystemResources, Unexpected, Canceled }!void {
     var val: bool = true;
     const info = windows.AFD.SOCKOPT_INFO{
         .mode = .set,
@@ -192,43 +189,80 @@ fn setReuseUnicastport(handle: HANDLE) !void {
         .optval = &val,
         .optlen = @sizeOf(bool),
     };
-    const st = afdIoctlEvent(handle, windows.IOCTL.AFD.SOCKOPT, &info, @sizeOf(@TypeOf(info)), null, 0, setup_timeout_100ns) orelse return error.Unexpected;
-    if (st != .SUCCESS) return error.Unexpected;
+    const st = try afdIoctl(io, handle, windows.IOCTL.AFD.SOCKOPT, std.mem.asBytes(&info), &.{});
+    switch (st) {
+        .SUCCESS => {},
+        .CANCELLED => unreachable, // deviceIoControl drains and returns error.Canceled
+        .INSUFFICIENT_RESOURCES => return error.SystemResources,
+        else => return error.Unexpected,
+    }
 }
 
 /// Mirror std's connect setup: bind the wildcard address in .Active mode and
-/// return the bound local address.
-fn bindActiveWildcard(handle: HANDLE, address: *const Io.net.IpAddress) !Io.net.IpAddress {
+/// return the bound local address. The status mapping mirrors std's
+/// bindSocketIpAfd; the caller maps AddressInUse to Unexpected as std does.
+fn bindActiveWildcard(io: Io, handle: HANDLE, address: *const Io.net.IpAddress) error{
+    SystemResources,
+    AddressInUse,
+    Unexpected,
+    Canceled,
+}!Io.net.IpAddress {
     const Storage = extern struct { Info: windows.AFD.BIND_INFO, Address: T.PosixAddress };
     var storage: Storage = .{ .Info = .{ .Mode = .Active }, .Address = undefined };
     const addr_len = T.addressToPosix(address, &storage.Address);
-    const st = afdIoctlEvent(handle, windows.IOCTL.AFD.BIND, &storage, @offsetOf(Storage, "Address") + addr_len, &storage.Address, addr_len, setup_timeout_100ns) orelse return error.Unexpected;
-    if (st != .SUCCESS) return error.Unexpected;
+    const st = try afdIoctl(
+        io,
+        handle,
+        windows.IOCTL.AFD.BIND,
+        @as([]const u8, @ptrCast(&storage))[0 .. @offsetOf(Storage, "Address") + addr_len],
+        @as([]u8, @ptrCast(&storage.Address))[0..addr_len],
+    );
+    switch (st) {
+        .SUCCESS => {},
+        .CANCELLED => unreachable, // deviceIoControl drains and returns error.Canceled
+        .INSUFFICIENT_RESOURCES => return error.SystemResources,
+        .SHARING_VIOLATION => return error.AddressInUse,
+        else => return error.Unexpected,
+    }
     return T.addressFromPosix(&storage.Address);
 }
 
 /// The shim's own connect (Windows + 0.16): create the AFD endpoint, set
 /// REUSE_UNICASTPORT, bind wildcard .Active, issue CONNECT and read its NTSTATUS
 /// directly. No second network probe: the connect itself yields the terminal
-/// status. The returned handle is a raw AFD endpoint std read/write/close accept.
-pub fn connect(address: *const Io.net.IpAddress, options: Io.net.IpAddress.ConnectOptions) Io.net.IpAddress.ConnectError!Io.net.Socket {
+/// status. The returned handle is a raw AFD endpoint std read/write/close
+/// accept. There is no connect timeout: CONNECT completes when TCP gives up and
+/// the caller cancels (error.Canceled), matching std 0.16. Setup-path errors
+/// propagate with std's mapping rather than collapsing to Unexpected.
+pub fn connect(io: Io, address: *const Io.net.IpAddress, options: Io.net.IpAddress.ConnectOptions) Io.net.IpAddress.ConnectError!Io.net.Socket {
     // std 0.16 panics on a connect timeout; reject it explicitly instead.
     if (options.timeout != .none) return error.OptionUnsupported;
     const family = T.posixAddressFamily(address);
-    const handle = openSocketAfd(family, options.mode, options.protocol) catch return error.Unexpected;
+    const handle = try openSocketAfd(family, options.mode, options.protocol);
     errdefer windows.CloseHandle(handle);
-    setReuseUnicastport(handle) catch return error.Unexpected;
+    try setReuseUnicastport(io, handle);
     const wildcard: Io.net.IpAddress = switch (address.*) {
         .ip4 => .{ .ip4 = .unspecified(0) },
         .ip6 => .{ .ip6 = .unspecified(0) },
     };
-    const bound = bindActiveWildcard(handle, &wildcard) catch return error.Unexpected;
+    const bound = bindActiveWildcard(io, handle, &wildcard) catch |err| switch (err) {
+        error.AddressInUse => return error.Unexpected, // std netConnectIpWindows maps bind AddressInUse to Unexpected
+        else => |e| return e,
+    };
     const Storage = extern struct { Reserved0: [3]usize = @splat(0), Address: T.PosixAddress };
     var storage: Storage = .{ .Address = undefined };
     const addr_len = T.addressToPosix(address, &storage.Address);
-    const st = afdIoctlEvent(handle, windows.IOCTL.AFD.CONNECT, &storage, @offsetOf(Storage, "Address") + addr_len, null, 0, connect_timeout_100ns) orelse return error.Timeout;
+    const st = try afdIoctl(
+        io,
+        handle,
+        windows.IOCTL.AFD.CONNECT,
+        @as([]const u8, @ptrCast(&storage))[0 .. @offsetOf(Storage, "Address") + addr_len],
+        &.{},
+    );
     switch (st) {
         .SUCCESS => {},
+        .CANCELLED => unreachable, // deviceIoControl drains and returns error.Canceled
+        .INSUFFICIENT_RESOURCES => return error.SystemResources,
         else => {
             if (mapConnect(st)) |mapped| return mapped;
             return error.Unexpected;

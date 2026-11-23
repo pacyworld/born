@@ -597,9 +597,8 @@ jobs:
           $lines = @(Get-Content nats-unit.log | ForEach-Object { $_ -replace "$esc\[[0-9;]*[A-Za-z]", '' })
           $proof = $lines | Select-String -Pattern '^route proof: PASS$'
           if (-not $proof) { throw "nats-unit.exe printed no route proof PASS line" }
-          # born#126 fixed the upstream Zig 0.16.0 threaded Windows refusal
-          # mapping, so the W3 (#118) known-failing allowance is removed: every
-          # leg must now exit 0 with a passing summary (universal exact-green).
+          # Universal exact-green: every leg must exit 0 with a passing summary
+          # (the Zig 0.16.0 threaded Windows refusal mapping is compensated).
           if ($rc -ne 0) { throw "nats-unit.exe exited with $rc" }
           $summary = $lines | Select-String -Pattern '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$'
           if (-not $summary) { throw "nats-unit.exe printed no passing summary line" }
@@ -693,10 +692,8 @@ jobs:
           $lines = @(Get-Content http-contract.log | ForEach-Object { $_ -replace "$esc\[[0-9;]*[A-Za-z]", '' })
           $proof = $lines | Select-String -Pattern '^route proof: PASS$'
           if (-not $proof) { throw "http-contract.exe printed no route proof PASS line" }
-          # born#126 fixed the upstream Zig 0.16.0 threaded Windows AFD mappings
-          # (connect refusal #118, read/write peer-close #126), so the W3/#126
-          # known-failing allowance is removed: every leg must now exit 0 with a
-          # passing summary (universal exact-green).
+          # Universal exact-green: every leg must exit 0 with a passing summary
+          # (the Zig 0.16.0 threaded Windows AFD mappings are compensated).
           if ($rc -ne 0) { throw "http-contract.exe exited with $rc" }
           $summary = $lines | Select-String -Pattern '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$'
           if (-not $summary) { throw "http-contract.exe printed no passing summary line" }
