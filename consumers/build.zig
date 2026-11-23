@@ -66,8 +66,11 @@ pub fn build(b: *std.Build) void {
     nats_options.addOption([]const u8, "lang", "zig");
     nats_options.addOption(bool, "use_tls", false);
     const nats_options_mod = nats_options.createModule();
+    // The fetched nats package is read-only; the born-side #133 deadline patch
+    // lives in a generated copy of the src tree that nats_mod roots at.
+    const nats_src_root = generateNatsSrcTree(b, nats_root);
     const nats_mod = b.createModule(.{
-        .root_source_file = .{ .cwd_relative = b.pathJoin(&.{ nats_root, "src", "root.zig" }) },
+        .root_source_file = nats_src_root,
         .target = target,
         .optimize = optimize,
         .imports = &.{
@@ -308,6 +311,79 @@ fn replaceOnce(alloc: std.mem.Allocator, src: []const u8, needle: []const u8, re
     return std.fmt.allocPrint(alloc, "{s}{s}{s}", .{ src[0..i], replacement, src[i + needle.len ..] }) catch @panic("OOM");
 }
 
+/// sha256 of the fetched jetstream.zig at the upstream pin (b8ffdd9). The
+/// born-side #133 patch below is derived from these exact bytes; a pin bump
+/// that changes the file fails the build until the patch is re-derived.
+const nats_jetstream_sha256 = "63c99a325871dc651603ac6297820041b904addcd6235268597165db9a3ff5af";
+
+/// born#133: publishMsgInternal's NoResponders branch returned NoStreamResponse
+/// once retries_left hit 0 without first checking the overall request deadline.
+/// response_manager.waitForResponse delivers a queued 503 reply without checking
+/// the deadline, so a NoResponders arriving after the deadline expired during a
+/// retry sleep surfaced NoStreamResponse instead of Timeout. Check the deadline
+/// at the top of the branch, before the retries_left guard. The needle occurs
+/// exactly once (replaceOnce drift guard); io_util.expired is already imported.
+const nats_deadline_needle =
+    "error.NoResponders => {\n" ++
+    "                    if (retries_left == 0) return error.NoStreamResponse;";
+const nats_deadline_patch =
+    "error.NoResponders => {\n" ++
+    "                    // born#133: an expired overall deadline ends the retries with\n" ++
+    "                    // Timeout before the retries_left guard can report NoStreamResponse.\n" ++
+    "                    if (io_util.expired(self.nc.io, deadline)) return error.Timeout;\n" ++
+    "                    if (retries_left == 0) return error.NoStreamResponse;";
+
+/// Generate the nats src tree from the fetched package, applying the born-side
+/// #133 deadline patch to jetstream.zig. Every src file is copied byte-identical
+/// except jetstream.zig, whose bytes are sha256-pinned and patched through
+/// replaceOnce (the same drift-guarded mechanism the std facade uses). The
+/// module roots at the generated root.zig so relative imports and @embedFile
+/// resolve within the generated tree.
+fn generateNatsSrcTree(b: *std.Build, nats_root: []const u8) std.Build.LazyPath {
+    const io = b.graph.io;
+    const src_path = b.pathJoin(&.{ nats_root, "src" });
+    var src_dir = std.Io.Dir.cwd().openDir(io, src_path, .{ .iterate = true }) catch |err|
+        std.debug.panic("consumers: cannot open nats src dir '{s}' ({s})", .{ src_path, @errorName(err) });
+    defer src_dir.close(io);
+    const wf = b.addWriteFiles();
+    var root_lp: ?std.Build.LazyPath = null;
+    copyNatsSrc(b, wf, src_dir, "", &root_lp);
+    return root_lp orelse @panic("consumers: nats src tree has no root.zig");
+}
+
+fn copyNatsSrc(b: *std.Build, wf: *std.Build.Step.WriteFile, dir: std.Io.Dir, prefix: []const u8, root_lp: *?std.Build.LazyPath) void {
+    const io = b.graph.io;
+    const alloc = b.allocator;
+    const limit = std.Io.Limit.limited(1 << 20);
+    var it = dir.iterate();
+    while (it.next(io) catch |err| std.debug.panic("consumers: cannot iterate nats src ({s})", .{@errorName(err)})) |entry| {
+        const rel = if (prefix.len == 0) entry.name else b.pathJoin(&.{ prefix, entry.name });
+        switch (entry.kind) {
+            .file => {
+                var bytes: []const u8 = dir.readFileAlloc(io, entry.name, alloc, limit) catch |err|
+                    std.debug.panic("consumers: cannot read nats src '{s}' ({s})", .{ rel, @errorName(err) });
+                if (std.mem.eql(u8, rel, "jetstream.zig")) {
+                    var digest: [32]u8 = undefined;
+                    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+                    const actual = std.fmt.bytesToHex(digest, .lower);
+                    if (!std.mem.eql(u8, &actual, nats_jetstream_sha256))
+                        std.debug.panic("consumers: nats jetstream.zig does not match the #133 patch pin (expected {s}, actual {s}); re-derive the patch against the new upstream pin", .{ nats_jetstream_sha256, actual });
+                    bytes = replaceOnce(alloc, bytes, nats_deadline_needle, nats_deadline_patch, "nats jetstream.zig: #133 NoResponders deadline check");
+                }
+                const lp = wf.add(rel, bytes);
+                if (std.mem.eql(u8, rel, "root.zig")) root_lp.* = lp;
+            },
+            .directory => {
+                var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch |err|
+                    std.debug.panic("consumers: cannot open nats src dir '{s}' ({s})", .{ rel, @errorName(err) });
+                defer sub.close(io);
+                copyNatsSrc(b, wf, sub, rel, root_lp);
+            },
+            else => std.debug.panic("consumers: unexpected nats src entry kind in '{s}'", .{rel}),
+        }
+    }
+}
+
 /// Resolve a declared dependency's fetched source root without evaluating
 /// its build.zig: reads the same generated package table std.Build.dependency
 /// itself reads. build_root is the fetched source directory.
@@ -464,7 +540,15 @@ fn generateE2eTree(b: *std.Build, entries: []const VendoredEntry) std.Build.Lazy
             std.debug.panic("consumers: override nats/{s} was derived from a different upstream {s}; re-derive it against the new pin or drop it", .{ o.owned, o.vendored });
         const bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, b.pathJoin(&.{ root, "nats", o.owned }), b.allocator, std.Io.Limit.limited(1 << 20)) catch |err|
             std.debug.panic("consumers: cannot read nats/{s} override ({s})", .{ o.owned, @errorName(err) });
-        _ = wf.add(o.vendored, bytes);
+        const lp = wf.add(o.vendored, bytes);
+        if (std.mem.eql(u8, o.vendored, "tests/all_tests.zig")) all_tests = lp;
+    }
+    // Born-owned test files with no vendored counterpart, imported by the
+    // born-owned all_tests.zig override (born#133 regression test).
+    for (e2e_extras) |x| {
+        const bytes = std.Io.Dir.cwd().readFileAlloc(b.graph.io, b.pathJoin(&.{ root, "nats", x.owned }), b.allocator, std.Io.Limit.limited(1 << 20)) catch |err|
+            std.debug.panic("consumers: cannot read nats/{s} extra ({s})", .{ x.owned, @errorName(err) });
+        _ = wf.add(x.vendored, bytes);
     }
     return all_tests orelse @panic("consumers: vendored tree has no tests/all_tests.zig");
 }
@@ -481,6 +565,14 @@ fn generateE2eTree(b: *std.Build, entries: []const VendoredEntry) std.Build.Lazy
 const e2e_overrides = [_]struct { vendored: []const u8, owned: []const u8, base_sha256: []const u8 }{
     .{ .vendored = "tests/utils.zig", .owned = "utils.zig", .base_sha256 = "bf61543fb6432aa90bddf15849175a4c164e2811f94ae96154f31184b3b973d2" },
     .{ .vendored = "tests/pending_msgs_test.zig", .owned = "pending_msgs_test.zig", .base_sha256 = "beb4462f4bb69c254b4458d992d949fdd9b6c8a07f580aded3b7e741e2be0d98" },
+    // born#133: imports the born-owned deadline regression test (e2e_extras).
+    .{ .vendored = "tests/all_tests.zig", .owned = "all_tests.zig", .base_sha256 = "00983d910a6d4d8dde4372c3778b08953517eb58fab1d94b4be33651f008b5e6" },
+};
+
+/// Born-owned e2e test files with no vendored counterpart, added to the
+/// generated tree and imported by the born-owned all_tests.zig override.
+const e2e_extras = [_]struct { vendored: []const u8, owned: []const u8 }{
+    .{ .vendored = "tests/deadline_133_test.zig", .owned = "deadline_133_test.zig" },
 };
 
 fn isOverridden(vendored_path: []const u8) bool {
