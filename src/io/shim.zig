@@ -123,6 +123,7 @@ const builtin = @import("builtin");
 const born = @import("born");
 const compat = @import("compat");
 const io_options = @import("born_io_options");
+const neterr016 = @import("neterr016.zig");
 const Io = std.Io;
 
 const is_017 = builtin.zig_version.minor >= 17;
@@ -4407,6 +4408,9 @@ const fwd = struct {
         const self = shimFrom(userdata);
         if (!self.entryEnter()) return deadResult(Io.net.IpAddress.ConnectError!Io.net.Socket);
         defer self.entryExit();
+        // Windows + 0.16: the shim owns connect to keep the CONNECT NTSTATUS
+        // observable (std 0.16 discards it); elsewhere forward unchanged.
+        if (is_windows and !is_017) return neterr016.connect(self.threaded_io, address, options);
         return self.threaded_io.vtable.netConnectIp(self.threaded_io.userdata, address, options);
     }
     fn netListenUnix(userdata: ?*anyopaque, address: *const Io.net.UnixAddress, options: Io.net.UnixAddress.ListenOptions) Io.net.UnixAddress.ListenError!Io.net.Socket.Handle {
@@ -4477,18 +4481,48 @@ const fwd016 = if (!is_017) struct {
         const self = shimFrom(userdata);
         if (!self.entryEnter()) return .{ error.Unexpected, 0 };
         defer self.entryExit();
-        return self.threaded_io.vtable.netSend(self.threaded_io.userdata, handle, messages, flags);
+        const result = self.threaded_io.vtable.netSend(self.threaded_io.userdata, handle, messages, flags);
+        // Windows: recover the sticky terminal state behind error.Unexpected;
+        // success and non-terminal errors forward unchanged.
+        if (is_windows) {
+            if (result[0]) |err| {
+                if (err == error.Unexpected) {
+                    if (neterr016.sendError(self.threaded_io, handle)) |mapped| return .{ mapped, result[1] };
+                }
+            }
+        }
+        return result;
     }
     fn netRead(userdata: ?*anyopaque, src: Io.net.Socket.Handle, data: [][]u8) Io.net.Stream.Reader.Error!usize {
         const self = shimFrom(userdata);
         if (!self.entryEnter()) return deadResult(Io.net.Stream.Reader.Error!usize);
         defer self.entryExit();
+        // Windows: recover the sticky terminal state behind error.Unexpected;
+        // success and non-terminal errors forward unchanged.
+        if (is_windows) {
+            return self.threaded_io.vtable.netRead(self.threaded_io.userdata, src, data) catch |err| {
+                if (err == error.Unexpected) {
+                    if (neterr016.readError(self.threaded_io, src)) |mapped| return mapped;
+                }
+                return err;
+            };
+        }
         return self.threaded_io.vtable.netRead(self.threaded_io.userdata, src, data);
     }
     fn netWrite(userdata: ?*anyopaque, dest: Io.net.Socket.Handle, header: []const u8, data: []const []const u8, splat: usize) Io.net.Stream.Writer.Error!usize {
         const self = shimFrom(userdata);
         if (!self.entryEnter()) return deadResult(Io.net.Stream.Writer.Error!usize);
         defer self.entryExit();
+        // Windows: recover the sticky terminal state behind error.Unexpected;
+        // success and non-terminal errors forward unchanged.
+        if (is_windows) {
+            return self.threaded_io.vtable.netWrite(self.threaded_io.userdata, dest, header, data, splat) catch |err| {
+                if (err == error.Unexpected) {
+                    if (neterr016.writeError(self.threaded_io, dest)) |mapped| return mapped;
+                }
+                return err;
+            };
+        }
         return self.threaded_io.vtable.netWrite(self.threaded_io.userdata, dest, header, data, splat);
     }
     fn netClose(userdata: ?*anyopaque, handles: []const Io.net.Socket.Handle) void {

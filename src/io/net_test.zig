@@ -15,6 +15,7 @@ const builtin = @import("builtin");
 const born = @import("born");
 const born_io = @import("root.zig");
 const shim = @import("shim.zig");
+const neterr016 = @import("neterr016.zig");
 const compat = @import("compat");
 const Io = std.Io;
 const expect = std.testing.expect;
@@ -1329,4 +1330,122 @@ test "a concurrent read on a parked Born read returns Unexpected" {
     thread.join();
     try expectEqual(@as(u32, 1), result.load(.acquire));
     try expectEqualSlices(u8, "Z", &got);
+}
+
+// Windows + 0.16 threaded-route compensation (#126). These run over the
+// all-Threaded baseline (capabilities default to .threaded), where netConnectIp
+// forwards to neterr016.connect and netRead/netWrite/netSend probe the sticky
+// terminal state behind error.Unexpected. Skipped on every other target and on
+// 0.17.x, where upstream already maps these statuses.
+
+test "Windows 0.16 threaded connect to a closed port returns ConnectionRefused (#126)" {
+    if (!is_windows or is_017 or builtin.single_threaded) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const io = try born_io.io(&port, .{ .allocator = std.testing.allocator });
+    defer born_io.deinit(io);
+    var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer fixture.deinit();
+    const fio = fixture.io();
+
+    // Reserve a loopback port, note it, then close the listener so it refuses.
+    const addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try addr.listen(fio, .{});
+    const refused_addr = server.socket.address;
+    server.deinit(fio);
+
+    // neterr016.connect observes the CONNECT refusal NTSTATUS directly; no
+    // second network probe.
+    try expectError(error.ConnectionRefused, refused_addr.connect(io, .{ .mode = .stream }));
+}
+
+test "Windows 0.16 threaded read after abortive peer close returns ConnectionResetByPeer (#126)" {
+    if (!is_windows or is_017 or builtin.single_threaded) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const io = try born_io.io(&port, .{ .allocator = std.testing.allocator });
+    defer born_io.deinit(io);
+    var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer fixture.deinit();
+    var server: Io.net.Server = undefined;
+    var client: Io.net.Stream = undefined;
+    var peer: Io.net.Stream = undefined;
+    try setupPair(io, &fixture, &server, &client, &peer);
+    defer client.close(io);
+    defer server.deinit(fixture.io());
+
+    // Client sends data the peer never reads; the peer closes with SO_LINGER
+    // {1,0} so the kernel sends RST. std 0.16 collapses the read failure to
+    // Unexpected; the shim's SEND probe recovers ConnectionResetByPeer.
+    var msg = [_][]const u8{"unread"};
+    try expectEqual(@as(usize, 6), try rawWrite(io, client.socket.handle, &.{}, &msg, 1));
+    forceResetOnClose(peer.socket.handle);
+    peer.close(fixture.io());
+
+    var buf: [8]u8 = undefined;
+    var iov = [_][]u8{buf[0..]};
+    try expectError(error.ConnectionResetByPeer, rawRead(io, client.socket.handle, &iov));
+
+    // Direct calls into the compensation module (real calls into the module
+    // bodies for check-targets on the Windows triple): the reset socket's send
+    // side probes to the same terminal state.
+    try expectEqual(
+        @as(?Io.net.Stream.Writer.Error, error.ConnectionResetByPeer),
+        neterr016.writeError(fixture.io(), client.socket.handle),
+    );
+    try expectEqual(
+        @as(?Io.net.Socket.SendError, error.ConnectionResetByPeer),
+        neterr016.sendError(fixture.io(), client.socket.handle),
+    );
+}
+
+test "Windows 0.16 threaded connect canceled while pending returns Canceled promptly (#126)" {
+    if (!is_windows or is_017 or builtin.single_threaded) return error.SkipZigTest;
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const io = try born_io.io(&port, .{ .allocator = std.testing.allocator });
+    defer born_io.deinit(io);
+    var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer fixture.deinit();
+
+    // Reserve a loopback port, note it, then close the listener. Windows
+    // loopback refusal pends ~2 s while TCP retries the SYN, so the CONNECT
+    // ioctl is still pending when cancel arrives, and nothing leaves the host.
+    const addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try addr.listen(fixture.io(), .{});
+    const target = server.socket.address;
+    server.deinit(fixture.io());
+
+    const Shared = struct {
+        started: std.atomic.Value(u32) = .init(0),
+        result: ?Io.net.IpAddress.ConnectError = null,
+    };
+    var shared: Shared = .{};
+    var group: Io.Group = .init;
+    group.async(io, struct {
+        fn run(gio: Io, sh: *Shared, dst: *const Io.net.IpAddress) void {
+            sh.started.store(1, .release);
+            Io.futexWake(gio, u32, &sh.started.raw, 1);
+            const stream = dst.connect(gio, .{ .mode = .stream }) catch |err| {
+                sh.result = err;
+                return;
+            };
+            sh.result = null;
+            stream.close(gio);
+        }
+    }.run, .{ io, &shared, &target });
+
+    // Wait until the task has entered connect, then cancel the group.
+    while (shared.started.load(.acquire) == 0) {
+        Io.futexWaitUncancelable(io, u32, &shared.started.raw, 0);
+    }
+    const t0 = try born.nowNs();
+    group.cancel(io);
+    const elapsed_ns = (try born.nowNs()) - t0;
+
+    try expectEqual(@as(?Io.net.IpAddress.ConnectError, error.Canceled), shared.result);
+    // Well under the ~2 s loopback refusal latency: cancel hit the pending
+    // ioctl through std's alertable wait + NtCancelIoFileEx + drain rather
+    // than the refusal completing first.
+    try expect(elapsed_ns < 1 * std.time.ns_per_s);
 }
