@@ -2,24 +2,16 @@
 // generated e2e tree by generateE2eTree and imported by the born-owned
 // all_tests.zig override).
 //
-// publishMsgInternal's NoResponders branch used to check retries_left before
-// the overall request deadline. response_manager.waitForResponse delivers a
-// queued 503 reply without checking the deadline, so a NoResponders arriving
-// after the deadline expired during a retry sleep surfaced NoStreamResponse
-// instead of Timeout. The born-side patch checks io_util.expired at the top of
-// the branch, so an expired deadline always ends the retries with Timeout.
+// The born-side patch checks io_util.expired at the top of publishMsgInternal's
+// NoResponders branch, before the retries_left guard, so an expired overall
+// request deadline always ends the retries with Timeout, never NoStreamResponse.
 //
-// Determinism note: the invariant asserted here (expired deadline => Timeout,
-// never NoStreamResponse) holds on every iteration with the patch. Without the
-// patch the failure is a race: waitForResponse also guards the deadline at
-// entry, and the retry loop has a post-sleep expiry check, so NoResponders
-// meets an already-expired deadline only in a narrow window (the reply is
-// queued after expiry but before waitForResponse's entry check, or the
-// post-sleep check races false). The loop below exercises that window
-// repeatedly; a clean public-API test that fails deterministically on the
-// unpatched client is not possible because both of those guards already return
-// Timeout on the common paths. See the pull request for the captured
-// unpatched failure and the patched clean runs.
+// Determinism: the asserted invariant (expired deadline => Timeout) holds on
+// every iteration with the patch. Unpatched, the failure is a load-dependent
+// race no public-API test can force deterministically: waitForResponse and the
+// retry loop's post-sleep check both already return Timeout on the common paths,
+// leaving only a narrow expiry window. See PR #135 for the captured unpatched
+// failure and the patched clean runs.
 
 const std = @import("std");
 const testing = std.testing;

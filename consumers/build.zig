@@ -316,13 +316,10 @@ fn replaceOnce(alloc: std.mem.Allocator, src: []const u8, needle: []const u8, re
 /// that changes the file fails the build until the patch is re-derived.
 const nats_jetstream_sha256 = "63c99a325871dc651603ac6297820041b904addcd6235268597165db9a3ff5af";
 
-/// born#133: publishMsgInternal's NoResponders branch returned NoStreamResponse
-/// once retries_left hit 0 without first checking the overall request deadline.
-/// response_manager.waitForResponse delivers a queued 503 reply without checking
-/// the deadline, so a NoResponders arriving after the deadline expired during a
-/// retry sleep surfaced NoStreamResponse instead of Timeout. Check the deadline
-/// at the top of the branch, before the retries_left guard. The needle occurs
-/// exactly once (replaceOnce drift guard); io_util.expired is already imported.
+/// born#133: check the overall request deadline at the top of the NoResponders
+/// branch, before the retries_left guard, so an expired deadline ends the
+/// retries with Timeout rather than NoStreamResponse. The needle occurs exactly
+/// once (replaceOnce drift guard); io_util.expired is already imported.
 const nats_deadline_needle =
     "error.NoResponders => {\n" ++
     "                    if (retries_left == 0) return error.NoStreamResponse;";
