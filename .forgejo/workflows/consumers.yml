@@ -597,39 +597,13 @@ jobs:
           $lines = @(Get-Content nats-unit.log | ForEach-Object { $_ -replace "$esc\[[0-9;]*[A-Za-z]", '' })
           $proof = $lines | Select-String -Pattern '^route proof: PASS$'
           if (-not $proof) { throw "nats-unit.exe printed no route proof PASS line" }
-          if (('${{ matrix.route }}' -eq 'threaded') -and ('${{ matrix.zig }}' -eq '0.16.0')) {
-            # W3 (#118, review 6166): upstream Zig 0.16.0 threaded Windows
-            # maps a refused connect to error.Unexpected. Accept ONLY the
-            # exact known-failing shape: this summary, exactly one failed
-            # test (the refusal test), this error detail, rc 1. Any other
-            # count, test, or error stays red.
-            $summary = $lines | Select-String -Pattern '^118 passed; 2 skipped; 1 failed\.$'
-            $errline = $lines | Select-String -Pattern '^\s*expected error\.ConnectionRefused, found error\.Unexpected\s*$'
-            $failed = @()
-            $inBlock = $false
-            foreach ($l in $lines) {
-              if ($l -eq 'Failed tests:') { $inBlock = $true; continue }
-              if ($inBlock) {
-                if ($l.Trim() -eq '') { break }
-                $failed += $l.Trim()
-              }
-            }
-            $onlyW3 = ($failed.Count -eq 1) -and ($failed[0] -eq 'net_util.test.tcpConnectToHost with nothing listening')
-            if ($summary -and $errline -and $onlyW3 -and ($rc -eq 1)) {
-              "W3 known-failing branch taken (#118): threaded Zig 0.16.0 Windows unit leg accepted with exactly the upstream refusal-mapping failure; any other shape stays red"
-              "runtime evidence (x86_64-windows-gnu, IOCP, nats-unit, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}, W3 #118): $($summary.Line)"
-              # The runner's pwsh wrapper ends with exit $LASTEXITCODE, which
-              # cmd /c left at 1; exit explicitly so acceptance is green.
-              exit 0
-            } else {
-              throw "threaded Zig 0.16.0 Windows unit leg does not match the exact W3 known-failing shape (#118): rc=$rc summary='$($summary.Line)' failedTests='$($failed -join '|')' errLine='$($errline.Line)'"
-            }
-          } else {
-            if ($rc -ne 0) { throw "nats-unit.exe exited with $rc" }
-            $summary = $lines | Select-String -Pattern '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$'
-            if (-not $summary) { throw "nats-unit.exe printed no passing summary line" }
-            "runtime evidence (x86_64-windows-gnu, IOCP, nats-unit, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $($summary.Line)"
-          }
+          # born#126 fixed the upstream Zig 0.16.0 threaded Windows refusal
+          # mapping, so the W3 (#118) known-failing allowance is removed: every
+          # leg must now exit 0 with a passing summary (universal exact-green).
+          if ($rc -ne 0) { throw "nats-unit.exe exited with $rc" }
+          $summary = $lines | Select-String -Pattern '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$'
+          if (-not $summary) { throw "nats-unit.exe printed no passing summary line" }
+          "runtime evidence (x86_64-windows-gnu, IOCP, nats-unit, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $($summary.Line)"
 
       - name: Run nats e2e suite
         if: matrix.zig == '0.16.0'
@@ -719,38 +693,11 @@ jobs:
           $lines = @(Get-Content http-contract.log | ForEach-Object { $_ -replace "$esc\[[0-9;]*[A-Za-z]", '' })
           $proof = $lines | Select-String -Pattern '^route proof: PASS$'
           if (-not $proof) { throw "http-contract.exe printed no route proof PASS line" }
-          if (('${{ matrix.route }}' -eq 'threaded') -and ('${{ matrix.zig }}' -eq '0.16.0')) {
-            # Upstream Zig 0.16.0 threaded Windows lacks two AFD result
-            # mappings: CONNECTION_REFUSED on connect (#118) and CONNECTION_RESET
-            # on read/write (#126); both surface as error.Unexpected. Accept ONLY
-            # the exact known-failing shape: 10 tests, 8 pass and exactly these 2
-            # fail (refusal and peer-close), this summary, these two error
-            # details, rc 1. Any other count, test, or error stays red.
-            $summary = $lines | Select-String -Pattern '^8 passed; 0 skipped; 2 failed\.$'
-            $errline = $lines | Select-String -Pattern '^\s*expected error\.ConnectionRefused, found error\.Unexpected\s*$'
-            $peerline = $lines | Select-String -Pattern '"contract\.test\.peer close mid-request: declared error, route stays alive" - Unexpected'
-            $failed = @()
-            $inBlock = $false
-            foreach ($l in $lines) {
-              if ($l -eq 'Failed tests:') { $inBlock = $true; continue }
-              if ($inBlock) {
-                if ($l.Trim() -eq '') { break }
-                $failed += $l.Trim()
-              }
-            }
-            $onlyKnown = ($failed.Count -eq 2) -and ($failed -contains 'contract.test.connection refusal maps to the connect error, not a hang') -and ($failed -contains 'contract.test.peer close mid-request: declared error, route stays alive')
-            if ($summary -and $errline -and $peerline -and $onlyKnown -and ($rc -eq 1)) {
-              "W3/#126 known-failing branch taken: threaded Zig 0.16.0 Windows http leg accepted with exactly the two upstream AFD-mapping failures (refusal #118, peer-close #126); any other shape stays red"
-              "runtime evidence (x86_64-windows-gnu, IOCP, http, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}, W3/#126): $($summary.Line)"
-              # The runner's pwsh wrapper ends with exit $LASTEXITCODE, which
-              # the test runner left at 1; exit explicitly so acceptance is green.
-              exit 0
-            } else {
-              throw "threaded Zig 0.16.0 Windows http leg does not match the exact W3/#126 known-failing shape: rc=$rc summary='$($summary.Line)' failedTests='$($failed -join '|')' errLine='$($errline.Line)' peerLine='$($peerline.Line)'"
-            }
-          } else {
-            if ($rc -ne 0) { throw "http-contract.exe exited with $rc" }
-            $summary = $lines | Select-String -Pattern '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$'
-            if (-not $summary) { throw "http-contract.exe printed no passing summary line" }
-            "runtime evidence (x86_64-windows-gnu, IOCP, http, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $($summary.Line)"
-          }
+          # born#126 fixed the upstream Zig 0.16.0 threaded Windows AFD mappings
+          # (connect refusal #118, read/write peer-close #126), so the W3/#126
+          # known-failing allowance is removed: every leg must now exit 0 with a
+          # passing summary (universal exact-green).
+          if ($rc -ne 0) { throw "http-contract.exe exited with $rc" }
+          $summary = $lines | Select-String -Pattern '^(All [0-9]+ tests passed\.|[0-9]+ passed; [0-9]+ skipped; 0 failed\.)$'
+          if (-not $summary) { throw "http-contract.exe printed no passing summary line" }
+          "runtime evidence (x86_64-windows-gnu, IOCP, http, zig ${{ matrix.zig }}, ${{ matrix.optimize }}, ${{ matrix.route }}): $($summary.Line)"
