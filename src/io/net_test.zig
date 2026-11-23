@@ -1405,12 +1405,17 @@ test "Windows 0.16 threaded connect canceled while pending returns Canceled prom
     defer port.deinit();
     const io = try born_io.io(&port, .{ .allocator = std.testing.allocator });
     defer born_io.deinit(io);
+    var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
+    defer fixture.deinit();
 
-    // TEST-NET-1 address: SYNs are black-holed, so the CONNECT ioctl pends
-    // until TCP gives up. Canceling must reach the pending ioctl through std's
-    // alertable wait + NtCancelIoFileEx + drain and return Canceled promptly,
-    // not block on a private timeout.
-    const target = try Io.net.IpAddress.parseIp4("192.0.2.1", 9);
+    // Reserve a loopback port, note it, then close the listener. Windows
+    // loopback refusal pends ~2 s while TCP retries the SYN, so the CONNECT
+    // ioctl is still pending when cancel arrives, and nothing leaves the host.
+    const addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
+    var server = try addr.listen(fixture.io(), .{});
+    const target = server.socket.address;
+    server.deinit(fixture.io());
+
     const Shared = struct {
         started: std.atomic.Value(u32) = .init(0),
         result: ?Io.net.IpAddress.ConnectError = null,
@@ -1439,7 +1444,8 @@ test "Windows 0.16 threaded connect canceled while pending returns Canceled prom
     const elapsed_ns = (try born.nowNs()) - t0;
 
     try expectEqual(@as(?Io.net.IpAddress.ConnectError, error.Canceled), shared.result);
-    // Prompt: the superseded event-based wait blocked up to 30 s; cancel + drain
-    // is sub-second. Bound generously for a loaded host.
-    try expect(elapsed_ns < 5 * std.time.ns_per_s);
+    // Well under the ~2 s loopback refusal latency: cancel hit the pending
+    // ioctl through std's alertable wait + NtCancelIoFileEx + drain rather
+    // than the refusal completing first.
+    try expect(elapsed_ns < 1 * std.time.ns_per_s);
 }
