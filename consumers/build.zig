@@ -316,19 +316,53 @@ fn replaceOnce(alloc: std.mem.Allocator, src: []const u8, needle: []const u8, re
 /// that changes the file fails the build until the patch is re-derived.
 const nats_jetstream_sha256 = "63c99a325871dc651603ac6297820041b904addcd6235268597165db9a3ff5af";
 
-/// born#133: check the overall request deadline at the top of the NoResponders
-/// branch, before the retries_left guard, so an expired deadline ends the
-/// retries with Timeout rather than NoStreamResponse. The needle occurs exactly
-/// once (replaceOnce drift guard); io_util.expired is already imported.
+/// born#133: two guards in the NoResponders branch of publishMsgInternal.
+/// (1) Check the overall request deadline before the retries_left guard, so an
+/// expired deadline ends the retries with Timeout rather than NoStreamResponse.
+/// (2) Consume the full clipped retry wait across early io.sleep wakeups (the
+/// awake clock can be coarse), so a retry_wait at least as long as the remaining
+/// deadline always expires it before retries can exhaust. The needle occurs
+/// exactly once (replaceOnce drift guard); io_util is already imported.
 const nats_deadline_needle =
     "error.NoResponders => {\n" ++
-    "                    if (retries_left == 0) return error.NoStreamResponse;";
+    "                    if (retries_left == 0) return error.NoStreamResponse;\n" ++
+    "                    retries_left -= 1;\n" ++
+    "\n" ++
+    "                    const remaining = io_util.remaining(self.nc.io, deadline) orelse return error.Timeout;\n" ++
+    "                    const retry_wait = if (remaining.nanoseconds < options.retry_wait.nanoseconds)\n" ++
+    "                        remaining\n" ++
+    "                    else\n" ++
+    "                        options.retry_wait;\n" ++
+    "                    try self.nc.io.sleep(retry_wait, .awake);\n" ++
+    "                    if (io_util.expired(self.nc.io, deadline)) return error.Timeout;\n" ++
+    "                    continue;\n" ++
+    "                },";
 const nats_deadline_patch =
     "error.NoResponders => {\n" ++
     "                    // born#133: an expired overall deadline ends the retries with\n" ++
     "                    // Timeout before the retries_left guard can report NoStreamResponse.\n" ++
     "                    if (io_util.expired(self.nc.io, deadline)) return error.Timeout;\n" ++
-    "                    if (retries_left == 0) return error.NoStreamResponse;";
+    "                    if (retries_left == 0) return error.NoStreamResponse;\n" ++
+    "                    retries_left -= 1;\n" ++
+    "\n" ++
+    "                    const remaining = io_util.remaining(self.nc.io, deadline) orelse return error.Timeout;\n" ++
+    "                    const retry_wait = if (remaining.nanoseconds < options.retry_wait.nanoseconds)\n" ++
+    "                        remaining\n" ++
+    "                    else\n" ++
+    "                        options.retry_wait;\n" ++
+    "                    // born#133: io.sleep can wake early on a coarse awake clock.\n" ++
+    "                    // Consume the full clipped wait so a retry_wait at least as\n" ++
+    "                    // long as the remaining deadline always expires it before\n" ++
+    "                    // retries can exhaust. The loop is bounded by wait_deadline.\n" ++
+    "                    const wait_deadline = io_util.deadline(self.nc.io, .{ .duration = .{ .raw = retry_wait, .clock = .awake } });\n" ++
+    "                    while (!io_util.expired(self.nc.io, wait_deadline)) {\n" ++
+    "                        if (io_util.expired(self.nc.io, deadline)) return error.Timeout;\n" ++
+    "                        const left = io_util.remaining(self.nc.io, wait_deadline) orelse break;\n" ++
+    "                        try self.nc.io.sleep(left, .awake);\n" ++
+    "                    }\n" ++
+    "                    if (io_util.expired(self.nc.io, deadline)) return error.Timeout;\n" ++
+    "                    continue;\n" ++
+    "                },";
 
 /// Generate the nats src tree from the fetched package, applying the born-side
 /// #133 deadline patch to jetstream.zig. Every src file is copied byte-identical

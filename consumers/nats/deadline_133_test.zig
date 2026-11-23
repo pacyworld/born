@@ -2,16 +2,16 @@
 // generated e2e tree by generateE2eTree and imported by the born-owned
 // all_tests.zig override).
 //
-// The born-side patch checks io_util.expired at the top of publishMsgInternal's
-// NoResponders branch, before the retries_left guard, so an expired overall
-// request deadline always ends the retries with Timeout, never NoStreamResponse.
+// The born-side patch guards publishMsgInternal's NoResponders branch twice:
+// io_util.expired before the retries_left guard (expired deadline => Timeout,
+// never NoStreamResponse), and a retry wait that consumes the full clipped
+// duration across early io.sleep wakeups, so a retry_wait longer than the
+// remaining deadline always expires it before retries can exhaust.
 //
-// Determinism: the asserted invariant (expired deadline => Timeout) holds on
-// every iteration with the patch. Unpatched, the failure is a load-dependent
-// race no public-API test can force deterministically: waitForResponse and the
-// retry loop's post-sleep check both already return Timeout on the common paths,
-// leaving only a narrow expiry window. See PR #135 for the captured unpatched
-// failure and the patched clean runs.
+// Determinism: with both guards the invariant holds on every iteration on
+// every route. Unpatched, the failure is a timing race: a coarse awake clock
+// can wake the clipped retry sleep early, letting retries exhaust inside the
+// deadline. See PR #135 for the captured failures and the patched clean runs.
 
 const std = @import("std");
 const testing = std.testing;
