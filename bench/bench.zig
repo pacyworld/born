@@ -310,7 +310,7 @@ fn serve(alloc: std.mem.Allocator, opts: Options) !void {
     defer srv.listener.close();
     try srv.listener.register(&srv.port, &srv.listener);
     var timer_tag: u8 = 0;
-    try srv.port.addTimer(1, &timer_tag, opts.seconds * 1000, .once);
+    try srv.port.addTimer(1, &timer_tag, @as(u64, opts.seconds) * std.time.ns_per_s, .once);
 
     const bound = try srv.listener.localAddress();
     out("port={d}\n", .{bound.getPort()});
@@ -522,7 +522,7 @@ const WakeCtx = struct {
 fn wakeB(ctx: *WakeCtx, seconds: u32) !void {
     var tag: u8 = 0;
     // Deadline only: the loop ends when A stops bouncing.
-    try ctx.b.addTimer(1, &tag, seconds * 1000 + 500, .once);
+    try ctx.b.addTimer(1, &tag, @as(u64, seconds) * std.time.ns_per_s + 500 * std.time.ns_per_ms, .once);
     var events: [8]born.Event = undefined;
     while (true) {
         const n = try ctx.b.wait(&events, null);

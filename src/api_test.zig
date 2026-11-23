@@ -29,7 +29,7 @@ test "reactor has exact non-generic handle and event API" {
     try std.testing.expect(@TypeOf(Port.wake) == fn (*Port) void);
     try std.testing.expect(@TypeOf(Port.wait) == fn (*Port, []backend.Event, ?i32) backend.WaitError!usize);
     const types = @import("types.zig");
-    try std.testing.expect(@TypeOf(Port.addTimer) == fn (*Port, u32, ?*anyopaque, u32, types.TimerMode) types.TimerError!void);
+    try std.testing.expect(@TypeOf(Port.addTimer) == fn (*Port, u32, ?*anyopaque, u64, types.TimerMode) types.TimerError!void);
     try std.testing.expect(@TypeOf(Port.cancelTimer) == fn (*Port, u32) void);
     try std.testing.expect(@TypeOf(Port.watchSignal) == fn (*Port, types.Signal, ?*anyopaque) types.SignalError!void);
     try std.testing.expect(@TypeOf(Port.unwatchSignal) == fn (*Port, types.Signal) void);

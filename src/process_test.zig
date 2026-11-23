@@ -236,7 +236,7 @@ test "process: an exit is delivered among timer and descriptor events" {
     var timer_tag: u8 = 0;
     var sock_tag: u8 = 0;
     try port.watchProcess(child.handle, &exit_tag);
-    try port.addTimer(1, &timer_tag, 10, .once);
+    try port.addTimer(1, &timer_tag, 10 * std.time.ns_per_ms, .once);
     port.monitorRead(pair[0], &sock_tag);
     _ = try posix.write(pair[1], "x");
 

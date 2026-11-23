@@ -45,9 +45,15 @@ pub const Signal = enum {
 pub const TimerMode = enum {
     /// Fire once, then remove the timer.
     once,
-    /// Fire repeatedly every `after_ms` until cancelled.
+    /// Fire repeatedly every `after_ns` until cancelled.
     repeat,
 };
+
+/// Upper bound on `EvPort.addTimer`'s `after_ns`, uniform across backends.
+/// The value must fit the platform's signed timer data field (kqueue
+/// `Kevent.data` is `i64` on every supported target); a larger `after_ns` is
+/// `error.InvalidArgument`. About 292 years.
+pub const timer_after_ns_max: u64 = std.math.maxInt(i64);
 
 /// `EvPort.init`, the same on every backend.
 pub const InitError = error{
@@ -62,7 +68,8 @@ pub const InitError = error{
 pub const TimerError = error{
     /// Timers are not available on this backend or target.
     Unsupported,
-    /// `.repeat` with `after_ms == 0`.
+    /// `.repeat` with `after_ns == 0`, or `after_ns` above
+    /// `timer_after_ns_max`.
     InvalidArgument,
     /// The kernel refused a timer resource (timerfd, thread-pool timer).
     SystemResources,

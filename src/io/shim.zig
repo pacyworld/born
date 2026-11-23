@@ -86,8 +86,10 @@
 //! `clockResolution(.awake)` stays on Threaded, so on macOS and Windows it
 //! reports the resolution of Threaded's awake clock (CLOCK_UPTIME_RAW and the
 //! Windows interrupt-time clock respectively), not of the Born timer clock
-//! (CLOCK_MONOTONIC, QPC) that `now(.awake)` reads. Born timers have
-//! millisecond granularity: a sleep shorter than 1 ms costs at least 1 ms.
+//! (CLOCK_MONOTONIC, QPC) that `now(.awake)` reads. Born timers take
+//! nanoseconds: a sleep is armed for its exact remaining nanoseconds, rounded
+//! up only by the kernel's own timer resolution, so sub-millisecond sleeps
+//! are honored.
 //!
 //! ## Latency stats
 //!
@@ -1500,19 +1502,20 @@ pub const Shim = struct {
         self.arm(op, op.deadline_ns - now_ns);
     }
 
-    /// Arm a one-shot timer for the remaining time. Born timers have
-    /// millisecond granularity: round up so a sleep never returns early, and
-    /// clamp to the u32 ms ceiling; `timerFired` re-arms the remainder for
-    /// longer sleeps. An arm refusal retires the operation as canceled and
-    /// latches the cause: `error{Canceled}` is the only error `sleep`'s
-    /// declared set admits (module overload table). Loop-thread only.
+    /// Arm a one-shot timer for the remaining time. Born timers take
+    /// nanoseconds: clamp to the port's uniform ceiling so a sleep never
+    /// returns early (the kernel rounds up to its own resolution);
+    /// `timerFired` re-arms the remainder for longer sleeps. An arm refusal
+    /// retires the operation as canceled and latches the cause:
+    /// `error{Canceled}` is the only error `sleep`'s declared set admits
+    /// (module overload table). Loop-thread only.
     fn arm(self: *Shim, op: *SleepOp, remaining_ns: u64) void {
         const index = op.slot_index;
         const slot = self.slotAt(index);
         // The slot was allocated under the queue mutex and dequeued under
         // the same mutex, so the submitter's generation write happens-before
         // this read; while occupied, no other thread writes it.
-        self.port.addTimer(index, slotUdata(index, slot.generation), ceilMs(remaining_ns), .once) catch |err| {
+        self.port.addTimer(index, slotUdata(index, slot.generation), clampTimerNs(remaining_ns), .once) catch |err| {
             self.latch(err);
             return self.retire(op, true);
         };
@@ -1556,7 +1559,7 @@ pub const Shim = struct {
         if (now_ns == 0 or now_ns >= op.deadline_ns) return self.retire(op, false);
         // Re-arm the remainder under the same identity; the slot stays
         // occupied, so the generation is unchanged.
-        self.port.addTimer(id.index, udata, ceilMs(op.deadline_ns - now_ns), .once) catch |err| {
+        self.port.addTimer(id.index, udata, clampTimerNs(op.deadline_ns - now_ns), .once) catch |err| {
             self.latch(err);
             return self.retire(op, true);
         };
@@ -2337,7 +2340,7 @@ pub const Shim = struct {
                 return self.netRetireErr(op, .route_dead);
             };
             if (c.deadline_ns > now_ns) {
-                self.port.addTimer(net_timer_id_base + op.slot_index, netTimerUdata(index, state.generation), ceilMs(c.deadline_ns - now_ns), .once) catch |err| {
+                self.port.addTimer(net_timer_id_base + op.slot_index, netTimerUdata(index, state.generation), clampTimerNs(c.deadline_ns - now_ns), .once) catch |err| {
                     self.latch(err);
                     self.sockRetire(state, index);
                     return self.netRetireErr(op, .route_dead);
@@ -3492,11 +3495,13 @@ const freebsd_wait = if (is_freebsd) struct {
     extern "c" fn wait6(idtype: c_int, id: i64, status: *c_int, options: c_int, wrusage: ?*anyopaque, siginfo: ?*anyopaque) std.c.pid_t;
 } else struct {};
 
-/// Milliseconds for a remaining nanosecond span, rounded up so a sleep never
-/// returns early, clamped to the port's u32 ms ceiling. `remaining_ns` > 0.
-pub fn ceilMs(remaining_ns: u64) u32 {
-    const ms = (remaining_ns +| (std.time.ns_per_ms - 1)) / std.time.ns_per_ms;
-    return @intCast(@min(ms, std.math.maxInt(u32)));
+/// Clamp a remaining nanosecond span to the port's uniform timer ceiling
+/// (`born.timer_after_ns_max`) so an arm never exceeds it; `timerFired`
+/// re-arms the remainder for longer sleeps. Nanosecond granularity: no
+/// rounding here, the kernel rounds up to its own resolution so a sleep
+/// never returns early. `remaining_ns` > 0.
+pub fn clampTimerNs(remaining_ns: u64) u64 {
+    return @min(remaining_ns, born.timer_after_ns_max);
 }
 
 /// Builds a `std.Io` over Born's event port. The returned interface owns a
@@ -6227,7 +6232,7 @@ test "connect deadline fire retires Timeout and frees the socket (POSIX)" {
     state.netSlotAt(op.slot_index).op = &op;
     s.pending_connect = &op;
     // Arm a real far-future deadline timer so the retire path cancels it.
-    try port.addTimer(net_timer_id_base + op.slot_index, netTimerUdata(index, s.generation), 60_000, .once);
+    try port.addTimer(net_timer_id_base + op.slot_index, netTimerUdata(index, s.generation), 60_000 * std.time.ns_per_ms, .once);
     s.deadline_armed = true;
 
     // The deadline fires: Timeout retire (not canceled), socket closed and
@@ -6299,7 +6304,7 @@ test "connect deadline fire drains the pending ConnectEx before freeing (Windows
     op.slot_index = try state.netAllocSlotLocked();
     state.netSlotAt(op.slot_index).op = &op;
     s.pending_connect = &op;
-    try port.addTimer(net_timer_id_base + op.slot_index, netTimerUdata(index, s.generation), 60_000, .once);
+    try port.addTimer(net_timer_id_base + op.slot_index, netTimerUdata(index, s.generation), 60_000 * std.time.ns_per_ms, .once);
     s.deadline_armed = true;
 
     // The deadline fires while ConnectEx is pending: Timeout retire (not

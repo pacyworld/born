@@ -369,15 +369,30 @@ test "time route keeps queue delegation" {
     try future.await(interface);
 }
 
-test "ceilMs rounds up, clamps, and saturates" {
-    try expectEqual(@as(u32, 1), shim.ceilMs(1));
-    try expectEqual(@as(u32, 1), shim.ceilMs(1 * ms));
-    try expectEqual(@as(u32, 2), shim.ceilMs(1 * ms + 1));
-    try expectEqual(@as(u32, std.math.maxInt(u32)), shim.ceilMs(std.math.maxInt(u64)));
-    try expectEqual(
-        @as(u32, std.math.maxInt(u32)),
-        shim.ceilMs(@as(u64, std.math.maxInt(u32)) * ms + 1),
-    );
+test "clampTimerNs clamps to the port ceiling without rounding" {
+    try expectEqual(@as(u64, 1), shim.clampTimerNs(1));
+    try expectEqual(@as(u64, 500_000), shim.clampTimerNs(500_000));
+    try expectEqual(@as(u64, 1 * ms), shim.clampTimerNs(1 * ms));
+    try expectEqual(born.timer_after_ns_max, shim.clampTimerNs(born.timer_after_ns_max));
+    try expectEqual(born.timer_after_ns_max, shim.clampTimerNs(born.timer_after_ns_max + 1));
+    try expectEqual(born.timer_after_ns_max, shim.clampTimerNs(std.math.maxInt(u64)));
+}
+
+test "time route sleep honors a sub-millisecond duration without firing early" {
+    var port = try born.EvPort.init(std.testing.allocator);
+    defer port.deinit();
+    const interface = try initTimeIo(&port);
+    defer born_io.deinit(interface);
+
+    // 500 us: below the old millisecond floor. The shim no longer rounds it
+    // up to 1 ms; the kernel rounds up to its own resolution, never down.
+    const delay_ns: u64 = 500_000;
+    const t0 = try born.nowNs();
+    try Io.sleep(interface, .fromNanoseconds(delay_ns), .awake);
+    const elapsed = try elapsedNs(t0);
+    // Never early: a small allowance covers clock-read ordering; scheduler
+    // load only delays return. Latency itself is measured in bench/.
+    try expect(elapsed + 100_000 >= delay_ns);
 }
 
 test "cancel list retires only the canceled sleeper" {

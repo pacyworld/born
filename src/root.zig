@@ -58,6 +58,9 @@ pub const Event = @import("types.zig").Event;
 pub const Signal = @import("types.zig").Signal;
 /// One-shot or repeating timer mode.
 pub const TimerMode = @import("types.zig").TimerMode;
+/// Upper bound on `EvPort.addTimer`'s `after_ns` (nanoseconds), uniform
+/// across backends; larger values are `error.InvalidArgument`.
+pub const timer_after_ns_max = @import("types.zig").timer_after_ns_max;
 /// Exit status reported for a watched child process.
 pub const ProcessExit = @import("types.zig").ProcessExit;
 /// Errors produced while initializing an event port.

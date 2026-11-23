@@ -1,7 +1,7 @@
 //! Timers on kqueue (EVFILT_TIMER).
 //!
-//! Each timer is one EVFILT_TIMER knote: ident = id, data = after_ms in
-//! milliseconds, udata = the caller's. Changes go through `EvPort.stageRaw`
+//! Each timer is one EVFILT_TIMER knote: ident = id, data = after_ns in
+//! nanoseconds, udata = the caller's. Changes go through `EvPort.stageRaw`
 //! into the next wait(); no kevent() call outside wait(). `.once` adds
 //! EV_ONESHOT, so the kernel drops the knote when wait() harvests its
 //! firing. wait() translates the firing into Event{ .timer, .fired, .udata }
@@ -25,18 +25,22 @@
 //! would not take, and the delete also discards an unharvested firing of
 //! the old timer.
 //!
-//! Timer units (sys/event.h, EVFILT_TIMER fflags). Every target defaults to
-//! milliseconds with fflags 0; born passes the explicit millisecond unit:
-//!   FreeBSD: bit flags, NOTE_MSECONDS = 0x2 (SECONDS 0x1, USECONDS 0x4,
-//!            NSECONDS 0x8, ABSTIME 0x10).
-//!   macOS:   no NOTE_MSECONDS; milliseconds is fflags 0 (NOTE_SECONDS 0x1,
-//!            NOTE_USECONDS 0x2, NOTE_NSECONDS 0x4, NOTE_ABSOLUTE 0x8).
-//!   NetBSD:  unit enum, NOTE_MSECONDS = 0 (SECONDS 1, USECONDS 2,
-//!            NSECONDS 3, ABSTIME 0x10).
-//!   OpenBSD: unit enum, NOTE_MSECONDS = 0 (SECONDS 1, USECONDS 2,
-//!            NSECONDS 3, ABSTIME 0x10).
-//! 0x2 is microseconds on macOS, NetBSD and OpenBSD, so the value is
-//! per target. Zig 0.15 std defines NOTE.MSECONDS for FreeBSD only.
+//! Timer units (sys/event.h, EVFILT_TIMER fflags). born passes nanoseconds
+//! via NOTE_NSECONDS where the target's header defines it; all four supported
+//! kqueue targets define and implement it (verified against each platform's
+//! header and kernel). A target without it falls back to NOTE_USECONDS with
+//! the value rounded up, so a deadline never fires early:
+//!   FreeBSD: bit flags, NOTE_NSECONDS = 0x8 (SECONDS 0x1, MSECONDS 0x2,
+//!            USECONDS 0x4, ABSTIME 0x10).
+//!   macOS:   NOTE_NSECONDS = 0x4 (SECONDS 0x1, USECONDS 0x2,
+//!            NOTE_ABSOLUTE 0x8); no NOTE_MSECONDS, milliseconds is fflags 0.
+//!   NetBSD:  unit enum, NOTE_NSECONDS = 3 (MSECONDS 0, SECONDS 1,
+//!            USECONDS 2, ABSTIME 0x10).
+//!   OpenBSD: unit enum, NOTE_NSECONDS = 3 (MSECONDS 0, SECONDS 1,
+//!            USECONDS 2, ABSTIME 0x10).
+//! The NOTE_NSECONDS value is per target (0x8 / 0x4 / 0x3), so it is selected
+//! at comptime. The firing's `data` is the expiration count on every target,
+//! independent of the unit flag.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -46,6 +50,7 @@ const EvPort = kq.EvPort;
 const Kevent = kq.Kevent;
 const TimerError = kq.TimerError;
 const TimerMode = kq.TimerMode;
+const timer_after_ns_max = kq.timer_after_ns_max;
 
 const EV_ADD = std.c.EV.ADD;
 const EV_DELETE = std.c.EV.DELETE;
@@ -54,13 +59,29 @@ const EV_ONESHOT = std.c.EV.ONESHOT;
 const EV_ERROR = if (@hasDecl(std.c.EV, "ERROR")) std.c.EV.ERROR else 0x4000;
 const ENOENT = @intFromEnum(compat.E.NOENT);
 
-/// EVFILT_TIMER fflags selecting milliseconds; see the unit table above.
-const NOTE_MSECONDS: @FieldType(Kevent, "fflags") = switch (builtin.os.tag) {
-    .freebsd => 0x2,
-    .netbsd, .openbsd => 0,
-    .macos => 0,
-    else => @compileError("born: unknown EVFILT_TIMER millisecond unit"),
+/// NOTE_NSECONDS value per target, or null where sys/event.h does not define
+/// it; see the unit table above. All four supported kqueue targets define it.
+const note_nseconds: ?@FieldType(Kevent, "fflags") = switch (builtin.os.tag) {
+    .freebsd => 0x8,
+    .macos => 0x4,
+    .netbsd, .openbsd => 0x3,
+    else => null,
 };
+
+/// NOTE_USECONDS value per target: the fallback unit when NOTE_NSECONDS is
+/// absent. The nanosecond value is rounded up to whole microseconds so a
+/// deadline never fires early because of rounding.
+const note_useconds: @FieldType(Kevent, "fflags") = switch (builtin.os.tag) {
+    .freebsd => 0x4,
+    .macos, .netbsd, .openbsd => 0x2,
+    else => @compileError("born: unknown EVFILT_TIMER microsecond unit"),
+};
+
+/// Nanoseconds to whole microseconds, rounded up. Used only on targets
+/// without NOTE_NSECONDS; comptime-dead on every supported kqueue target.
+fn ceilUs(ns: u64) u64 {
+    return ns / std.time.ns_per_us + @intFromBool(ns % std.time.ns_per_us != 0);
+}
 
 /// Per-port timer bookkeeping, a field of EvPort (`timers`).
 pub const State = struct {
@@ -80,17 +101,19 @@ pub const State = struct {
     }
 };
 
-/// Stages the timer for the next wait(). Allocation happens up front, so
+/// Stages the timer for the next wait(). `after_ns` is nanoseconds; above
+/// `timer_after_ns_max` is InvalidArgument. Allocation happens up front, so
 /// OutOfMemory leaves the port unchanged. A kernel refusal of the EV_ADD
 /// arrives at wait() as Event{ .err, .err_no } with the timer's udata.
-pub fn add(port: *EvPort, id: u32, udata: ?*anyopaque, after_ms: u32, mode: TimerMode) TimerError!void {
-    if (mode == .repeat and after_ms == 0) return TimerError.InvalidArgument;
+pub fn add(port: *EvPort, id: u32, udata: ?*anyopaque, after_ns: u64, mode: TimerMode) TimerError!void {
+    if (after_ns > timer_after_ns_max) return TimerError.InvalidArgument;
+    if (mode == .repeat and after_ns == 0) return TimerError.InvalidArgument;
     port.changes.ensureUnusedCapacity(port.alloc, 2) catch return TimerError.OutOfMemory;
     const slot = port.timers.live.getOrPut(port.alloc, id) catch return TimerError.OutOfMemory;
     if (slot.found_existing) port.stageRaw(change(id, EV_DELETE, null, 0));
     slot.value_ptr.* = mode;
     const flags: @FieldType(Kevent, "flags") = if (mode == .once) EV_ADD | EV_ONESHOT else EV_ADD;
-    port.stageRaw(change(id, flags, udata, after_ms));
+    port.stageRaw(change(id, flags, udata, after_ns));
 }
 
 /// Stages EV_DELETE for a live id; anything else is a no-op. If the
@@ -117,13 +140,18 @@ pub fn observe(port: *EvPort, kev: Kevent) bool {
     return true;
 }
 
-fn change(id: u32, flags: @FieldType(Kevent, "flags"), udata: ?*anyopaque, after_ms: u32) Kevent {
+fn change(id: u32, flags: @FieldType(Kevent, "flags"), udata: ?*anyopaque, after_ns: u64) Kevent {
     var kev = std.mem.zeroes(Kevent);
     kev.ident = id;
     kev.filter = kq.EVFILT_TIMER;
     kev.flags = flags;
-    kev.fflags = NOTE_MSECONDS;
-    kev.data = after_ms;
+    if (note_nseconds) |unit| {
+        kev.fflags = unit;
+        kev.data = @intCast(after_ns);
+    } else {
+        kev.fflags = note_useconds;
+        kev.data = @intCast(ceilUs(after_ns));
+    }
     kev.udata = @intFromPtr(udata);
     return kev;
 }
@@ -145,19 +173,40 @@ fn waitOne(port: *EvPort, events: []Event, window_ms: i32) !usize {
     }
 }
 
-test "timer_kqueue: change encoding uses the target's millisecond unit" {
+test "timer_kqueue: change encoding uses the target's nanosecond unit" {
     var tag: u8 = 1;
-    const kev = change(7, EV_ADD | EV_ONESHOT, &tag, 250);
+    const after_ns: u64 = 250 * std.time.ns_per_ms;
+    const kev = change(7, EV_ADD | EV_ONESHOT, &tag, after_ns);
     try testing.expectEqual(@as(usize, 7), kev.ident);
     try testing.expectEqual(kq.EVFILT_TIMER, kev.filter);
     try testing.expectEqual(EV_ADD | EV_ONESHOT, kev.flags);
-    try testing.expectEqual(@as(@TypeOf(kev.data), 250), kev.data);
     try testing.expectEqual(@intFromPtr(&tag), kev.udata);
-    const expected: u32 = switch (builtin.os.tag) {
-        .freebsd => std.c.NOTE.MSECONDS,
-        else => 0,
-    };
-    try testing.expectEqual(expected, kev.fflags);
+    if (note_nseconds) |unit| {
+        try testing.expectEqual(unit, kev.fflags);
+        try testing.expectEqual(@as(@TypeOf(kev.data), @intCast(after_ns)), kev.data);
+    } else {
+        try testing.expectEqual(note_useconds, kev.fflags);
+        try testing.expectEqual(@as(@TypeOf(kev.data), @intCast(ceilUs(after_ns))), kev.data);
+    }
+}
+
+test "timer_kqueue: a sub-millisecond deadline keeps nanosecond precision" {
+    var tag: u8 = 1;
+    const kev = change(8, EV_ADD | EV_ONESHOT, &tag, 500_000);
+    if (note_nseconds) |unit| {
+        try testing.expectEqual(unit, kev.fflags);
+        try testing.expectEqual(@as(@TypeOf(kev.data), 500_000), kev.data);
+    } else {
+        try testing.expectEqual(note_useconds, kev.fflags);
+        try testing.expectEqual(@as(@TypeOf(kev.data), 500), kev.data);
+    }
+}
+
+test "timer_kqueue: ceilUs rounds up to whole microseconds" {
+    try testing.expectEqual(@as(u64, 0), ceilUs(0));
+    try testing.expectEqual(@as(u64, 1), ceilUs(1));
+    try testing.expectEqual(@as(u64, 1), ceilUs(std.time.ns_per_us));
+    try testing.expectEqual(@as(u64, 2), ceilUs(std.time.ns_per_us + 1));
 }
 
 test "timer_kqueue: cancelling an expired or unknown id stages nothing" {
@@ -165,7 +214,7 @@ test "timer_kqueue: cancelling an expired or unknown id stages nothing" {
     defer port.deinit();
     var events: [4]Event = undefined;
     var tag: u8 = 1;
-    try add(&port, 1, &tag, 1, .once);
+    try add(&port, 1, &tag, 1 * std.time.ns_per_ms, .once);
     try testing.expectEqual(@as(usize, 1), try waitOne(&port, &events, 1000));
     try testing.expect(events[0].timer);
     try testing.expect(!port.timers.live.contains(1));
@@ -179,7 +228,7 @@ test "timer_kqueue: cancel discards a fired but unharvested one-shot" {
     defer port.deinit();
     var events: [4]Event = undefined;
     var tag: u8 = 1;
-    try add(&port, 2, &tag, 5, .once);
+    try add(&port, 2, &tag, 5 * std.time.ns_per_ms, .once);
     try testing.expectEqual(@as(usize, 0), try port.wait(&events, 0));
     compat.sleepNs(30 * std.time.ns_per_ms);
     // Fired in the kernel, not yet harvested: still live, so the delete
@@ -220,15 +269,15 @@ test "timer_kqueue: replacing a live id changes its mode" {
     var a: u8 = 1;
     var b: u8 = 2;
     // repeat -> once: exactly one firing, then the id is retired.
-    try add(&port, 5, &a, 5, .repeat);
-    try add(&port, 5, &b, 5, .once);
+    try add(&port, 5, &a, 5 * std.time.ns_per_ms, .repeat);
+    try add(&port, 5, &b, 5 * std.time.ns_per_ms, .once);
     try testing.expectEqual(@as(usize, 1), try waitOne(&port, &events, 1000));
     try testing.expect(events[0].udata == @as(?*anyopaque, &b));
     try testing.expect(!port.timers.live.contains(5));
     try testing.expectEqual(@as(usize, 0), try port.wait(&events, 50));
     // once -> repeat: keeps firing until cancelled.
-    try add(&port, 6, &a, 1000, .once);
-    try add(&port, 6, &b, 5, .repeat);
+    try add(&port, 6, &a, 1000 * std.time.ns_per_ms, .once);
+    try add(&port, 6, &b, 5 * std.time.ns_per_ms, .repeat);
     var fired: usize = 0;
     while (fired < 3) {
         const n = try waitOne(&port, &events, 1000);
@@ -250,7 +299,7 @@ test "timer_kqueue: allocation failure in add leaves the port unchanged" {
     const staged = port.changes.items.len;
     failing.fail_index = failing.alloc_index;
     var tag: u8 = 1;
-    try testing.expectError(TimerError.OutOfMemory, add(&port, 8, &tag, 10, .once));
+    try testing.expectError(TimerError.OutOfMemory, add(&port, 8, &tag, 10 * std.time.ns_per_ms, .once));
     try testing.expectEqual(staged, port.changes.items.len);
     try testing.expect(!port.timers.live.contains(8));
     try testing.expect(port.pending_error == null);
@@ -262,7 +311,7 @@ test "timer_kqueue: allocation failure in cancel keeps the id cancellable" {
     defer port.deinit();
     var events: [4]Event = undefined;
     var tag: u8 = 1;
-    try add(&port, 9, &tag, 5, .repeat);
+    try add(&port, 9, &tag, 5 * std.time.ns_per_ms, .repeat);
     // Flush, then leave the changelist with no spare capacity.
     try testing.expectEqual(@as(usize, 0), try port.wait(&events, 0));
     port.changes.shrinkAndFree(failing.allocator(), 0);

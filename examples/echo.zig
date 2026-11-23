@@ -96,7 +96,7 @@ pub const Echo = struct {
             .opts = opts,
             .conns = conns,
         };
-        try port.addTimer(sweep_id, &self.sweep_tag, opts.sweep_ms, .repeat);
+        try port.addTimer(sweep_id, &self.sweep_tag, @as(u64, opts.sweep_ms) * std.time.ns_per_ms, .repeat);
         errdefer port.cancelTimer(sweep_id);
         if (opts.watch_signals) {
             try port.watchSignal(.terminate, null);
@@ -185,7 +185,7 @@ pub const Echo = struct {
         if (self.draining) return;
         self.draining = true;
         self.closeListener();
-        self.port.addTimer(drain_id, &self.drain_tag, self.opts.drain_ms, .once) catch {
+        self.port.addTimer(drain_id, &self.drain_tag, @as(u64, self.opts.drain_ms) * std.time.ns_per_ms, .once) catch {
             self.closeAll();
         };
     }

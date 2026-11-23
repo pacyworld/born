@@ -6,9 +6,10 @@ const born = @import("root.zig");
 const compat = @import("compat");
 const Event = born.Event;
 const alloc = std.testing.allocator;
+const ms = std.time.ns_per_ms;
 
-fn addOrSkip(port: *born.EvPort, id: u32, udata: ?*anyopaque, after_ms: u32, mode: born.TimerMode) !void {
-    port.addTimer(id, udata, after_ms, mode) catch |err| {
+fn addOrSkip(port: *born.EvPort, id: u32, udata: ?*anyopaque, after_ns: u64, mode: born.TimerMode) !void {
+    port.addTimer(id, udata, after_ns, mode) catch |err| {
         if (err == error.Unsupported) return error.SkipZigTest;
         return err;
     };
@@ -50,7 +51,7 @@ test "timer: one-shot fires exactly once" {
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
     var a: u8 = 0;
-    try addOrSkip(&port, 1, &a, 20, .once);
+    try addOrSkip(&port, 1, &a, 20 * ms, .once);
     var seen: std.ArrayList(Seen) = .empty;
     defer seen.deinit(alloc);
     try collect(&port, &seen, liveness_ms, 1, 16);
@@ -65,7 +66,7 @@ test "timer: repeat fires again until cancelled" {
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
     var a: u8 = 0;
-    try addOrSkip(&port, 2, &a, 10, .repeat);
+    try addOrSkip(&port, 2, &a, 10 * ms, .repeat);
     var seen: std.ArrayList(Seen) = .empty;
     defer seen.deinit(alloc);
     try collect(&port, &seen, liveness_ms, 3, 16);
@@ -85,7 +86,7 @@ test "timer: cancel before expiry delivers nothing" {
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
     var a: u8 = 0;
-    try addOrSkip(&port, 3, &a, 30, .once);
+    try addOrSkip(&port, 3, &a, 30 * ms, .once);
     port.cancelTimer(3);
     var seen: std.ArrayList(Seen) = .empty;
     defer seen.deinit(alloc);
@@ -98,9 +99,9 @@ test "timer: a cancelled id is reusable" {
     defer port.deinit();
     var a: u8 = 0;
     var b: u8 = 0;
-    try addOrSkip(&port, 4, &a, 1000, .once);
+    try addOrSkip(&port, 4, &a, 1000 * ms, .once);
     port.cancelTimer(4);
-    try port.addTimer(4, &b, 10, .once);
+    try port.addTimer(4, &b, 10 * ms, .once);
     var seen: std.ArrayList(Seen) = .empty;
     defer seen.deinit(alloc);
     try collect(&port, &seen, liveness_ms, 1, 16);
@@ -114,8 +115,8 @@ test "timer: re-adding a live id replaces it" {
     defer port.deinit();
     var a: u8 = 0;
     var b: u8 = 0;
-    try addOrSkip(&port, 5, &a, 30, .once);
-    try port.addTimer(5, &b, 60, .once);
+    try addOrSkip(&port, 5, &a, 30 * ms, .once);
+    try port.addTimer(5, &b, 60 * ms, .once);
     var seen: std.ArrayList(Seen) = .empty;
     defer seen.deinit(alloc);
     // The replacement fires once and the cancelled 30ms timer must not. Stop
@@ -131,7 +132,7 @@ test "timer: cancelling an unknown or expired id is a no-op" {
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
     var a: u8 = 0;
-    try addOrSkip(&port, 6, &a, 5, .once);
+    try addOrSkip(&port, 6, &a, 5 * ms, .once);
     var seen: std.ArrayList(Seen) = .empty;
     defer seen.deinit(alloc);
     try collect(&port, &seen, liveness_ms, 1, 16);
@@ -152,7 +153,7 @@ test "timer: deadlines are delivered in order across waits" {
     var i: usize = count;
     while (i > 0) {
         i -= 1;
-        try addOrSkip(&port, @intCast(100 + i), &tags[i], @intCast(10 + 15 * i), .once);
+        try addOrSkip(&port, @intCast(100 + i), &tags[i], @intCast((10 + 15 * i) * ms), .once);
     }
     var seen: std.ArrayList(Seen) = .empty;
     defer seen.deinit(alloc);
@@ -183,7 +184,7 @@ test "timer: expirations beyond the event buffer wait for the next wait()" {
     defer port.deinit();
     const count = 8;
     var tags: [count]u8 = undefined;
-    for (&tags, 0..) |*tag, i| try addOrSkip(&port, @intCast(200 + i), tag, 5, .once);
+    for (&tags, 0..) |*tag, i| try addOrSkip(&port, @intCast(200 + i), tag, 5 * ms, .once);
     // Let every timer fall due before the first harvest.
     compat.sleepNs(40 * std.time.ns_per_ms);
     var seen: std.ArrayList(Seen) = .empty;
@@ -216,17 +217,51 @@ test "timer: a deadline never fires early" {
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
     var a: u8 = 0;
-    const delay_ms: u32 = 80;
+    const delay_ns: u64 = 80 * ms;
     const armed = try compat.monotonicNs();
-    try addOrSkip(&port, 9, &a, delay_ms, .once);
+    try addOrSkip(&port, 9, &a, delay_ns, .once);
     var seen: std.ArrayList(Seen) = .empty;
     defer seen.deinit(alloc);
     try collect(&port, &seen, liveness_ms, 1, 16);
     try std.testing.expectEqual(@as(usize, 1), seen.items.len);
     // Harvest is at or after the kernel's firing, which is at or after the
-    // deadline armed no earlier than `armed`. Two milliseconds cover the
-    // kernel's millisecond rounding; scheduler load only delays harvest, it
-    // never advances the firing (#45).
-    const elapsed_ms = (try compat.monotonicNs() - armed) / std.time.ns_per_ms;
-    try std.testing.expect(elapsed_ms + 2 >= delay_ms);
+    // deadline armed no earlier than `armed`. The kernel rounds the deadline
+    // up to its own resolution, never down; two milliseconds of slack cover
+    // clock-read ordering. Scheduler load only delays harvest, it never
+    // advances the firing (#45).
+    const elapsed_ns = try compat.monotonicNs() - armed;
+    try std.testing.expect(elapsed_ns + 2 * ms >= delay_ns);
+}
+
+test "timer: a sub-millisecond deadline is honored and never fires early" {
+    var port = try born.EvPort.init(alloc);
+    defer port.deinit();
+    var a: u8 = 0;
+    // 500 us: below the old millisecond floor. The backend takes nanoseconds,
+    // so this is armed as-is; the kernel rounds up to its own resolution.
+    const delay_ns: u64 = 500_000;
+    const armed = try compat.monotonicNs();
+    try addOrSkip(&port, 10, &a, delay_ns, .once);
+    var seen: std.ArrayList(Seen) = .empty;
+    defer seen.deinit(alloc);
+    try collect(&port, &seen, liveness_ms, 1, 16);
+    try std.testing.expectEqual(@as(usize, 1), seen.items.len);
+    try std.testing.expect(seen.items[0].udata == @as(?*anyopaque, &a));
+    // Never early: a small allowance covers clock-read ordering; the kernel
+    // rounds up and scheduler load only delays harvest. Latency itself is
+    // measured in bench/, not bounded here.
+    const elapsed_ns = try compat.monotonicNs() - armed;
+    try std.testing.expect(elapsed_ns + 100_000 >= delay_ns);
+}
+
+test "timer: an over-cap delay is refused; the ceiling is accepted" {
+    var port = try born.EvPort.init(alloc);
+    defer port.deinit();
+    var a: u8 = 0;
+    const over = born.timer_after_ns_max + 1;
+    try std.testing.expectError(error.InvalidArgument, port.addTimer(11, &a, over, .once));
+    try std.testing.expectError(error.InvalidArgument, port.addTimer(11, &a, over, .repeat));
+    // The ceiling itself arms (then is cancelled before it can fire).
+    try addOrSkip(&port, 11, &a, born.timer_after_ns_max, .once);
+    port.cancelTimer(11);
 }

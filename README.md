@@ -536,8 +536,12 @@ exercise each implemented backend. Windows Unix domain sockets return
 
 ### Timers
 
-`EvPort.addTimer(id, udata, after_ms, .once or .repeat)` and `cancelTimer(id)`
-deliver `Event{ .timer = true, .fired = n }` through `wait()`.
+`EvPort.addTimer(id, udata, after_ns, .once or .repeat)` and `cancelTimer(id)`
+deliver `Event{ .timer = true, .fired = n }` through `wait()`. `after_ns` is
+nanoseconds; the kernel rounds the deadline up to its own timer resolution
+(sub-millisecond on kqueue and epoll, the system clock tick on IOCP), so a
+deadline never fires early. `after_ns` above `born.timer_after_ns_max` is
+`error.InvalidArgument`.
 
 ### Signals
 
@@ -571,8 +575,9 @@ POSIX provides `Listener.openUnix(path, opts)` and
   batch. Tolerate it, as for a purged descriptor.
 - **Timer ids** are caller-chosen and unique per port; re-adding a live id
   replaces it. Cancelling an unknown or expired id is a no-op. A `.once`
-  timer with `after_ms = 0` is due at the next `wait()`; a `.repeat` timer
-  with `after_ms = 0` is `error.InvalidArgument`.
+  timer with `after_ns = 0` is due at the next `wait()`; a `.repeat` timer
+  with `after_ns = 0`, or any `after_ns` above `born.timer_after_ns_max`, is
+  `error.InvalidArgument`.
 - **Signals are process-wide.** At most one port watches a given signal; a
   second gets `error.SignalInUse`. On epoll the signal must be blocked in
   every thread (signalfd), so call `born.blockSignals` in `main` before
