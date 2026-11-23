@@ -89,7 +89,8 @@
 //! (CLOCK_MONOTONIC, QPC) that `now(.awake)` reads. Born timers take
 //! nanoseconds: a sleep is armed for its exact remaining nanoseconds, rounded
 //! up only by the kernel's own timer resolution, so sub-millisecond sleeps
-//! are honored.
+//! are honored where that resolution is sub-millisecond (on NetBSD and
+//! OpenBSD a sleep rounds up to one callout tick).
 //!
 //! ## Latency stats
 //!

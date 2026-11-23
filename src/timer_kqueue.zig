@@ -26,21 +26,27 @@
 //! the old timer.
 //!
 //! Timer units (sys/event.h, EVFILT_TIMER fflags). born passes nanoseconds
-//! via NOTE_NSECONDS where the target's header defines it; all four supported
-//! kqueue targets define and implement it (verified against each platform's
-//! header and kernel). A target without it falls back to NOTE_USECONDS with
-//! the value rounded up, so a deadline never fires early:
+//! via NOTE_NSECONDS where the target's header defines it; a target without
+//! it falls back to NOTE_USECONDS with the value rounded up, so a deadline
+//! never fires early:
 //!   FreeBSD: bit flags, NOTE_NSECONDS = 0x8 (SECONDS 0x1, MSECONDS 0x2,
-//!            USECONDS 0x4, ABSTIME 0x10).
+//!            USECONDS 0x4, ABSTIME 0x10). Header and kernel verified,
+//!            runtime-tested on the FreeBSD CI backend.
 //!   macOS:   NOTE_NSECONDS = 0x4 (SECONDS 0x1, USECONDS 0x2,
 //!            NOTE_ABSOLUTE 0x8); no NOTE_MSECONDS, milliseconds is fflags 0.
+//!            Header and kernel verified, runtime-tested on macOS 26 arm64.
 //!   NetBSD:  unit enum, NOTE_NSECONDS = 3 (MSECONDS 0, SECONDS 1,
-//!            USECONDS 2, ABSTIME 0x10).
+//!            USECONDS 2, ABSTIME 0x10). First release 10.0; kernels <= 9
+//!            ignore fflags and read data as milliseconds. Header and kernel
+//!            verified, runtime-tested on NetBSD 10.1.
 //!   OpenBSD: unit enum, NOTE_NSECONDS = 3 (MSECONDS 0, SECONDS 1,
-//!            USECONDS 2, ABSTIME 0x10).
+//!            USECONDS 2, ABSTIME 0x10). First release 7.4; kernels <= 7.3
+//!            ignore fflags and read data as milliseconds. Source-verified
+//!            only: compile-only target, no runtime evidence.
 //! The NOTE_NSECONDS value is per target (0x8 / 0x4 / 0x3), so it is selected
 //! at comptime. The firing's `data` is the expiration count on every target,
-//! independent of the unit flag.
+//! independent of the unit flag. NetBSD and OpenBSD round the deadline up to
+//! a callout tick (1/hz); FreeBSD and macOS arm at sub-millisecond precision.
 
 const std = @import("std");
 const builtin = @import("builtin");

@@ -254,14 +254,34 @@ test "timer: a sub-millisecond deadline is honored and never fires early" {
     try std.testing.expect(elapsed_ns + 100_000 >= delay_ns);
 }
 
-test "timer: an over-cap delay is refused; the ceiling is accepted" {
+test "timer: an over-cap delay is refused at the API boundary" {
     var port = try born.EvPort.init(alloc);
     defer port.deinit();
     var a: u8 = 0;
     const over = born.timer_after_ns_max + 1;
     try std.testing.expectError(error.InvalidArgument, port.addTimer(11, &a, over, .once));
     try std.testing.expectError(error.InvalidArgument, port.addTimer(11, &a, over, .repeat));
-    // The ceiling itself arms (then is cancelled before it can fire).
-    try addOrSkip(&port, 11, &a, born.timer_after_ns_max, .once);
-    port.cancelTimer(11);
+}
+
+test "timer: the kernel accepts the ceiling and a 60-day deadline" {
+    var port = try born.EvPort.init(alloc);
+    defer port.deinit();
+    var a: u8 = 0;
+    // Runtime proof of the uniform ceiling: the arm must be accepted by the
+    // kernel, not refused as a deferred .err event (which the shim would
+    // latch into a canceled sleep). wait(…, 0) submits the staged arm on
+    // kqueue and harvests any refusal on every backend. 60 days exceeds the
+    // old u32-ms ceiling (~49.7 days); the ceiling itself is ~292 years.
+    // A kernel that cannot represent a value saturates it (FreeBSD SBT_MAX)
+    // rather than refusing; either way no .err may surface.
+    const sixty_days: u64 = 60 * 24 * 60 * 60 * std.time.ns_per_s;
+    for ([_]u64{ born.timer_after_ns_max, sixty_days }) |delay| {
+        try addOrSkip(&port, 12, &a, delay, .once);
+        var events: [4]Event = undefined;
+        const n = try port.wait(&events, 0);
+        for (events[0..n]) |ev| try std.testing.expect(!ev.err);
+        port.cancelTimer(12);
+        // Flush the staged cancel before re-arming the same id.
+        _ = try port.wait(&events, 0);
+    }
 }

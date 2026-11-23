@@ -13,8 +13,8 @@ into a concrete event.
 | `aarch64-macos` | kqueue | tested on macOS 26 arm64; see runtime evidence |
 | `x86_64-macos` | kqueue | **compile-only, not tested on hardware** |
 | `x86_64-windows-gnu` | IOCP | original backend in production since 2026-08 |
-| `x86_64-netbsd` | kqueue | **compile-only, not tested on hardware** |
-| `x86_64-openbsd` | kqueue | **compile-only, not tested on hardware** |
+| `x86_64-netbsd` | kqueue | **compile-only, not tested on hardware**; nanosecond timers need NetBSD 10.0 or newer |
+| `x86_64-openbsd` | kqueue | **compile-only, not tested on hardware**; nanosecond timers need OpenBSD 7.4 or newer |
 
 These are exactly the `supported_targets` in `build.zig`, checked by CI.
 The build rejects missing or extra target rows in this table.
@@ -538,10 +538,22 @@ exercise each implemented backend. Windows Unix domain sockets return
 
 `EvPort.addTimer(id, udata, after_ns, .once or .repeat)` and `cancelTimer(id)`
 deliver `Event{ .timer = true, .fired = n }` through `wait()`. `after_ns` is
-nanoseconds; the kernel rounds the deadline up to its own timer resolution
-(sub-millisecond on kqueue and epoll, the system clock tick on IOCP), so a
-deadline never fires early. `after_ns` above `born.timer_after_ns_max` is
-`error.InvalidArgument`.
+nanoseconds; the kernel rounds the deadline up to its own timer resolution,
+so a deadline never fires early. `after_ns` above `born.timer_after_ns_max`
+is `error.InvalidArgument`; the ceiling itself (about 292 years) is accepted
+by every supported kernel, proven by a contract test that arms it and a
+60-day deadline and asserts no error event.
+
+Resolution per platform:
+
+- FreeBSD kqueue: sbintime precision, sub-millisecond.
+- macOS kqueue: mach absolute time, sub-millisecond.
+- NetBSD and OpenBSD kqueue: one callout tick (1/hz, commonly 10 ms at
+  hz 100 or 1 ms at hz 1000). A sub-millisecond delay rounds up to a whole
+  tick. Nanosecond units require NetBSD 10.0 / OpenBSD 7.4 or newer; older
+  kernels ignore the unit flag and read the delay as milliseconds.
+- Linux epoll (timerfd): nanosecond deadlines, sub-millisecond.
+- Windows IOCP: 100 ns due-time ticks, fired on the system clock tick.
 
 ### Signals
 
