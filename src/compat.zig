@@ -2768,6 +2768,39 @@ pub fn sleepNs(nanoseconds: u64) void {
     }
 }
 
+/// `struct clockinfo` from `kern.clockrate` (sysctl), identical layout on
+/// the BSDs. `tick` is microseconds per callout tick.
+pub const Clockinfo = extern struct {
+    hz: c_int,
+    tick: c_int,
+    tickadj: c_int,
+    profhz: c_int,
+    stathz: c_int,
+};
+
+/// Reads `kern.clockrate` once; null on other targets or a failed sysctl.
+/// The kqueue timer backend uses `tick` to bound an arm below the kernel's
+/// INT_MAX callout ticks, where `tvtohz` would saturate and fire early.
+pub fn kernClockrate() ?Clockinfo {
+    if (comptime !(native_os == .netbsd or native_os == .openbsd)) return null;
+    var ci: Clockinfo = undefined;
+    var len: usize = @sizeOf(Clockinfo);
+    if (std.c.sysctlbyname("kern.clockrate", &ci, &len, null, 0) != 0) return null;
+    if (len != @sizeOf(Clockinfo)) return null;
+    return ci;
+}
+
+/// Mach timebase: absolute ticks convert to nanoseconds as `ticks * numer /
+/// denom`. Null on other targets or a failed trap. The kqueue timer backend
+/// derives the arm cap from it so the kernel's ns-to-absolute multiply
+/// cannot overflow.
+pub fn machTimebase() ?std.c.mach_timebase_info_data {
+    if (comptime !is_darwin) return null;
+    var info: std.c.mach_timebase_info_data = undefined;
+    if (std.c.mach_timebase_info(&info) != 0) return null;
+    return info;
+}
+
 /// Native mutex with static `.{} initialization and Born's lock/unlock shape.
 pub const Mutex = if (is_windows) struct {
     raw: windows.SRWLOCK = .{},

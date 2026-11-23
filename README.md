@@ -51,7 +51,7 @@ OS per primitive, and lists real runs only.
 | kqueue, FreeBSD 15 (CI FreeBSD runner) | process descriptors (pdfork, EVFILT_PROCDESC) | [run 127, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/127/jobs/0): Debug and ReleaseSafe, 108 passed, 8 skipped, 0 failed | 2026-11-09 | [6f4f6ed](https://pacyworld.dev/pacyworld/born/commit/6f4f6ed776306c37e5beaa4cd238263cb980d1be) |
 | epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | process descriptors (pidfd, waitid) | [run 127, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/127/jobs/1): ReleaseSafe, 104 passed, 7 skipped, 0 failed | 2026-11-09 | [6f4f6ed](https://pacyworld.dev/pacyworld/born/commit/6f4f6ed776306c37e5beaa4cd238263cb980d1be) |
 | IOCP, Windows Server 2022 build 20348 (CI Windows runner) | process descriptors: unsupported contract | [run 134, Windows job](https://pacyworld.dev/pacyworld/born/actions/runs/134/jobs/2): ReleaseSafe, 74 passed, 25 skipped, 0 failed; Unsupported test passed | 2026-11-10 | [1aaf70e](https://pacyworld.dev/pacyworld/born/commit/1aaf70e9d5f61dc8bb4a92aee3f2ca4682057b4c) |
-| kqueue, FreeBSD 15 (CI FreeBSD runner) | timers (EVFILT_TIMER plus deadline heap) | [run 647, FreeBSD job (zig 0.15.2)](https://pacyworld.dev/pacyworld/born/actions/runs/647/jobs/1): Debug and ReleaseSafe, 156 passed, 18 skipped, 0 failed; ceiling and 60-day acceptance passed | 2026-11-23 | [07a09fb](https://pacyworld.dev/pacyworld/born/commit/07a09fbef1e6e05b89bfe5cbfbf4706c9e6b010c) |
+| kqueue, FreeBSD 15 (CI FreeBSD runner) | timers (EVFILT_TIMER, per-id deadlines, internal re-arm) | [run 647, FreeBSD job (zig 0.15.2)](https://pacyworld.dev/pacyworld/born/actions/runs/647/jobs/1): Debug and ReleaseSafe, 156 passed, 18 skipped, 0 failed; ceiling and 60-day acceptance passed | 2026-11-23 | [07a09fb](https://pacyworld.dev/pacyworld/born/commit/07a09fbef1e6e05b89bfe5cbfbf4706c9e6b010c) |
 | kqueue, macOS 26.1 arm64 (manual host) | timers (NOTE_NSECONDS 0x4, sub-ms, ceiling) | born-tests ReleaseSafe on Zig 0.16.0: 140 passed, 34 skipped, 0 failed; ceiling and 60-day acceptance passed | 2026-11-23 | [07a09fb](https://pacyworld.dev/pacyworld/born/commit/07a09fbef1e6e05b89bfe5cbfbf4706c9e6b010c) |
 | kqueue, NetBSD 10.1 amd64 (manual host) | timers (NOTE_NSECONDS 3, callout tick, ceiling) | born-tests ReleaseSafe on Zig 0.16.0: 139 passed, 31 skipped, 4 failed; the four failures pre-date this commit and are tracked in #76; ceiling and 60-day acceptance passed | 2026-11-23 | [07a09fb](https://pacyworld.dev/pacyworld/born/commit/07a09fbef1e6e05b89bfe5cbfbf4706c9e6b010c) |
 | kqueue, FreeBSD 15 (CI FreeBSD runner) | signals (EVFILT_SIGNAL) | [run 275, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/275/jobs/1): Debug and ReleaseSafe, 151 passed, 18 skipped, 0 failed | 2026-11-15 | [2605345](https://pacyworld.dev/pacyworld/born/commit/26053451f8fa4d1fd70973618db28ca69c7ca16e) |
@@ -541,28 +541,39 @@ exercise each implemented backend. Windows Unix domain sockets return
 `EvPort.addTimer(id, udata, after_ns, .once or .repeat)` and `cancelTimer(id)`
 deliver `Event{ .timer = true, .fired = n }` through `wait()`. `after_ns` is
 nanoseconds; the kernel rounds the deadline up to its own timer resolution,
-so a deadline never fires early within that resolution. A deadline beyond a
-kernel's representable maximum saturates to that maximum rather than firing
-immediately (see below). `after_ns` above `born.timer_after_ns_max`
-is `error.InvalidArgument`; the ceiling itself (about 292 years) is accepted
-by every runtime-tested kernel (FreeBSD, Linux, Windows, macOS, NetBSD),
-proven by a contract test that arms it and a 60-day deadline and asserts no
-error event and no immediate firing. OpenBSD is source-verified only
-(`tvtohz` saturates at `INT_MAX`).
+so a deadline never fires early within that resolution. `after_ns` above
+`born.timer_after_ns_max` is `error.InvalidArgument`. Every runtime-tested
+backend (FreeBSD, Linux, Windows, macOS, NetBSD) honors any accepted
+`after_ns` up to the ceiling (about 292 years) without firing early, proven
+by a contract test that arms the ceiling and a 60-day deadline and asserts
+no error event and no immediate firing. OpenBSD is source-verified only.
 
-Resolution per platform:
+Each kernel converts a delay exactly only up to a per-platform maximum;
+beyond it the conversion wraps or saturates and would fire early. Born
+tracks every live timer's absolute deadline, arms at most that maximum per
+shot, and re-arms the remainder internally until the deadline is due.
 
-- FreeBSD kqueue: sbintime precision, sub-millisecond. Deadlines above about
-  34 years saturate to that cap: the kernel adds the current uptime to the
-  sbintime deadline, so born leaves headroom below the ~68-year sbintime
-  maximum to keep that add from overflowing and firing at once.
-- macOS kqueue: mach absolute time, sub-millisecond.
+Resolution and exact arm caps per platform:
+
+- FreeBSD kqueue: sbintime precision, sub-millisecond. The exact cap is
+  about 34 years, half the sbintime seconds range: the kernel adds the
+  current uptime to the sbintime deadline, and a value at the ~68-year
+  sbintime maximum would overflow that add, wrap into the past and fire at
+  once.
+- macOS kqueue: mach absolute time, sub-millisecond. The cap derives from
+  the mach timebase read at init; at the shipping 24 MHz (arm64) and 1:1
+  (Intel) timebases the full ceiling converts exactly.
 - NetBSD and OpenBSD kqueue: one callout tick (1/hz, commonly 10 ms at
   hz 100 or 1 ms at hz 1000). A sub-millisecond delay rounds up to a whole
-  tick. Nanosecond units require NetBSD 10.0 / OpenBSD 7.4 or newer; older
-  kernels ignore the unit flag and read the delay as milliseconds.
-- Linux epoll (timerfd): nanosecond deadlines, sub-millisecond.
-- Windows IOCP: 100 ns due-time ticks, fired on the system clock tick.
+  tick. The cap is just below INT_MAX callout ticks (about 248 days at
+  hz 100, 24.8 days at hz 1000), from kern.clockrate read at init; above it
+  tvtohz saturates and would fire early. Nanosecond units require NetBSD
+  10.0 / OpenBSD 7.4 or newer; older kernels ignore the unit flag and read
+  the delay as milliseconds.
+- Linux epoll (timerfd): nanosecond deadlines, sub-millisecond. Absolute
+  ktime deadlines represent the full ceiling exactly.
+- Windows IOCP: 100 ns due-time ticks, fired on the system clock tick. The
+  full ceiling fits the signed 100 ns due-time range.
 
 ### Signals
 

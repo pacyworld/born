@@ -1,17 +1,25 @@
 //! Timers on kqueue (EVFILT_TIMER).
 //!
-//! Each timer is one EVFILT_TIMER knote: ident = id, data = after_ns in
-//! nanoseconds, udata = the caller's. Changes go through `EvPort.stageRaw`
-//! into the next wait(); no kevent() call outside wait(). `.once` adds
-//! EV_ONESHOT, so the kernel drops the knote when wait() harvests its
-//! firing. wait() translates the firing into Event{ .timer, .fired, .udata }
-//! after `observe` has seen it.
+//! Each timer is one EVFILT_TIMER knote: ident = id, udata = the caller's.
+//! State tracks every live id's absolute monotonic deadline (and repeat
+//! period), and both modes arm EV_ONESHOT: the kernel fires one chunk and
+//! drops the knote. A chunk is at most `State.cap_ns`, the largest delay the
+//! running kernel converts exactly; `observe` re-arms the remainder of an
+//! early firing internally and delivers nothing, so a deadline never fires
+//! early for any accepted `after_ns`, however far beyond one chunk. A due
+//! `.once` firing retires the id; a due `.repeat` firing delivers the elapsed
+//! periods and re-arms on the original phase, like the epoll/IOCP deadline
+//! heap. Changes go through `EvPort.stageRaw` into the next wait(); no
+//! kevent() call outside wait(). wait() translates a delivered firing into
+//! Event{ .timer, .fired, .udata } after `observe` has seen it.
 //!
 //! Late deletes: State tracks live ids, and `cancel` stages EV_DELETE only
 //! for a live one, so cancelling an unknown or expired id stages nothing.
-//! A `.once` id leaves the live set when `observe` sees its firing; until
+//! A `.once` id leaves the live set when `observe` sees its due firing; until
 //! then its knote exists (an unharvested firing stays queued on it), so the
-//! delete finds it and also discards that firing. This keeps an expected
+//! delete finds it and also discards that firing. Between an early chunk
+//! firing and its staged re-arm the knote is gone; a delete there is the
+//! documented ENOENT no-op. This keeps an expected
 //! ENOENT out of the changelist entirely: a change error needs an eventlist
 //! slot, and with none free kevent() fails the whole wait() and skips the
 //! rest of the changelist. The one ENOENT left is a delete for an id whose
@@ -47,10 +55,29 @@
 //! at comptime. The firing's `data` is the expiration count on every target,
 //! independent of the unit flag. NetBSD and OpenBSD round the deadline up to
 //! a callout tick (1/hz); FreeBSD and macOS arm at sub-millisecond precision.
-//! FreeBSD caps the deadline at half the sbintime seconds range (~34 years):
-//! the kernel adds the current uptime to the sbintime deadline, and a value
-//! at SBT_MAX (~68 years) overflows that add, wraps into the past and fires
-//! at once. Larger deadlines saturate to the cap, never fire immediately.
+//!
+//! Per-platform arm cap (`State.cap_ns`), the largest delay the kernel
+//! converts exactly, verified against kernel source:
+//!   FreeBSD: half the sbintime seconds range (~34 years). timer2sbintime
+//!            converts exactly below SBT_MAX (~68 years), but filt_timerstart
+//!            adds the current uptime (next = to + sbinuptime()); a value at
+//!            SBT_MAX overflows that add, wraps into the past and fires at
+//!            once. Half the range leaves headroom for any uptime below it.
+//!   macOS:   derived from mach_timebase_info at init. The kernel computes
+//!            (ns/1e9)*divisor + (ns%1e9)*divisor/1e9 with divisor =
+//!            floor(1e9*denom/numer) ticks/sec (osfmk/arm/rtclock.c; Intel is
+//!            identity). The cap keeps seconds*divisor below u64 max; the
+//!            deadline add saturates at UINT64_MAX (os_add_overflow), never
+//!            wraps. At the shipping 24 MHz and 1:1 timebases the full API
+//!            ceiling converts exactly.
+//!   NetBSD/OpenBSD: (INT_MAX - 1024) callout ticks, from kern.clockrate's
+//!            tick (usec) read once at init. tstohz/tvtohz round up and add
+//!            one tick, then saturate at INT_MAX ticks (248 days at hz 100,
+//!            24.8 days at hz 1000), which would fire early; staying below
+//!            INT_MAX keeps the conversion exact.
+//! A failed sysctl/timebase read falls back to a one-hour cap, below every
+//! supported kernel's representable maximum. In test builds the cap is 2 ms
+//! so short deadlines span several internal re-arms.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -93,25 +120,78 @@ fn ceilUs(ns: u64) u64 {
     return ns / std.time.ns_per_us + @intFromBool(ns % std.time.ns_per_us != 0);
 }
 
-/// FreeBSD deadline cap in nanoseconds: half the sbintime seconds range
-/// (~34 years). The kernel converts the deadline to sbintime (32.32 fixed
-/// point) and adds the current uptime to it (filt_timerstart:
-/// next = to + sbinuptime()). A deadline at SBT_MAX (~68 years) overflows
-/// that add, wraps into the past and fires at once. Half the range leaves
-/// headroom for any uptime below the same bound; larger deadlines saturate
-/// to this cap instead of firing immediately.
-const freebsd_after_ns_max: u64 = ((@as(u64, std.math.maxInt(i64)) >> 32) / 2) * std.time.ns_per_s;
+/// FreeBSD arm cap in nanoseconds: half the sbintime seconds range
+/// (~34 years). timer2sbintime converts exactly below SBT_MAX (~68 years),
+/// but filt_timerstart adds the current uptime (next = to + sbinuptime());
+/// a value at SBT_MAX overflows that add, wraps into the past and fires at
+/// once. Half the range leaves headroom for any uptime below the same bound.
+const freebsd_cap_ns: u64 = ((@as(u64, std.math.maxInt(i64)) >> 32) / 2) * std.time.ns_per_s;
+
+/// Fallback cap when the kernel's clockrate/timebase cannot be read: one
+/// hour, below every supported kernel's representable maximum (the BSD tick
+/// cap would need hz > 596523 to overflow INT_MAX in an hour).
+const fallback_cap_ns: u64 = 3600 * std.time.ns_per_s;
+
+/// Test-build cap: small enough that a short deadline spans several internal
+/// re-arms, exercising the never-early path on every runtime backend.
+const test_cap_ns: u64 = 2 * std.time.ns_per_ms;
+
+/// The largest arm the running kernel converts exactly, in nanoseconds.
+/// Values above it are chunked and re-armed internally, never saturated.
+fn platformCapNs() u64 {
+    switch (builtin.os.tag) {
+        .freebsd => return freebsd_cap_ns,
+        .macos => {
+            const tb = compat.machTimebase() orelse return fallback_cap_ns;
+            if (tb.numer == 0 or tb.denom == 0) return fallback_cap_ns;
+            // Kernel ticks per second: floor(1e9 * denom / numer). The
+            // conversion's only overflow candidate is whole_seconds*divisor;
+            // the remainder term stays below divisor. One second of margin
+            // keeps the sum under u64 max.
+            const divisor: u64 = @intCast((@as(u128, std.time.ns_per_s) * tb.denom) / tb.numer);
+            if (divisor == 0) return fallback_cap_ns;
+            const max_seconds = std.math.maxInt(u64) / divisor - 1;
+            const cap = @as(u128, max_seconds) * std.time.ns_per_s;
+            return @intCast(@min(cap, timer_after_ns_max));
+        },
+        .netbsd, .openbsd => {
+            const ci = compat.kernClockrate() orelse return fallback_cap_ns;
+            if (ci.tick <= 0) return fallback_cap_ns;
+            // tvtohz rounds up and adds one tick, then saturates at INT_MAX.
+            // 1024 ticks of margin keep the rounded result below INT_MAX.
+            const ticks: u64 = std.math.maxInt(i32) - 1024;
+            return ticks * @as(u64, @intCast(ci.tick)) * std.time.ns_per_us;
+        },
+        else => @compileError("born: unknown kqueue timer cap platform"),
+    }
+}
+
+/// Per-id bookkeeping: mode, the caller's udata, the absolute monotonic
+/// deadline, and the repeat period (0 for `.once`). Mirrors timer_heap.Entry.
+const Entry = struct {
+    mode: TimerMode,
+    udata: ?*anyopaque,
+    deadline_ns: u64,
+    period_ns: u64,
+};
 
 /// Per-port timer bookkeeping, a field of EvPort (`timers`).
 pub const State = struct {
-    /// Armed ids and their mode. An id is live from add until cancel, or
-    /// until `observe` sees a `.once` firing.
-    live: std.AutoHashMapUnmanaged(u32, TimerMode) = .empty,
+    /// Armed ids and their deadline state. An id is live from add until
+    /// cancel, or until `observe` sees a due `.once` firing.
+    live: std.AutoHashMapUnmanaged(u32, Entry) = .empty,
+    /// Largest single arm the running kernel converts exactly (ns). Longer
+    /// deadlines are chunked and re-armed internally.
+    cap_ns: u64 = 0,
+    /// Early chunk firings re-armed without delivery (diagnostic and test
+    /// seam; monotonic, never reset).
+    early_rearms: u64 = 0,
 
-    /// Returns state with no live timers.
+    /// Returns state with no live timers and the platform arm cap (a small
+    /// fixed cap in test builds).
     pub fn init(alloc: std.mem.Allocator) State {
         _ = alloc;
-        return .{};
+        return .{ .cap_ns = if (builtin.is_test) test_cap_ns else platformCapNs() };
     }
 
     /// Closing the kqueue drops every knote; only the bookkeeping is freed.
@@ -121,18 +201,25 @@ pub const State = struct {
 };
 
 /// Stages the timer for the next wait(). `after_ns` is nanoseconds; above
-/// `timer_after_ns_max` is InvalidArgument. Allocation happens up front, so
-/// OutOfMemory leaves the port unchanged. A kernel refusal of the EV_ADD
-/// arrives at wait() as Event{ .err, .err_no } with the timer's udata.
+/// `timer_after_ns_max` is InvalidArgument. The absolute deadline is tracked
+/// on the monotonic clock; the first arm is at most `State.cap_ns` and
+/// `observe` re-arms the remainder until the deadline. Allocation happens up
+/// front, so OutOfMemory leaves the port unchanged. A kernel refusal of the
+/// EV_ADD arrives at wait() as Event{ .err, .err_no } with the timer's udata.
 pub fn add(port: *EvPort, id: u32, udata: ?*anyopaque, after_ns: u64, mode: TimerMode) TimerError!void {
     if (after_ns > timer_after_ns_max) return TimerError.InvalidArgument;
     if (mode == .repeat and after_ns == 0) return TimerError.InvalidArgument;
+    const now = compat.monotonicNs() catch return TimerError.SystemResources;
     port.changes.ensureUnusedCapacity(port.alloc, 2) catch return TimerError.OutOfMemory;
     const slot = port.timers.live.getOrPut(port.alloc, id) catch return TimerError.OutOfMemory;
     if (slot.found_existing) port.stageRaw(change(id, EV_DELETE, null, 0));
-    slot.value_ptr.* = mode;
-    const flags: @FieldType(Kevent, "flags") = if (mode == .once) EV_ADD | EV_ONESHOT else EV_ADD;
-    port.stageRaw(change(id, flags, udata, after_ns));
+    slot.value_ptr.* = .{
+        .mode = mode,
+        .udata = udata,
+        .deadline_ns = now +| after_ns,
+        .period_ns = if (mode == .repeat) after_ns else 0,
+    };
+    port.stageRaw(change(id, EV_ADD | EV_ONESHOT, udata, @min(after_ns, port.timers.cap_ns)));
 }
 
 /// Stages EV_DELETE for a live id; anything else is a no-op. If the
@@ -148,29 +235,58 @@ pub fn cancel(port: *EvPort, id: u32) void {
     port.stageRaw(change(id, EV_DELETE, null, 0));
 }
 
-/// Sees each EVFILT_TIMER kevent first; false suppresses it. Retires a
-/// fired `.once` id and drops the ENOENT of a delete that found no knote.
-pub fn observe(port: *EvPort, kev: Kevent) bool {
+/// Sees each EVFILT_TIMER kevent first; false suppresses it. The tracked
+/// deadline is authoritative: a firing before it is an early chunk (or
+/// kernel rounding) and is re-armed for the remainder with no delivery; a
+/// due `.once` firing retires the id; a due `.repeat` firing delivers the
+/// elapsed periods and re-arms on the original phase. Drops the ENOENT of a
+/// delete that found no knote. May set kev.data to the delivered period
+/// count. A clock failure stashes WaitFailed and keeps the timer armed.
+pub fn observe(port: *EvPort, kev: *Kevent) bool {
     if ((kev.flags & EV_ERROR) != 0) return kev.data != ENOENT;
     const id = std.math.cast(u32, kev.ident) orelse return true;
-    if (port.timers.live.get(id)) |mode| {
-        if (mode == .once) _ = port.timers.live.remove(id);
+    const entry = port.timers.live.getPtr(id) orelse return true;
+    const now = compat.monotonicNs() catch {
+        if (port.pending_error == null) port.pending_error = error.WaitFailed;
+        rearm(port, id, entry.udata, port.timers.cap_ns);
+        return false;
+    };
+    if (now < entry.deadline_ns) {
+        port.timers.early_rearms += 1;
+        rearm(port, id, entry.udata, @min(entry.deadline_ns - now, port.timers.cap_ns));
+        return false;
     }
+    if (entry.mode == .once) {
+        _ = port.timers.live.remove(id);
+        return true;
+    }
+    const periods = (now - entry.deadline_ns) / entry.period_ns +| 1;
+    kev.data = @intCast(@min(periods, std.math.maxInt(u32)));
+    entry.deadline_ns = entry.deadline_ns +| (periods *| entry.period_ns);
+    rearm(port, id, entry.udata, @min(entry.deadline_ns - now, port.timers.cap_ns));
     return true;
 }
 
-fn change(id: u32, flags: @FieldType(Kevent, "flags"), udata: ?*anyopaque, after_ns: u64) Kevent {
+/// Stages the next one-shot chunk for a live id. A staging allocation
+/// failure is stashed by stageRaw and reported by the next wait().
+fn rearm(port: *EvPort, id: u32, udata: ?*anyopaque, arm_ns: u64) void {
+    port.stageRaw(change(id, EV_ADD | EV_ONESHOT, udata, arm_ns));
+}
+
+/// Pure encoder of one arm into a kevent; the cap is applied by add/rearm,
+/// not here. `arm_ns` is at most `timer_after_ns_max`, so it fits the signed
+/// data field on every target.
+fn change(id: u32, flags: @FieldType(Kevent, "flags"), udata: ?*anyopaque, arm_ns: u64) Kevent {
     var kev = std.mem.zeroes(Kevent);
     kev.ident = id;
     kev.filter = kq.EVFILT_TIMER;
     kev.flags = flags;
     if (note_nseconds) |unit| {
         kev.fflags = unit;
-        const ns = if (builtin.os.tag == .freebsd) @min(after_ns, freebsd_after_ns_max) else after_ns;
-        kev.data = @intCast(ns);
+        kev.data = @intCast(arm_ns);
     } else {
         kev.fflags = note_useconds;
-        kev.data = @intCast(ceilUs(after_ns));
+        kev.data = @intCast(ceilUs(arm_ns));
     }
     kev.udata = @intFromPtr(udata);
     return kev;
@@ -191,6 +307,18 @@ fn waitOne(port: *EvPort, events: []Event, window_ms: i32) !usize {
         const n = try port.wait(events, window_ms - elapsed);
         if (n != 0) return n;
     }
+}
+
+/// Effective chunk granularity for the multi-re-arm tests. On sub-millisecond
+/// kernels it is the test cap; on NetBSD/OpenBSD the kernel rounds each arm up
+/// to a callout tick (and tstohz adds one), so a deadline must span several
+/// ticks, not several caps, to exercise multiple re-arms at any hz.
+fn testChunkNs(cap: u64) u64 {
+    const tick_ns: u64 = if (compat.kernClockrate()) |ci|
+        @as(u64, @intCast(ci.tick)) * std.time.ns_per_us
+    else
+        0;
+    return @max(cap, tick_ns);
 }
 
 test "timer_kqueue: change encoding uses the target's nanosecond unit" {
@@ -229,6 +357,104 @@ test "timer_kqueue: ceilUs rounds up to whole microseconds" {
     try testing.expectEqual(@as(u64, 2), ceilUs(std.time.ns_per_us + 1));
 }
 
+test "timer_kqueue: the arm cap is bounded and add never stages beyond it" {
+    var port = try EvPort.init(testing.allocator);
+    defer port.deinit();
+    try testing.expect(port.timers.cap_ns >= 1);
+    try testing.expect(port.timers.cap_ns <= timer_after_ns_max);
+    if (builtin.is_test) try testing.expectEqual(test_cap_ns, port.timers.cap_ns);
+    var tag: u8 = 1;
+    try add(&port, 10, &tag, timer_after_ns_max, .once);
+    const kev = port.changes.items[port.changes.items.len - 1];
+    try testing.expectEqual(EV_ADD | EV_ONESHOT, kev.flags);
+    try testing.expectEqual(@as(@TypeOf(kev.data), @intCast(port.timers.cap_ns)), kev.data);
+    // A repeat period above the cap is tracked in full, not truncated.
+    try add(&port, 11, &tag, timer_after_ns_max, .repeat);
+    try testing.expectEqual(timer_after_ns_max, port.timers.live.get(11).?.period_ns);
+    cancel(&port, 10);
+    cancel(&port, 11);
+}
+
+test "timer_kqueue: the runtime platform cap is bounded and converts exactly" {
+    // Exercises the real derivation (mach timebase / kern.clockrate), not the
+    // is_test seam, so each runtime host proves its own cap.
+    const cap = platformCapNs();
+    try testing.expect(cap >= 1);
+    try testing.expect(cap <= timer_after_ns_max);
+    switch (builtin.os.tag) {
+        .freebsd => try testing.expectEqual(freebsd_cap_ns, cap),
+        .netbsd, .openbsd => {
+            // Below INT_MAX callout ticks, so tvtohz never saturates.
+            if (compat.kernClockrate()) |ci| {
+                const tick_ns = @as(u64, @intCast(ci.tick)) * std.time.ns_per_us;
+                try testing.expect(cap / tick_ns < std.math.maxInt(i32));
+            }
+        },
+        .macos => {
+            // whole_seconds*divisor stays below u64 max (one second margin).
+            if (compat.machTimebase()) |tb| {
+                if (tb.numer != 0 and tb.denom != 0) {
+                    const divisor = (@as(u128, std.time.ns_per_s) * tb.denom) / tb.numer;
+                    try testing.expect((@as(u128, cap / std.time.ns_per_s) + 1) * divisor <= std.math.maxInt(u64));
+                }
+            }
+        },
+        else => {},
+    }
+}
+
+test "timer_kqueue: a deadline beyond the cap re-arms internally and fires once, never early" {
+    var port = try EvPort.init(testing.allocator);
+    defer port.deinit();
+    var events: [4]Event = undefined;
+    var tag: u8 = 1;
+    const cap = port.timers.cap_ns;
+    // Ten chunks of the effective granularity: several early re-arms before
+    // the final one on every runtime backend, whatever its tick resolution.
+    const delay = 10 * testChunkNs(cap);
+    const armed = try compat.monotonicNs();
+    try add(&port, 12, &tag, delay, .once);
+    const before = port.timers.early_rearms;
+    try testing.expectEqual(@as(usize, 1), try waitOne(&port, &events, 5000));
+    try testing.expect(events[0].timer);
+    try testing.expect(events[0].udata == @as(?*anyopaque, &tag));
+    try testing.expectEqual(@as(u32, 1), events[0].fired);
+    const elapsed = (try compat.monotonicNs()) - armed;
+    try testing.expect(elapsed >= delay);
+    try testing.expect(port.timers.early_rearms - before >= 3);
+    try testing.expect(!port.timers.live.contains(12));
+    try testing.expectEqual(@as(usize, 0), try port.wait(&events, 50));
+}
+
+test "timer_kqueue: a repeat period beyond the cap keeps its phase across re-arms" {
+    var port = try EvPort.init(testing.allocator);
+    defer port.deinit();
+    var events: [4]Event = undefined;
+    var tag: u8 = 1;
+    const cap = port.timers.cap_ns;
+    // Eight chunks per period keeps the phase across several re-arms on every
+    // runtime backend, whatever its tick resolution.
+    const period = 8 * testChunkNs(cap);
+    const armed = try compat.monotonicNs();
+    try add(&port, 13, &tag, period, .repeat);
+    const before = port.timers.early_rearms;
+    var fired: u64 = 0;
+    while (fired < 2) {
+        const n = try waitOne(&port, &events, 5000);
+        try testing.expect(n != 0);
+        for (events[0..n]) |ev| {
+            try testing.expect(ev.timer and ev.udata == @as(?*anyopaque, &tag));
+            try testing.expect(ev.fired >= 1);
+            fired += ev.fired;
+        }
+    }
+    const elapsed = (try compat.monotonicNs()) - armed;
+    try testing.expect(elapsed >= 2 * period);
+    try testing.expect(port.timers.early_rearms - before >= 2);
+    cancel(&port, 13);
+    try testing.expectEqual(@as(usize, 0), try port.wait(&events, 50));
+}
+
 test "timer_kqueue: cancelling an expired or unknown id stages nothing" {
     var port = try EvPort.init(testing.allocator);
     defer port.deinit();
@@ -264,7 +490,12 @@ test "timer_kqueue: a delete that finds no knote is suppressed" {
     var events: [4]Event = undefined;
     try testing.expectEqual(@as(usize, 0), try port.wait(&events, 0));
     // The state a refused EV_ADD leaves: tracked as live, no knote.
-    try port.timers.live.put(testing.allocator, 3, .repeat);
+    try port.timers.live.put(testing.allocator, 3, .{
+        .mode = .repeat,
+        .udata = null,
+        .deadline_ns = 0,
+        .period_ns = 1,
+    });
     cancel(&port, 3);
     try testing.expectEqual(@as(usize, 1), port.changes.items.len);
     try testing.expectEqual(@as(usize, 0), try port.wait(&events, 20));
@@ -277,9 +508,9 @@ test "timer_kqueue: other change errors still surface" {
     var kev = change(4, EV_ADD, &tag, 0);
     kev.flags = EV_ERROR;
     kev.data = @intFromEnum(compat.E.INVAL);
-    try testing.expect(observe(&port, kev));
+    try testing.expect(observe(&port, &kev));
     kev.data = ENOENT;
-    try testing.expect(!observe(&port, kev));
+    try testing.expect(!observe(&port, &kev));
 }
 
 test "timer_kqueue: replacing a live id changes its mode" {
@@ -307,7 +538,7 @@ test "timer_kqueue: replacing a live id changes its mode" {
             fired += 1;
         }
     }
-    try testing.expectEqual(@as(?TimerMode, .repeat), port.timers.live.get(6));
+    try testing.expectEqual(@as(?TimerMode, .repeat), if (port.timers.live.get(6)) |e| e.mode else null);
     cancel(&port, 6);
     try testing.expectEqual(@as(usize, 0), try port.wait(&events, 50));
 }

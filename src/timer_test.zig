@@ -273,9 +273,9 @@ test "timer: the kernel accepts the ceiling and a 60-day deadline" {
     // submits the staged arm on kqueue and harvests any refusal on every
     // backend; a real window then proves no wrapped near-zero deadline fires
     // at once. 60 days exceeds the old u32-ms ceiling (~49.7 days); the
-    // ceiling itself is ~292 years. A kernel that cannot represent a value
-    // saturates it rather than refusing; born caps FreeBSD below SBT_MAX so
-    // the kernel's uptime add cannot wrap the deadline into the past.
+    // ceiling itself is ~292 years. Each backend arms at most its kernel's
+    // exact conversion cap and re-arms the remainder internally, so even a
+    // value no kernel can represent in one shot never fires early.
     const sixty_days: u64 = 60 * 24 * 60 * 60 * std.time.ns_per_s;
     for ([_]u64{ born.timer_after_ns_max, sixty_days }) |delay| {
         try addOrSkip(&port, 12, &a, delay, .once);

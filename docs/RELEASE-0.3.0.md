@@ -36,7 +36,10 @@ migration is tracked in mcp-bridge#35 and follows the repin order below.
 `after_ms: u32` (milliseconds); the uniform ceiling is
 `born.timer_after_ns_max` (about 292 years). A consumer that passed
 milliseconds must multiply by `std.time.ns_per_ms`. The born.io shim no
-longer rounds sleeps up to whole milliseconds.
+longer rounds sleeps up to whole milliseconds. Every backend honors any
+accepted delay up to the ceiling without firing early: each arms at most
+its kernel's exact conversion cap per shot and re-arms the remainder
+internally until the deadline is due.
 
 Estate consumers audited for the change: none builds against born master
 with the nanosecond API today. McpBridge, identityd, sonya-core,
