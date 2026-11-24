@@ -158,6 +158,14 @@ pub const process_stats_enabled: bool = io_options.process_stats;
 /// relocates completion latency into the submitter's futex wait, and enabling
 /// it elsewhere requires an on-OS runtime measurement showing no p99 regression
 /// first. Compiling on a target is not evidence for it.
+///
+/// Correctness dependency: UMTX_OP_NWAKE_PRIVATE matches only PRIVATE umtx keys,
+/// so the batched drain releases a submitter only because std `Io.Threaded`'s
+/// futexWait parks with UMTX_OP_WAIT_UINT_PRIVATE (verified on Zig 0.16.0
+/// Threaded.zig:1032 and 0.17.1 :1036). If a future std switches that wait to a
+/// shared key, every deferred completion is lost and the time route hangs; the
+/// real-waiter FreeBSD test below fails on that change instead of leaving it to
+/// surface as a suite timeout.
 const defer_wake_enabled = is_freebsd;
 
 /// Where a capability family is serviced.
@@ -1033,7 +1041,7 @@ pub const Shim = struct {
         dead: bool = false,
         /// Idle-gate: set (release) under the mutex when a submit or cancel
         /// request takes a list empty-to-non-empty; the loop's drain reads it
-        /// relaxed and skips the lock when empty, clearing it under the mutex
+        /// acquire and skips the lock when empty, clearing it under the mutex
         /// after the swap. A racing submit re-sets it and wakes the loop
         /// (was_empty), so a skipped drain is always followed by another cycle.
         pending: std.atomic.Value(bool) = .init(false),
@@ -1550,6 +1558,9 @@ pub const Shim = struct {
     /// re-checks its word (the same hazard as the immediate wake after the
     /// terminal store). On list overflow, wake immediately rather than drop.
     /// Comptime-dead to a plain futexWake on backends without deferred wakes.
+    /// NWAKE wakes EVERY waiter on each word, where futexWake(.., 1) wakes one;
+    /// the two are equivalent here only because the time route has exactly one
+    /// waiter per completion word.
     fn wakeOp(self: *Shim, ptr: *const u32) void {
         if (comptime defer_wake_enabled) {
             if (self.defer_wake_active) {
@@ -1740,11 +1751,13 @@ pub const Shim = struct {
     /// for ops still in the swapped queue are left to `netArmOrRetire`'s
     /// `cancel_requested` check.
     fn netDrainLocked(self: *Shim) ?*NetOp {
-        // Idle-gate: skip the drain lock when the relaxed pending flag reads
-        // empty. A submission racing this check sets pending under the lock and,
-        // finding the queue empty, wakes the loop (was_empty), so the next cycle
-        // drains it; no submission is lost.
-        if (!self.net_queue.pending.load(.monotonic)) return null;
+        // Idle-gate: skip the drain lock when the pending flag reads empty.
+        // The load is acquire, pairing with the submitter's release store under
+        // the mutex, so the happens-before edge holds by the memory model rather
+        // than by platform practice. A submission racing this check sets pending
+        // under the lock and, finding the queue empty, wakes the loop (was_empty),
+        // so the next cycle drains it; no submission is lost.
+        if (!self.net_queue.pending.load(.acquire)) return null;
         self.net_queue.mutex.lockUncancelable(self.threaded_io);
         var driven: ?*NetOp = null;
         var idx = self.net_cancel_head;
@@ -3084,8 +3097,8 @@ pub const Shim = struct {
     /// `cancel_requested` check.
     fn procDrainLocked(self: *Shim) ?*ProcOp {
         if (comptime !process_supported) return null;
-        // Idle-gate: see netDrainLocked.
-        if (!self.proc_queue.pending.load(.monotonic)) return null;
+        // Idle-gate: see netDrainLocked (acquire load pairs with the release store).
+        if (!self.proc_queue.pending.load(.acquire)) return null;
         self.proc_queue.mutex.lockUncancelable(self.threaded_io);
         var driven: ?*ProcOp = null;
         var idx = self.proc_cancel_head;
@@ -3751,8 +3764,9 @@ pub fn loopError(interface: Io) ?anyerror {
 /// written and every latency field reports zero. `nwake_refusals` is the
 /// exception: it counts FreeBSD NWAKE kernel refusals that fell back to
 /// per-address wakes and is incremented on every refusal regardless of
-/// `time_stats` (a rare correctness fallback, not a latency accumulator); it
-/// still reads zero here when `time_stats` is off.
+/// `time_stats` (a rare correctness fallback, not a latency accumulator). It is
+/// reported even when `time_stats` is off, so the degradation counter stays
+/// readable in the default build where a refusal would fire.
 pub const TimeStats = struct {
     ops: u64,
     wakes: u64,
@@ -3763,9 +3777,14 @@ pub const TimeStats = struct {
     nwake_refusals: u64,
 };
 
-/// Snapshot of the time route's latency breakdown accumulators. Reports
-/// zeros when the `time_stats` build option is off.
+/// Snapshot of the time route's latency breakdown accumulators. The latency
+/// fields report zero when the `time_stats` build option is off; `nwake_refusals`
+/// is always reported (see `TimeStats`).
 pub fn timeStats(interface: Io) TimeStats {
+    const s = &shimFrom(interface.userdata).stats;
+    // Correctness fallback counter: read regardless of time_stats so a
+    // degradation is visible in the default (stats-off) build.
+    const refusals = s.nwake_refusals.load(.monotonic);
     if (!time_stats_enabled) return .{
         .ops = 0,
         .wakes = 0,
@@ -3773,9 +3792,8 @@ pub fn timeStats(interface: Io) TimeStats {
         .queue_arm_ns = 0,
         .timer_span_ns = 0,
         .futex_return_ns = 0,
-        .nwake_refusals = 0,
+        .nwake_refusals = refusals,
     };
-    const s = &shimFrom(interface.userdata).stats;
     return .{
         .ops = s.ops.load(.monotonic),
         .wakes = s.wakes.load(.monotonic),
@@ -3783,7 +3801,7 @@ pub fn timeStats(interface: Io) TimeStats {
         .queue_arm_ns = s.queue_arm.load(.monotonic),
         .timer_span_ns = s.timer_span.load(.monotonic),
         .futex_return_ns = s.futex_return.load(.monotonic),
-        .nwake_refusals = s.nwake_refusals.load(.monotonic),
+        .nwake_refusals = refusals,
     };
 }
 
@@ -6134,7 +6152,7 @@ test "net submit reports only the empty-to-non-empty transition" {
 }
 
 test "idle gate: a submission racing the emptiness check drains on the next cycle" {
-    // The loop's relaxed emptiness read can race a submission: the check reads
+    // The loop's emptiness read can race a submission: the check reads
     // empty, then the submitter enqueues and, finding the queue empty, wakes the
     // loop (was_empty). The next cycle must drain the op. This is the
     // deterministic simulation of that interleaving; the was_empty wake is the
@@ -6146,7 +6164,7 @@ test "idle gate: a submission racing the emptiness check drains on the next cycl
     defer state.netFreeChunks();
 
     // Cycle 1: empty queue, the drain returns nothing (the gate skips the lock
-    // entirely on the relaxed empty read).
+    // entirely on the empty acquire read).
     try std.testing.expectEqual(@as(?*NetOp, null), state.netDrainLocked());
     try std.testing.expect(!state.net_queue.pending.load(.monotonic));
 
@@ -6177,7 +6195,7 @@ test "idle gate: a submission racing the emptiness check drains on the next cycl
 
 test "idle gate: concurrent submissions are never lost across emptiness checks" {
     // The real race: a submitter enqueues while the drainer sweeps. A drain
-    // whose relaxed read saw empty skips the lock; the was_empty wake guarantees
+    // whose acquire read saw empty skips the lock; the was_empty wake guarantees
     // another cycle in production. Here the drainer retires each drained op
     // (freeing its slot) and sweeps until every op is accounted for; thread join
     // makes the final stores visible, so the sweep terminates. Bounded spins
@@ -7044,7 +7062,7 @@ test "proc submit reports only the empty-to-non-empty transition" {
 }
 
 test "idle gate: a proc submission racing the emptiness check drains on the next cycle" {
-    // Proc mirror of the net race test: the relaxed emptiness read can race a
+    // Proc mirror of the net race test: the emptiness read can race a
     // submission; the was_empty wake guarantees the next cycle drains it.
     if (comptime !process_supported) return error.SkipZigTest;
     var state: Shim = undefined;
@@ -7070,12 +7088,79 @@ test "nwakePrivate accepts a private-umtx address array (FreeBSD ABI)" {
     // No waiters: the kernel must accept the opcode and array layout and return
     // success. A misnumbered opcode (std.c.freebsd's UMTX_OP enum has
     // NWAKE_PRIVATE=31; the kernel's sys/umtx.h defines 21) returns EINVAL and
-    // fails here. Delivery to real waiters is exercised end-to-end by the
-    // time-route suite on FreeBSD, whose completion wakes use the batched
-    // NWAKE drain (defer_wake_enabled).
+    // fails here. Delivery to a real parked waiter is proven by the next test.
     var word: u32 = 0;
     try std.testing.expect(compat.nwakePrivate(&.{}));
     try std.testing.expect(compat.nwakePrivate(&.{&word}));
+}
+
+test "nwakePrivate wakes a real parked private-umtx waiter (FreeBSD)" {
+    if (comptime !is_freebsd) return error.SkipZigTest;
+    // NWAKE_PRIVATE matches only PRIVATE umtx keys, so the batched completion
+    // drain releases a submitter only because std Io.Threaded's futexWait parks
+    // with UMTX_OP_WAIT_UINT_PRIVATE (0.16.0 Threaded.zig:1032, 0.17.1 :1036).
+    // This parks a real thread on that vtable futexWait and proves nwakePrivate
+    // releases it. If a future std switches to a shared wait the wake is lost:
+    // the waiter then returns via its own timeout (woken stays 0) and the
+    // assertion fails, instead of the change surfacing only as a suite timeout.
+    var state: Shim = undefined;
+    testShim(&state);
+    defer state.threaded.deinit();
+    const tio = state.threaded_io;
+    var word: std.atomic.Value(u32) = .init(0);
+    var parked: std.atomic.Value(u32) = .init(0);
+    var done: std.atomic.Value(u32) = .init(0);
+    var woken: std.atomic.Value(u32) = .init(0);
+
+    const Waiter = struct {
+        fn run(iface: Io, w: *std.atomic.Value(u32), p: *std.atomic.Value(u32), d: *std.atomic.Value(u32), wk: *std.atomic.Value(u32)) void {
+            // Handshake: signal about-to-park, then park on the private word.
+            p.store(1, .release);
+            iface.vtable.futexWake(iface.userdata, &p.raw, 1);
+            // Park while word == 0. The timeout means a lost wake surfaces as a
+            // timeout return (woken stays 0), not a prompt NWAKE release.
+            const tmo = Io.Timeout{ .duration = .{ .raw = .fromNanoseconds(3 * std.time.ns_per_s), .clock = .awake } };
+            iface.vtable.futexWait(iface.userdata, &w.raw, 0, tmo) catch {
+                d.store(1, .release);
+                iface.vtable.futexWake(iface.userdata, &d.raw, 1);
+                return;
+            };
+            wk.store(1, .release);
+            d.store(1, .release);
+            iface.vtable.futexWake(iface.userdata, &d.raw, 1);
+        }
+    };
+    const t = try std.Thread.spawn(.{}, Waiter.run, .{ tio, &word, &parked, &done, &woken });
+    // On any failure path, release and join the waiter before threaded.deinit:
+    // a live thread outliving `state` would dereference freed Threaded memory.
+    var joined = false;
+    defer {
+        if (!joined) {
+            word.store(1, .release);
+            tio.vtable.futexWake(tio.userdata, &word.raw, 1);
+            t.join();
+        }
+    }
+    // Bounded handshake: wait until the waiter signals it is parking. Futex
+    // re-checks the value under the parking lock, so a wake landing before this
+    // wait is not lost (event-driven, no spin cap).
+    while (parked.load(.acquire) == 0) {
+        tio.vtable.futexWait(tio.userdata, &parked.raw, 0, .none) catch {};
+    }
+    // Deliver the batched wake, retrying to cover the wake-before-park race:
+    // NWAKE is idempotent and the waiter parks momentarily after the handshake.
+    // Each iteration is a real 100ms event wait; the cap is a time bound (~4s,
+    // past the waiter's 3s timeout), not a busy-spin budget.
+    const retry = Io.Timeout{ .duration = .{ .raw = .fromNanoseconds(100 * std.time.ns_per_ms), .clock = .awake } };
+    var tries: u32 = 0;
+    while (done.load(.acquire) == 0 and tries < 40) : (tries += 1) {
+        try std.testing.expect(compat.nwakePrivate(&.{&word.raw}));
+        tio.vtable.futexWait(tio.userdata, &done.raw, 0, retry) catch {};
+    }
+    t.join();
+    joined = true;
+    // The waiter must have been released by NWAKE, not by its own timeout.
+    try std.testing.expectEqual(@as(u32, 1), woken.load(.acquire));
 }
 
 test "proc cancel request skips a retired slot and refuses a double push" {
