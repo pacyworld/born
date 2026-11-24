@@ -13,8 +13,8 @@ into a concrete event.
 | `aarch64-macos` | kqueue | tested on macOS 26 arm64; see runtime evidence |
 | `x86_64-macos` | kqueue | **compile-only, not tested on hardware** |
 | `x86_64-windows-gnu` | IOCP | original backend in production since 2026-08 |
-| `x86_64-netbsd` | kqueue | **compile-only, not tested on hardware** |
-| `x86_64-openbsd` | kqueue | **compile-only, not tested on hardware** |
+| `x86_64-netbsd` | kqueue | **compile-only, not tested on hardware**; nanosecond timers need NetBSD 10.0 or newer |
+| `x86_64-openbsd` | kqueue | **compile-only, not tested on hardware**; nanosecond timers need OpenBSD 7.4 or newer |
 
 These are exactly the `supported_targets` in `build.zig`, checked by CI.
 The build rejects missing or extra target rows in this table.
@@ -33,8 +33,8 @@ OS per primitive, and lists real runs only.
 | epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | event port, wake, plain TCP stream | [run 39, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/39/jobs/1): ReleaseSafe, 28 passed, 26 skipped, 0 failed | 2026-10-18 | [3ed3785](https://pacyworld.dev/pacyworld/born/commit/3ed378538592c0f8c3a0598c957409dd6becfd57) |
 | IOCP, Windows Server 2022 build 20348 (CI Windows runner) | event port, wake, plain TCP stream | [run 39, Windows job](https://pacyworld.dev/pacyworld/born/actions/runs/39/jobs/2): ReleaseSafe, 21 passed, 27 skipped, 0 failed | 2026-10-18 | [3ed3785](https://pacyworld.dev/pacyworld/born/commit/3ed378538592c0f8c3a0598c957409dd6becfd57) |
 | epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | signals (signalfd) | [run 51, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/51/jobs/1): ReleaseSafe, 53 passed, 18 skipped, 0 failed | 2026-10-19 | [af7d004](https://pacyworld.dev/pacyworld/born/commit/af7d0046630ed67698570b6b9fd261b6e659c3a7) |
-| IOCP, Windows Server 2022 build 20348 (CI Windows runner) | timers (thread-pool timer) | [run 75, Windows job](https://pacyworld.dev/pacyworld/born/actions/runs/75/jobs/2): ReleaseSafe, 49 passed, 20 skipped, 0 failed | 2026-10-20 | [27c7357](https://pacyworld.dev/pacyworld/born/commit/27c735706b9b3e8f29adcf966ba62b4dfe3b8c4a) |
-| epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | timers (timerfd plus deadline heap) | [run 61, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/61/jobs/1): ReleaseSafe, 67 passed, 9 skipped, 0 failed | 2026-10-19 | [efa2d93](https://pacyworld.dev/pacyworld/born/commit/efa2d93497abf0ca4d52fe500a6094a9dc1b5888) |
+| IOCP, Windows Server 2022 build 20348 (CI Windows runner) | timers (thread-pool timer) | [run 664, Windows job (zig 0.15.2, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/664/jobs/13): 99 passed, 36 skipped, 0 failed; ceiling and 60-day acceptance passed; green on all six legs | 2026-11-24 | [73e23b1](https://pacyworld.dev/pacyworld/born/commit/73e23b1ea6adf4c5599ef467d21edec6f11b1928) |
+| epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | timers (timerfd plus deadline heap) | [run 664, Linux job (zig 0.15.2, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/664/jobs/7): 152 passed, 12 skipped, 0 failed; ceiling and 60-day acceptance passed; green on all six legs | 2026-11-24 | [73e23b1](https://pacyworld.dev/pacyworld/born/commit/73e23b1ea6adf4c5599ef467d21edec6f11b1928) |
 | IOCP, Windows Server 2022 build 20348 (CI Windows runner) | signals (console control events) | [run 81, Windows job](https://pacyworld.dev/pacyworld/born/actions/runs/81/jobs/2): ReleaseSafe, 36 passed, 25 skipped, 0 failed | 2026-10-20 | [f2229c6](https://pacyworld.dev/pacyworld/born/commit/f2229c68d7e32f718e34f6b5c563461b993b61b9) |
 | IOCP, Windows 11 build 26100 (manual host) | signals (console control events) | born-tests.exe Debug and ReleaseSafe over OpenSSH: 36 passed, 25 skipped, 0 failed each | 2026-10-20 | [f2229c6](https://pacyworld.dev/pacyworld/born/commit/f2229c68d7e32f718e34f6b5c563461b993b61b9) |
 | IOCP, Windows Server 2022 build 20348 (CI Windows runner) | TCP listener (AcceptEx) | [run 64, Windows job](https://pacyworld.dev/pacyworld/born/actions/runs/64/jobs/2): ReleaseSafe, 38 passed, 26 skipped, 0 failed | 2026-10-20 | [8eca1d3](https://pacyworld.dev/pacyworld/born/commit/8eca1d3e226b14d5120a84192b2aa0779d50884a) |
@@ -51,17 +51,19 @@ OS per primitive, and lists real runs only.
 | kqueue, FreeBSD 15 (CI FreeBSD runner) | process descriptors (pdfork, EVFILT_PROCDESC) | [run 127, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/127/jobs/0): Debug and ReleaseSafe, 108 passed, 8 skipped, 0 failed | 2026-11-09 | [6f4f6ed](https://pacyworld.dev/pacyworld/born/commit/6f4f6ed776306c37e5beaa4cd238263cb980d1be) |
 | epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | process descriptors (pidfd, waitid) | [run 127, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/127/jobs/1): ReleaseSafe, 104 passed, 7 skipped, 0 failed | 2026-11-09 | [6f4f6ed](https://pacyworld.dev/pacyworld/born/commit/6f4f6ed776306c37e5beaa4cd238263cb980d1be) |
 | IOCP, Windows Server 2022 build 20348 (CI Windows runner) | process descriptors: unsupported contract | [run 134, Windows job](https://pacyworld.dev/pacyworld/born/actions/runs/134/jobs/2): ReleaseSafe, 74 passed, 25 skipped, 0 failed; Unsupported test passed | 2026-11-10 | [1aaf70e](https://pacyworld.dev/pacyworld/born/commit/1aaf70e9d5f61dc8bb4a92aee3f2ca4682057b4c) |
-| kqueue, FreeBSD 15 (CI FreeBSD runner) | timers (EVFILT_TIMER plus deadline heap) | [run 275, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/275/jobs/1): Debug and ReleaseSafe, 151 passed, 18 skipped, 0 failed | 2026-11-15 | [2605345](https://pacyworld.dev/pacyworld/born/commit/26053451f8fa4d1fd70973618db28ca69c7ca16e) |
+| kqueue, FreeBSD 15 (CI FreeBSD runner) | timers (EVFILT_TIMER, per-id deadlines, internal re-arm) | [run 664, FreeBSD job (zig 0.15.2)](https://pacyworld.dev/pacyworld/born/actions/runs/664/jobs/1): Debug and ReleaseSafe, 161 passed, 18 skipped, 0 failed; ceiling, 60-day, multi-re-arm and production one-shot never-early passed | 2026-11-24 | [73e23b1](https://pacyworld.dev/pacyworld/born/commit/73e23b1ea6adf4c5599ef467d21edec6f11b1928) |
+| kqueue, macOS 26.1 arm64 (manual host) | timers (NOTE_NSECONDS 0x4, sub-ms, internal re-arm) | born-tests ReleaseSafe on Zig 0.16.0: 145 passed, 34 skipped, 0 failed; ceiling, 60-day, multi-re-arm and production one-shot never-early passed | 2026-11-24 | [73e23b1](https://pacyworld.dev/pacyworld/born/commit/73e23b1ea6adf4c5599ef467d21edec6f11b1928) |
+| kqueue, NetBSD 10.1 amd64 (manual host) | timers (NOTE_NSECONDS 3, callout tick, internal re-arm) | born-tests ReleaseSafe on Zig 0.16.0: 144 passed, 31 skipped, 4 failed; the four failures pre-date this commit and are tracked in #76; ceiling, 60-day, multi-re-arm and production one-shot never-early passed | 2026-11-24 | [73e23b1](https://pacyworld.dev/pacyworld/born/commit/73e23b1ea6adf4c5599ef467d21edec6f11b1928) |
 | kqueue, FreeBSD 15 (CI FreeBSD runner) | signals (EVFILT_SIGNAL) | [run 275, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/275/jobs/1): Debug and ReleaseSafe, 151 passed, 18 skipped, 0 failed | 2026-11-15 | [2605345](https://pacyworld.dev/pacyworld/born/commit/26053451f8fa4d1fd70973618db28ca69c7ca16e) |
 | kqueue, FreeBSD 15 (CI FreeBSD runner) | TCP listener (accept drain, SO_REUSEPORT_LB) | [run 275, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/275/jobs/1): Debug and ReleaseSafe, 151 passed, 18 skipped, 0 failed | 2026-11-15 | [2605345](https://pacyworld.dev/pacyworld/born/commit/26053451f8fa4d1fd70973618db28ca69c7ca16e) |
 | epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | TCP listener (accept drain, SO_REUSEPORT) | [run 275, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/275/jobs/7): ReleaseSafe, 149 passed, 12 skipped, 0 failed | 2026-11-15 | [2605345](https://pacyworld.dev/pacyworld/born/commit/26053451f8fa4d1fd70973618db28ca69c7ca16e) |
-| kqueue, FreeBSD 15 (CI FreeBSD runner) | born.io time route (sleep, now) | [run 272, FreeBSD job (zig 0.16.0)](https://pacyworld.dev/pacyworld/born/actions/runs/272/jobs/2) and [zig 0.17.1 job](https://pacyworld.dev/pacyworld/born/actions/runs/272/jobs/3): Debug and ReleaseSafe, 34 passed, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
-| epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | born.io time route (sleep, now) | [run 272, Linux job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/272/jobs/8): Debug and ReleaseSafe on 0.16.0 and 0.17.1, 33 passed, 1 skipped, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
-| IOCP, Windows Server 2022 build 20348 (CI Windows runner) | born.io time route (sleep, now) | [run 272, Windows job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/272/jobs/14): Debug and ReleaseSafe on 0.16.0 and 0.17.1, 33 passed, 1 skipped, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
+| kqueue, FreeBSD 15 (CI FreeBSD runner) | born.io time route (sleep, now) | [run 664, FreeBSD job (zig 0.16.0)](https://pacyworld.dev/pacyworld/born/actions/runs/664/jobs/2) and [zig 0.17.1 job](https://pacyworld.dev/pacyworld/born/actions/runs/664/jobs/3): Debug and ReleaseSafe, 144 passed, 9 skipped, 0 failed each | 2026-11-24 | [73e23b1](https://pacyworld.dev/pacyworld/born/commit/73e23b1ea6adf4c5599ef467d21edec6f11b1928) |
+| epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | born.io time route (sleep, now) | [run 664, Linux job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/664/jobs/8) and [zig 0.17.1 job](https://pacyworld.dev/pacyworld/born/actions/runs/664/jobs/9): Debug and ReleaseSafe on 0.16.0 and 0.17.1, 141 passed, 12 skipped, 0 failed each | 2026-11-24 | [73e23b1](https://pacyworld.dev/pacyworld/born/commit/73e23b1ea6adf4c5599ef467d21edec6f11b1928) |
+| IOCP, Windows Server 2022 build 20348 (CI Windows runner) | born.io time route (sleep, now) | [run 664, Windows job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/664/jobs/14) and [zig 0.17.1 job](https://pacyworld.dev/pacyworld/born/actions/runs/664/jobs/15): Debug and ReleaseSafe, 88 passed, 65 skipped, 0 failed (0.16.0); 85 passed, 68 skipped, 0 failed (0.17.1) | 2026-11-24 | [73e23b1](https://pacyworld.dev/pacyworld/born/commit/73e23b1ea6adf4c5599ef467d21edec6f11b1928) |
 | kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io time route (sleep, now) | born-io-tests Debug and ReleaseSafe on Zig 0.16.0: 34 passed, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
 | kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io time route, default config (stats off) | born-io-tests-default Debug and ReleaseSafe on Zig 0.16.0: 34 passed, 0 failed each; the wake-count test asserts the zero contract | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
-| kqueue, macOS 26.1 arm64 (manual host) | born.io time route (sleep, now) | born-io-tests Debug and ReleaseSafe on Zig 0.16.0, ReleaseSafe on 0.17.1: 34 passed, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
-| kqueue, NetBSD 10.1 amd64 (manual host) | born.io time route (pipe wake) | born-io-tests Debug and ReleaseSafe on Zig 0.16.0: 34 passed, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
+| kqueue, macOS 26.1 arm64 (manual host) | born.io time route (sleep, now) | born-io-tests ReleaseSafe on Zig 0.16.0: 93 passed, 60 skipped, 0 failed; sub-millisecond sleep contract passed | 2026-11-23 | [07a09fb](https://pacyworld.dev/pacyworld/born/commit/07a09fbef1e6e05b89bfe5cbfbf4706c9e6b010c) |
+| kqueue, NetBSD 10.1 amd64 (manual host) | born.io time route (pipe wake) | born-io-tests ReleaseSafe on Zig 0.16.0: 93 passed, 60 skipped, 0 failed; sub-millisecond sleep contract passed | 2026-11-23 | [07a09fb](https://pacyworld.dev/pacyworld/born/commit/07a09fbef1e6e05b89bfe5cbfbf4706c9e6b010c) |
 | epoll, Linux 7.0 (Ubuntu 26.04 VM, manual host) | born.io time route (sleep, now) | born-io-tests Debug and ReleaseSafe on Zig 0.16.0: 33 passed, 1 skipped, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
 | epoll, Linux 7.0 (Ubuntu 26.04 VM, manual host) | born.io time route, default config (stats off) | born-io-tests-default ReleaseSafe on Zig 0.16.0: 33 passed, 1 skipped, 0 failed | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
 | IOCP, Windows 11 build 26100 (manual host) | born.io time route (sleep, now) | born-io-tests.exe Debug and ReleaseSafe on Zig 0.16.0 over OpenSSH: 33 passed, 1 skipped, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
@@ -536,8 +538,42 @@ exercise each implemented backend. Windows Unix domain sockets return
 
 ### Timers
 
-`EvPort.addTimer(id, udata, after_ms, .once or .repeat)` and `cancelTimer(id)`
-deliver `Event{ .timer = true, .fired = n }` through `wait()`.
+`EvPort.addTimer(id, udata, after_ns, .once or .repeat)` and `cancelTimer(id)`
+deliver `Event{ .timer = true, .fired = n }` through `wait()`. `after_ns` is
+nanoseconds; the kernel rounds the deadline up to its own timer resolution,
+so a deadline never fires early within that resolution. `after_ns` above
+`born.timer_after_ns_max` is `error.InvalidArgument`. Every runtime-tested
+backend (FreeBSD, Linux, Windows, macOS, NetBSD) honors any accepted
+`after_ns` up to the ceiling (about 292 years) without firing early, proven
+by a contract test that arms the ceiling and a 60-day deadline and asserts
+no error event and no immediate firing. OpenBSD is source-verified only.
+
+Each kernel converts a delay exactly only up to a per-platform maximum;
+beyond it the conversion wraps or saturates and would fire early. Born
+tracks every live timer's absolute deadline, arms at most that maximum per
+shot, and re-arms the remainder internally until the deadline is due.
+
+Resolution and exact arm caps per platform:
+
+- FreeBSD kqueue: sbintime precision, sub-millisecond. The exact cap is
+  about 34 years, half the sbintime seconds range: the kernel adds the
+  current uptime to the sbintime deadline, and a value at the ~68-year
+  sbintime maximum would overflow that add, wrap into the past and fire at
+  once.
+- macOS kqueue: mach absolute time, sub-millisecond. The cap derives from
+  the mach timebase read at init; at the shipping 24 MHz (arm64) and 1:1
+  (Intel) timebases the full ceiling converts exactly.
+- NetBSD and OpenBSD kqueue: one callout tick (1/hz, commonly 10 ms at
+  hz 100 or 1 ms at hz 1000). A sub-millisecond delay rounds up to a whole
+  tick. The cap is just below INT_MAX callout ticks (about 248 days at
+  hz 100, 24.8 days at hz 1000), from kern.clockrate read at init; above it
+  tvtohz saturates and would fire early. Nanosecond units require NetBSD
+  10.0 / OpenBSD 7.4 or newer; older kernels ignore the unit flag and read
+  the delay as milliseconds.
+- Linux epoll (timerfd): nanosecond deadlines, sub-millisecond. Absolute
+  ktime deadlines represent the full ceiling exactly.
+- Windows IOCP: 100 ns due-time ticks, fired on the system clock tick. The
+  full ceiling fits the signed 100 ns due-time range.
 
 ### Signals
 
@@ -571,8 +607,9 @@ POSIX provides `Listener.openUnix(path, opts)` and
   batch. Tolerate it, as for a purged descriptor.
 - **Timer ids** are caller-chosen and unique per port; re-adding a live id
   replaces it. Cancelling an unknown or expired id is a no-op. A `.once`
-  timer with `after_ms = 0` is due at the next `wait()`; a `.repeat` timer
-  with `after_ms = 0` is `error.InvalidArgument`.
+  timer with `after_ns = 0` is due at the next `wait()`; a `.repeat` timer
+  with `after_ns = 0`, or any `after_ns` above `born.timer_after_ns_max`, is
+  `error.InvalidArgument`.
 - **Signals are process-wide.** At most one port watches a given signal; a
   second gets `error.SignalInUse`. On epoll the signal must be blocked in
   every thread (signalfd), so call `born.blockSignals` in `main` before

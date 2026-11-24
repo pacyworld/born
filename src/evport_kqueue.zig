@@ -95,6 +95,7 @@ pub const Handle = types.Handle;
 pub const Event = types.Event;
 pub const Signal = types.Signal;
 pub const TimerMode = types.TimerMode;
+pub const timer_after_ns_max = types.timer_after_ns_max;
 
 /// SystemResources: kqueue, the EVFILT_USER add, or the wake pipe was
 /// refused. OutOfMemory: the wake-pipe registration could not be staged.
@@ -312,10 +313,12 @@ pub const EvPort = struct {
         return kev;
     }
 
-    /// Arm a timer. `id` is caller-chosen and unique per port; re-adding a
-    /// live id replaces it. Timers are deadlines, never I/O drivers.
-    pub fn addTimer(self: *EvPort, id: u32, udata: ?*anyopaque, after_ms: u32, mode: TimerMode) TimerError!void {
-        return timer_kqueue.add(self, id, udata, after_ms, mode);
+    /// Arm a timer to fire `after_ns` nanoseconds from now. `id` is
+    /// caller-chosen and unique per port; re-adding a live id replaces it.
+    /// `after_ns` above `timer_after_ns_max` is `error.InvalidArgument`.
+    /// Timers are deadlines, never I/O drivers.
+    pub fn addTimer(self: *EvPort, id: u32, udata: ?*anyopaque, after_ns: u64, mode: TimerMode) TimerError!void {
+        return timer_kqueue.add(self, id, udata, after_ns, mode);
     }
 
     /// Disarm a timer. Unknown or already-expired ids are a no-op.
@@ -387,9 +390,20 @@ pub const EvPort = struct {
 
         var ts: std.c.timespec = undefined;
         var tsp: ?*const std.c.timespec = null;
+        // The caller's timeout as an absolute monotonic deadline. observe may
+        // stage internal timer re-arms mid-harvest, looping back through here;
+        // each blocking iteration waits only the remaining time instead of
+        // restarting the caller's timeout. Null when timeout_ms is null (block
+        // indefinitely), zero (non-blocking), or the clock cannot be read.
+        var deadline_ns: ?u64 = null;
         if (timeout_ms) |ms| {
             ts = .{ .sec = @intCast(@divTrunc(ms, 1000)), .nsec = @intCast(@mod(ms, 1000) * 1_000_000) };
             tsp = &ts;
+            if (ms > 0) {
+                if (compat.monotonicNs()) |now| {
+                    deadline_ns = now +| @as(u64, @intCast(ms)) * std.time.ns_per_ms;
+                } else |_| {}
+            }
         }
         const zero_ts: std.c.timespec = .{ .sec = 0, .nsec = 0 };
 
@@ -400,6 +414,16 @@ pub const EvPort = struct {
             const remaining = self.changes.items.len - consumed;
             const submitted = @min(remaining, cap);
             const last = submitted == remaining;
+            if (last) {
+                if (deadline_ns) |dl| {
+                    if (compat.monotonicNs()) |now| {
+                        // Ceil to whole milliseconds so the wait never ends
+                        // before the caller's deadline.
+                        const remain_ms = ((dl -| now) + (std.time.ns_per_ms - 1)) / std.time.ns_per_ms;
+                        ts = .{ .sec = @intCast(remain_ms / 1000), .nsec = @intCast((remain_ms % 1000) * std.time.ns_per_ms) };
+                    } else |_| {}
+                }
+            }
             const n = if (builtin.os.tag == .netbsd)
                 netbsd.__kevent50(self.kq, self.changes.items[consumed..].ptr, submitted, &kbuf, cap, if (last) tsp else &zero_ts)
             else
@@ -413,7 +437,7 @@ pub const EvPort = struct {
                 return WaitError.WaitFailed;
             }
 
-            for (kbuf[0..@intCast(n)]) |kev| {
+            for (kbuf[0..@intCast(n)]) |*kev| {
                 if (kev.udata == @intFromPtr(&wake_sentinel)) {
                     if (!woke) {
                         woke = true;
@@ -428,24 +452,28 @@ pub const EvPort = struct {
                     _ = self.armed_write.remove(@intCast(kev.ident));
                 }
                 // The owning module sees its kevents first (live-id bookkeeping,
-                // or suppressing an expected ENOENT from a late delete).
+                // or suppressing an expected ENOENT from a late delete). The
+                // timer observe may rewrite kev.data and stage a re-arm.
                 const keep = if (kev.filter == EVFILT_TIMER)
                     timer_kqueue.observe(self, kev)
                 else if (kev.filter == EVFILT_SIGNAL)
-                    signal_kqueue.observe(self, kev)
+                    signal_kqueue.observe(self, kev.*)
                 else if (process_kqueue.have_procdesc and kev.filter == process_kqueue.EVFILT_PROCDESC)
-                    process_kqueue.observe(self, kev)
+                    process_kqueue.observe(self, kev.*)
                 else
                     true;
                 if (!keep) continue;
-                events[out] = translate(kev);
+                events[out] = translate(kev.*);
                 out += 1;
             }
             if (out != 0) {
                 self.consumeChanges(consumed);
                 return out;
             }
-            if (last) {
+            // observe may have staged re-arms while this batch was processed;
+            // they are not consumed yet, so loop and submit them. Only a fully
+            // consumed changelist ends an empty wait.
+            if (self.changes.items.len == consumed) {
                 self.changes.clearRetainingCapacity();
                 return 0;
             }
@@ -610,7 +638,7 @@ test "kqueue: eventlist capacity preserves rejected changes and the suffix" {
     port.monitorRead(closed[0], &tags[0]);
     port.monitorRead(closed[1], &tags[1]);
     var timer_tag: u8 = 3;
-    try port.addTimer(99, &timer_tag, 1, .once);
+    try port.addTimer(99, &timer_tag, 1 * std.time.ns_per_ms, .once);
 
     var event: [1]Event = undefined;
     try std.testing.expectEqual(@as(usize, 1), try port.wait(&event, 0));
@@ -639,7 +667,7 @@ test "kqueue: 65 rejections cross the 64-slot boundary without loss" {
     var tags: [65]u8 = @splat(0);
     for (&tags, 0..) |*tag, i| port.monitorRead(closed[i], tag);
     var timer_tag: u8 = 1;
-    try port.addTimer(100, &timer_tag, 1, .once);
+    try port.addTimer(100, &timer_tag, 1 * std.time.ns_per_ms, .once);
 
     var events: [64]Event = undefined;
     try std.testing.expectEqual(@as(usize, 64), try port.wait(&events, 0));

@@ -40,6 +40,7 @@ pub const Handle = types.Handle;
 pub const Event = types.Event;
 pub const Signal = types.Signal;
 pub const TimerMode = types.TimerMode;
+pub const timer_after_ns_max = types.timer_after_ns_max;
 
 pub const InitError = types.InitError;
 /// Failure to associate a handle with an I/O completion port.
@@ -188,10 +189,12 @@ pub const EvPort = struct {
         return &internal_keys[@intFromEnum(kind)];
     }
 
-    /// Arm a timer. `id` is caller-chosen and unique per port; re-adding a
-    /// live id replaces it. Timers are deadlines, never I/O drivers.
-    pub fn addTimer(self: *EvPort, id: u32, udata: ?*anyopaque, after_ms: u32, mode: TimerMode) TimerError!void {
-        return timer_iocp.add(self, id, udata, after_ms, mode);
+    /// Arm a timer to fire `after_ns` nanoseconds from now. `id` is
+    /// caller-chosen and unique per port; re-adding a live id replaces it.
+    /// `after_ns` above `timer_after_ns_max` is `error.InvalidArgument`.
+    /// Timers are deadlines, never I/O drivers.
+    pub fn addTimer(self: *EvPort, id: u32, udata: ?*anyopaque, after_ns: u64, mode: TimerMode) TimerError!void {
+        return timer_iocp.add(self, id, udata, after_ns, mode);
     }
 
     /// Disarm a timer. Unknown or already-expired ids are a no-op.

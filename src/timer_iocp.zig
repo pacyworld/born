@@ -12,7 +12,7 @@
 //!
 //! Due timers that do not fit in wait()'s buffer stay in the heap, and
 //! `harvest` posts one completion from the loop thread (`repost_payload`)
-//! so the next wait() reports them. A `.once` timer with `after_ms = 0` is
+//! so the next wait() reports them. A `.once` timer with `after_ns = 0` is
 //! due at once and takes the same path. Reposts coalesce: at most one is
 //! queued at a time.
 //!
@@ -37,6 +37,7 @@ const EvPort = iocp.EvPort;
 const Event = iocp.Event;
 const TimerError = iocp.TimerError;
 const TimerMode = iocp.TimerMode;
+const timer_after_ns_max = iocp.timer_after_ns_max;
 
 // Thread-pool timer API (threadpoolapiset.h), exported by kernel32.dll
 // since Windows Vista and listed in mingw-w64's kernel32.def. These local
@@ -206,14 +207,16 @@ fn now() u64 {
     };
 }
 
-/// Arms `id` on the port's thread-pool timer. Replaces a live id. On error
-/// the port's timers are unchanged.
-pub fn add(port: *EvPort, id: u32, udata: ?*anyopaque, after_ms: u32, mode: TimerMode) TimerError!void {
-    if (mode == .repeat and after_ms == 0) return TimerError.InvalidArgument;
+/// Arms `id` on the port's thread-pool timer `after_ns` nanoseconds from now.
+/// Replaces a live id. `after_ns` above `timer_after_ns_max` is
+/// error.InvalidArgument. On error the port's timers are unchanged. The due
+/// time is rounded up to whole 100 ns ticks (relativeTicks).
+pub fn add(port: *EvPort, id: u32, udata: ?*anyopaque, after_ns: u64, mode: TimerMode) TimerError!void {
+    if (after_ns > timer_after_ns_max) return TimerError.InvalidArgument;
+    if (mode == .repeat and after_ns == 0) return TimerError.InvalidArgument;
     const state = &port.timers;
     const gpa = state.alloc orelse return TimerError.Unsupported;
     _ = try state.timer(port);
-    const after_ns = @as(u64, after_ms) * std.time.ns_per_ms;
     const period_ns: u64 = if (mode == .repeat) after_ns else 0;
     const now_ns = now();
     state.heap.add(gpa, now_ns, id, udata, after_ns, period_ns) catch |err| switch (err) {
@@ -311,15 +314,15 @@ test "timer_iocp: the thread-pool timer is created lazily and armed for the head
     defer port.deinit();
     try testing.expect(port.timers.tp == null);
     var tag: u8 = 1;
-    try add(&port, 1, &tag, 5000, .once);
+    try add(&port, 1, &tag, 5000 * std.time.ns_per_ms, .once);
     const tp = port.timers.tp.?;
     try testing.expect(port.timers.owner == &port);
     try testing.expect(IsThreadpoolTimerSet(tp) != 0);
     try testing.expectEqual(port.timers.heap.deadlineOf(1), port.timers.armed_ns);
     // A later deadline keeps the earlier arm; an earlier one re-arms.
-    try add(&port, 2, &tag, 9000, .once);
+    try add(&port, 2, &tag, 9000 * std.time.ns_per_ms, .once);
     try testing.expectEqual(port.timers.heap.deadlineOf(1), port.timers.armed_ns);
-    try add(&port, 3, &tag, 2000, .once);
+    try add(&port, 3, &tag, 2000 * std.time.ns_per_ms, .once);
     try testing.expectEqual(port.timers.heap.deadlineOf(3), port.timers.armed_ns);
     try testing.expect(port.timers.tp.? == tp);
 }
@@ -328,8 +331,8 @@ test "timer_iocp: cancelling the last timer disarms the thread-pool timer" {
     var port = try EvPort.init(testing.allocator);
     defer port.deinit();
     var tag: u8 = 1;
-    try add(&port, 1, &tag, 30, .once);
-    try add(&port, 2, &tag, 40, .repeat);
+    try add(&port, 1, &tag, 30 * std.time.ns_per_ms, .once);
+    try add(&port, 2, &tag, 40 * std.time.ns_per_ms, .repeat);
     cancel(&port, 1);
     try testing.expect(IsThreadpoolTimerSet(port.timers.tp.?) != 0);
     cancel(&port, 2);
@@ -344,8 +347,8 @@ test "timer_iocp: re-adding a live id with an earlier deadline re-arms" {
     defer port.deinit();
     var a: u8 = 1;
     var b: u8 = 2;
-    try add(&port, 1, &a, 60_000, .once);
-    try add(&port, 1, &b, 10, .once);
+    try add(&port, 1, &a, 60_000 * std.time.ns_per_ms, .once);
+    try add(&port, 1, &b, 10 * std.time.ns_per_ms, .once);
     var events: [4]Event = undefined;
     try testing.expectEqual(@as(usize, 1), try waitOne(&port, &events, 1000));
     try testing.expect(events[0].timer and events[0].udata == @as(?*anyopaque, &b));
@@ -386,7 +389,7 @@ test "timer_iocp: a firing with nothing due re-arms and reports nothing" {
     var port = try EvPort.init(testing.allocator);
     defer port.deinit();
     var tag: u8 = 1;
-    try add(&port, 1, &tag, 40, .once);
+    try add(&port, 1, &tag, 40 * std.time.ns_per_ms, .once);
     // A stale firing, as from a cancelled head or an early thread-pool tick.
     port.post(EvPort.internalKey(.timer), null, fire_payload);
     var events: [4]Event = undefined;
@@ -400,7 +403,7 @@ test "timer_iocp: repeat reports missed periods in fired" {
     var port = try EvPort.init(testing.allocator);
     defer port.deinit();
     var tag: u8 = 1;
-    try add(&port, 1, &tag, 5, .repeat);
+    try add(&port, 1, &tag, 5 * std.time.ns_per_ms, .repeat);
     // Miss several periods before the first harvest.
     compat.sleepNs(60 * std.time.ns_per_ms);
     var events: [4]Event = undefined;
@@ -441,7 +444,7 @@ test "timer_iocp: 1000 create/arm/deinit cycles with a timer due at teardown" {
         defer warm.deinit();
         var events: [4]Event = undefined;
         const start = now();
-        try add(&warm, 1, &tag, 1, .once);
+        try add(&warm, 1, &tag, 1 * std.time.ns_per_ms, .once);
         try testing.expectEqual(@as(usize, 1), try waitOne(&warm, &events, 1000));
         latency_us = @max(latency_us, (now() - start) / std.time.ns_per_us);
     }
@@ -453,7 +456,7 @@ test "timer_iocp: 1000 create/arm/deinit cycles with a timer due at teardown" {
     var fired: usize = 0;
     for (0..1000) |i| {
         var port = try EvPort.init(testing.allocator);
-        try add(&port, @intCast(i), &tag, 1, if (i % 2 == 0) .once else .repeat);
+        try add(&port, @intCast(i), &tag, 1 * std.time.ns_per_ms, if (i % 2 == 0) .once else .repeat);
         // 7 is coprime to 33, so every offset recurs in each residue class.
         spinUs((i * 7 % steps) * step_us);
         if (i % 8 == 7) {

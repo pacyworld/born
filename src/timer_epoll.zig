@@ -27,6 +27,7 @@ const EvPort = ep.EvPort;
 const Event = ep.Event;
 const TimerError = ep.TimerError;
 const TimerMode = ep.TimerMode;
+const timer_after_ns_max = ep.timer_after_ns_max;
 
 /// Per-port timer bookkeeping, a field of EvPort (`timers`).
 pub const State = struct {
@@ -95,16 +96,17 @@ pub const State = struct {
     }
 };
 
-/// Arms timer `id` to fire `after_ms` from now, every `after_ms` for
-/// `.repeat`. Re-adding a live id replaces it. A `.once` with 0 is due at
-/// the next wait(); a `.repeat` with 0 is error.InvalidArgument.
-/// OutOfMemory leaves every live timer as it was.
-pub fn add(port: *EvPort, id: u32, udata: ?*anyopaque, after_ms: u32, mode: TimerMode) TimerError!void {
-    if (mode == .repeat and after_ms == 0) return TimerError.InvalidArgument;
+/// Arms timer `id` to fire `after_ns` nanoseconds from now, every `after_ns`
+/// for `.repeat`. Re-adding a live id replaces it. A `.once` with 0 is due at
+/// the next wait(); a `.repeat` with 0, or `after_ns` above
+/// `timer_after_ns_max`, is error.InvalidArgument. OutOfMemory leaves every
+/// live timer as it was. The timerfd is armed in nanoseconds (CLOCK_MONOTONIC).
+pub fn add(port: *EvPort, id: u32, udata: ?*anyopaque, after_ns: u64, mode: TimerMode) TimerError!void {
+    if (after_ns > timer_after_ns_max) return TimerError.InvalidArgument;
+    if (mode == .repeat and after_ns == 0) return TimerError.InvalidArgument;
     const st = &port.timers;
     try st.ensureFd(port);
     const now = timer_heap.nowNs() catch return TimerError.SystemResources;
-    const after_ns = @as(u64, after_ms) * std.time.ns_per_ms;
     const period_ns: u64 = if (mode == .repeat) after_ns else 0;
     st.heap.add(port.alloc, now, id, udata, after_ns, period_ns) catch return TimerError.OutOfMemory;
     st.rearm(port);
@@ -193,11 +195,11 @@ test "timer_epoll: one lazily created timerfd serves every timer" {
     defer port.deinit();
     try testing.expect(port.internalFd(.timer) == null);
     var a: u8 = 0;
-    try port.addTimer(1, &a, 1000, .once);
+    try port.addTimer(1, &a, 1000 * std.time.ns_per_ms, .once);
     const fd = port.internalFd(.timer).?;
     try testing.expectEqual(fd, port.timers.fd);
     var i: u32 = 2;
-    while (i < 200) : (i += 1) try port.addTimer(i, &a, 1000 + i, .repeat);
+    while (i < 200) : (i += 1) try port.addTimer(i, &a, @as(u64, 1000 + i) * std.time.ns_per_ms, .repeat);
     try testing.expectEqual(fd, port.internalFd(.timer).?);
     try testing.expectEqual(@as(usize, 199), port.timers.heap.count());
 }
@@ -206,13 +208,13 @@ test "timer_epoll: the timerfd follows the heap head and disarms when empty" {
     var port = try EvPort.init(testing.allocator);
     defer port.deinit();
     var a: u8 = 0;
-    try port.addTimer(1, &a, 5000, .once);
+    try port.addTimer(1, &a, 5000 * std.time.ns_per_ms, .once);
     const fd = port.timers.fd;
     try testing.expectEqual(port.timers.heap.next(), port.timers.armed);
     const late = (try armedAt(fd)).?;
 
     // A sooner timer moves the head and the kernel deadline with it.
-    try port.addTimer(2, &a, 1000, .once);
+    try port.addTimer(2, &a, 1000 * std.time.ns_per_ms, .once);
     try testing.expectEqual(port.timers.heap.next(), port.timers.armed);
     try testing.expect((try armedAt(fd)).? < late);
 
@@ -268,7 +270,7 @@ test "timer_epoll: more expirations than one expire chunk fill a large buffer" {
 test "timer_epoll: deinit closes the timerfd" {
     var port = try EvPort.init(testing.allocator);
     var a: u8 = 0;
-    try port.addTimer(1, &a, 1000, .repeat);
+    try port.addTimer(1, &a, 1000 * std.time.ns_per_ms, .repeat);
     const fd = port.timers.fd;
     port.deinit();
     try testing.expectEqual(linux.E.BADF, compat.linuxErrno(linux.fcntl(fd, linux.F.GETFD, 0)));

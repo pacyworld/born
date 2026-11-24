@@ -30,6 +30,24 @@ with no source changes. The #23 "consumers build with no source changes"
 check is scoped to POSIX until the Windows migration lands; that
 migration is tracked in mcp-bridge#35 and follows the repin order below.
 
+## Timer unit breaking change
+
+`EvPort.addTimer`'s delay is now `after_ns: u64` (nanoseconds), not
+`after_ms: u32` (milliseconds); the uniform ceiling is
+`born.timer_after_ns_max` (about 292 years). A consumer that passed
+milliseconds must multiply by `std.time.ns_per_ms`. The born.io shim no
+longer rounds sleeps up to whole milliseconds. Every backend honors any
+accepted delay up to the ceiling without firing early: each arms at most
+its kernel's exact conversion cap per shot and re-arms the remainder
+internally until the deadline is due.
+
+Estate consumers audited for the change: none builds against born master
+with the nanosecond API today. McpBridge, identityd, sonya-core,
+sonya-core-port and sonya-studio pin v0.2.3, which has no timers. Antibot's
+gateway (git pin) and HSM (vendored snapshot) are frozen pre-change copies
+that call `addTimer` with millisecond values; they need the unit change when
+they repin or re-vendor onto 0.3.0. xmppd uses its own event loop, not born.
+
 ## born.io (std.Io compatibility shim) - experimental, opt-in
 
 - `born.io` requires Zig >= 0.16 and is not exported on 0.15.2. The all-Threaded
