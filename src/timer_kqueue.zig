@@ -76,8 +76,13 @@
 //!            24.8 days at hz 1000), which would fire early; staying below
 //!            INT_MAX keeps the conversion exact.
 //! A failed sysctl/timebase read falls back to a one-hour cap, below every
-//! supported kernel's representable maximum. In test builds the cap is 2 ms
-//! so short deadlines span several internal re-arms.
+//! supported kernel's representable maximum. Every port arms at the real
+//! platform cap; only the multi-re-arm tests lower their own port's cap to
+//! 2 ms so a short deadline spans several internal re-arms.
+//!
+//! A re-arm staged in a batch that also delivers events is submitted on the
+//! caller's next wait(), so that chunk fires late by the caller's processing
+//! time. Late, never early.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -132,8 +137,8 @@ const freebsd_cap_ns: u64 = ((@as(u64, std.math.maxInt(i64)) >> 32) / 2) * std.t
 /// cap would need hz > 596523 to overflow INT_MAX in an hour).
 const fallback_cap_ns: u64 = 3600 * std.time.ns_per_s;
 
-/// Test-build cap: small enough that a short deadline spans several internal
-/// re-arms, exercising the never-early path on every runtime backend.
+/// Small cap the multi-re-arm tests set on their own port so a short deadline
+/// spans several internal re-arms. Production ports always use platformCapNs().
 const test_cap_ns: u64 = 2 * std.time.ns_per_ms;
 
 /// The largest arm the running kernel converts exactly, in nanoseconds.
@@ -187,11 +192,11 @@ pub const State = struct {
     /// seam; monotonic, never reset).
     early_rearms: u64 = 0,
 
-    /// Returns state with no live timers and the platform arm cap (a small
-    /// fixed cap in test builds).
+    /// Returns state with no live timers and the real platform arm cap. Tests
+    /// that exercise internal re-arm lower `cap_ns` on their own port.
     pub fn init(alloc: std.mem.Allocator) State {
         _ = alloc;
-        return .{ .cap_ns = if (builtin.is_test) test_cap_ns else platformCapNs() };
+        return .{ .cap_ns = platformCapNs() };
     }
 
     /// Closing the kqueue drops every knote; only the bookkeeping is freed.
@@ -360,6 +365,9 @@ test "timer_kqueue: ceilUs rounds up to whole microseconds" {
 test "timer_kqueue: the arm cap is bounded and add never stages beyond it" {
     var port = try EvPort.init(testing.allocator);
     defer port.deinit();
+    // Configure a small cap on this port so the bounding is observable; init
+    // otherwise uses the real platform cap (the production one-shot path).
+    port.timers.cap_ns = test_cap_ns;
     try testing.expect(port.timers.cap_ns >= 1);
     try testing.expect(port.timers.cap_ns <= timer_after_ns_max);
     if (builtin.is_test) try testing.expectEqual(test_cap_ns, port.timers.cap_ns);
@@ -403,9 +411,37 @@ test "timer_kqueue: the runtime platform cap is bounded and converts exactly" {
     }
 }
 
+test "timer_kqueue: a delay within the platform cap arms in one shot, never early" {
+    var port = try EvPort.init(testing.allocator);
+    defer port.deinit();
+    var events: [4]Event = undefined;
+    var tag: u8 = 1;
+    // The production path: init uses the real platform cap, so a delay below
+    // it arms in a single shot with no internal chunking. Well above the test
+    // cap, so a global is_test seam would have chunked this delay instead.
+    const delay = 20 * test_cap_ns;
+    try testing.expect(delay < port.timers.cap_ns);
+    const armed = try compat.monotonicNs();
+    try add(&port, 14, &tag, delay, .once);
+    // One shot: the staged arm carries the full delay, not a capped chunk.
+    const kev = port.changes.items[port.changes.items.len - 1];
+    try testing.expectEqual(@as(@TypeOf(kev.data), @intCast(delay)), kev.data);
+    try testing.expectEqual(@as(usize, 1), try waitOne(&port, &events, 5000));
+    try testing.expect(events[0].timer);
+    try testing.expect(events[0].udata == @as(?*anyopaque, &tag));
+    try testing.expectEqual(@as(u32, 1), events[0].fired);
+    const elapsed = (try compat.monotonicNs()) - armed;
+    try testing.expect(elapsed >= delay);
+    try testing.expect(!port.timers.live.contains(14));
+    try testing.expectEqual(@as(usize, 0), try port.wait(&events, 50));
+}
+
 test "timer_kqueue: a deadline beyond the cap re-arms internally and fires once, never early" {
     var port = try EvPort.init(testing.allocator);
     defer port.deinit();
+    // Lower this port's cap so a short deadline spans several re-arms; other
+    // ports keep the real platform cap.
+    port.timers.cap_ns = test_cap_ns;
     var events: [4]Event = undefined;
     var tag: u8 = 1;
     const cap = port.timers.cap_ns;
@@ -429,6 +465,9 @@ test "timer_kqueue: a deadline beyond the cap re-arms internally and fires once,
 test "timer_kqueue: a repeat period beyond the cap keeps its phase across re-arms" {
     var port = try EvPort.init(testing.allocator);
     defer port.deinit();
+    // Lower this port's cap so a short period spans several re-arms; other
+    // ports keep the real platform cap.
+    port.timers.cap_ns = test_cap_ns;
     var events: [4]Event = undefined;
     var tag: u8 = 1;
     const cap = port.timers.cap_ns;
