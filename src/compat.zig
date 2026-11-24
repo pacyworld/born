@@ -1324,6 +1324,38 @@ pub fn connectUnixAt(dirfd: fd_t, sock: socket_t, addr: *const sockaddr, len: so
     return std.c.connect(sock, addr, len);
 }
 
+// FreeBSD _umtx_op ABI for the multi-address private wake. The opcode is 21
+// per the kernel's sys/umtx.h (UMTX_OP_NWAKE_PRIVATE) and the kern_umtx.c
+// dispatch table. std.c.freebsd's UMTX_OP enum misnumbers NWAKE_PRIVATE as 31
+// (an upstream Zig bug; filing it is the maintainer's call), so compat owns the
+// constant and the declaration, the freebsd_at precedent. The kernel copies the
+// address array in 128-entry chunks and wakes every waiter on each word; Born's
+// time route has one waiter per word, so the effect matches per-address single
+// wakes. A stale address wakes at most an unrelated waiter spuriously, which
+// re-checks its word (the same hazard as the immediate wake after the terminal
+// store).
+const freebsd_umtx = if (is_freebsd) struct {
+    extern "c" fn _umtx_op(obj: usize, op: c_int, val: c_ulong, uaddr: usize, uaddr2: usize) c_int;
+    const UMTX_OP_NWAKE_PRIVATE: c_int = 21;
+} else struct {};
+
+/// Wakes an array of private-umtx words in one FreeBSD UMTX_OP_NWAKE_PRIVATE
+/// call. Returns false on kernel refusal so the caller falls back to
+/// per-address wakes; no wake is lost. The array is borrowed for the call only.
+/// FreeBSD-only; other OSes keep per-address wakes in the caller.
+pub fn nwakePrivate(addrs: []const *const u32) bool {
+    if (comptime !is_freebsd) @compileError("nwakePrivate is FreeBSD-only");
+    if (addrs.len == 0) return true;
+    const rc = freebsd_umtx._umtx_op(
+        @intFromPtr(addrs.ptr),
+        freebsd_umtx.UMTX_OP_NWAKE_PRIVATE,
+        @intCast(addrs.len),
+        0,
+        0,
+    );
+    return rc == 0;
+}
+
 /// Reads a socket option into `opt`.
 pub fn getsockopt(sock: socket_t, level: i32, option: u32, opt: []u8) GetSockOptError!void {
     if (comptime is_windows) {
