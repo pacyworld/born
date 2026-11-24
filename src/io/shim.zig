@@ -7100,9 +7100,12 @@ test "nwakePrivate wakes a real parked private-umtx waiter (FreeBSD)" {
     // drain releases a submitter only because std Io.Threaded's futexWait parks
     // with UMTX_OP_WAIT_UINT_PRIVATE (0.16.0 Threaded.zig:1032, 0.17.1 :1036).
     // This parks a real thread on that vtable futexWait and proves nwakePrivate
-    // releases it. If a future std switches to a shared wait the wake is lost:
-    // the waiter then returns via its own timeout (woken stays 0) and the
-    // assertion fails, instead of the change surfacing only as a suite timeout.
+    // releases it. If a future std switches to a shared wait the wake is lost
+    // and the waiter returns via its own 3s timeout. futexWait reports a timeout
+    // as a NORMAL return (Threaded maps .TIMEDOUT => {} on 0.16.0 and 0.17.1),
+    // so an error/catch cannot detect the lost wake: decide by elapsed monotonic
+    // time instead. A NWAKE release returns well under 1s; a lost wake runs out
+    // the full 3s and fails the assertion, instead of surfacing as a suite hang.
     var state: Shim = undefined;
     testShim(&state);
     defer state.threaded.deinit();
@@ -7110,27 +7113,26 @@ test "nwakePrivate wakes a real parked private-umtx waiter (FreeBSD)" {
     var word: std.atomic.Value(u32) = .init(0);
     var parked: std.atomic.Value(u32) = .init(0);
     var done: std.atomic.Value(u32) = .init(0);
-    var woken: std.atomic.Value(u32) = .init(0);
+    var elapsed_ns: std.atomic.Value(u64) = .init(0);
 
     const Waiter = struct {
-        fn run(iface: Io, w: *std.atomic.Value(u32), p: *std.atomic.Value(u32), d: *std.atomic.Value(u32), wk: *std.atomic.Value(u32)) void {
+        fn run(iface: Io, w: *std.atomic.Value(u32), p: *std.atomic.Value(u32), d: *std.atomic.Value(u32), el: *std.atomic.Value(u64)) void {
             // Handshake: signal about-to-park, then park on the private word.
             p.store(1, .release);
             iface.vtable.futexWake(iface.userdata, &p.raw, 1);
-            // Park while word == 0. The timeout means a lost wake surfaces as a
-            // timeout return (woken stays 0), not a prompt NWAKE release.
+            // Park while word == 0, timing the wait on the monotonic clock. The
+            // elapsed time (not an error) distinguishes a prompt NWAKE release
+            // from a lost wake that runs out the 3s timeout.
+            const t0 = born.nowNs() catch 0;
             const tmo = Io.Timeout{ .duration = .{ .raw = .fromNanoseconds(3 * std.time.ns_per_s), .clock = .awake } };
-            iface.vtable.futexWait(iface.userdata, &w.raw, 0, tmo) catch {
-                d.store(1, .release);
-                iface.vtable.futexWake(iface.userdata, &d.raw, 1);
-                return;
-            };
-            wk.store(1, .release);
+            iface.vtable.futexWait(iface.userdata, &w.raw, 0, tmo) catch {};
+            const t1 = born.nowNs() catch t0;
+            el.store(t1 - t0, .release);
             d.store(1, .release);
             iface.vtable.futexWake(iface.userdata, &d.raw, 1);
         }
     };
-    const t = try std.Thread.spawn(.{}, Waiter.run, .{ tio, &word, &parked, &done, &woken });
+    const t = try std.Thread.spawn(.{}, Waiter.run, .{ tio, &word, &parked, &done, &elapsed_ns });
     // On any failure path, release and join the waiter before threaded.deinit:
     // a live thread outliving `state` would dereference freed Threaded memory.
     var joined = false;
@@ -7159,8 +7161,11 @@ test "nwakePrivate wakes a real parked private-umtx waiter (FreeBSD)" {
     }
     t.join();
     joined = true;
-    // The waiter must have been released by NWAKE, not by its own timeout.
-    try std.testing.expectEqual(@as(u32, 1), woken.load(.acquire));
+    // The waiter must have returned promptly via NWAKE, not run out its 3s
+    // timeout (which futexWait reports as a normal return). The retry loop
+    // delivers a wake within ~100ms of parking, so a real release is well under
+    // 1s; a lost wake takes the full 3s and fails here.
+    try std.testing.expect(elapsed_ns.load(.acquire) < std.time.ns_per_s);
 }
 
 test "proc cancel request skips a retired slot and refuses a double push" {
