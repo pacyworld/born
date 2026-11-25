@@ -57,24 +57,13 @@ OS per primitive, and lists real runs only.
 | kqueue, FreeBSD 15 (CI FreeBSD runner) | signals (EVFILT_SIGNAL) | [run 275, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/275/jobs/1): Debug and ReleaseSafe, 151 passed, 18 skipped, 0 failed | 2026-11-15 | [2605345](https://pacyworld.dev/pacyworld/born/commit/26053451f8fa4d1fd70973618db28ca69c7ca16e) |
 | kqueue, FreeBSD 15 (CI FreeBSD runner) | TCP listener (accept drain, SO_REUSEPORT_LB) | [run 275, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/275/jobs/1): Debug and ReleaseSafe, 151 passed, 18 skipped, 0 failed | 2026-11-15 | [2605345](https://pacyworld.dev/pacyworld/born/commit/26053451f8fa4d1fd70973618db28ca69c7ca16e) |
 | epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | TCP listener (accept drain, SO_REUSEPORT) | [run 275, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/275/jobs/7): ReleaseSafe, 149 passed, 12 skipped, 0 failed | 2026-11-15 | [2605345](https://pacyworld.dev/pacyworld/born/commit/26053451f8fa4d1fd70973618db28ca69c7ca16e) |
-| kqueue, FreeBSD 15 (CI FreeBSD runner) | born.io time route (sleep, now) | [run 664, FreeBSD job (zig 0.16.0)](https://pacyworld.dev/pacyworld/born/actions/runs/664/jobs/2) and [zig 0.17.1 job](https://pacyworld.dev/pacyworld/born/actions/runs/664/jobs/3): Debug and ReleaseSafe, 144 passed, 9 skipped, 0 failed each | 2026-11-24 | [73e23b1](https://pacyworld.dev/pacyworld/born/commit/73e23b1ea6adf4c5599ef467d21edec6f11b1928) |
-| epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | born.io time route (sleep, now) | [run 664, Linux job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/664/jobs/8) and [zig 0.17.1 job](https://pacyworld.dev/pacyworld/born/actions/runs/664/jobs/9): Debug and ReleaseSafe on 0.16.0 and 0.17.1, 141 passed, 12 skipped, 0 failed each | 2026-11-24 | [73e23b1](https://pacyworld.dev/pacyworld/born/commit/73e23b1ea6adf4c5599ef467d21edec6f11b1928) |
-| IOCP, Windows Server 2022 build 20348 (CI Windows runner) | born.io time route (sleep, now) | [run 664, Windows job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/664/jobs/14) and [zig 0.17.1 job](https://pacyworld.dev/pacyworld/born/actions/runs/664/jobs/15): Debug and ReleaseSafe, 88 passed, 65 skipped, 0 failed (0.16.0); 85 passed, 68 skipped, 0 failed (0.17.1) | 2026-11-24 | [73e23b1](https://pacyworld.dev/pacyworld/born/commit/73e23b1ea6adf4c5599ef467d21edec6f11b1928) |
-| kqueue, FreeBSD 15 (CI FreeBSD runner) | born.io time route, batched NWAKE completion wake (FreeBSD only) | [run 682, FreeBSD job (zig 0.16.0)](https://pacyworld.dev/pacyworld/born/actions/runs/682/jobs/2) and [zig 0.17.1 job](https://pacyworld.dev/pacyworld/born/actions/runs/682/jobs/3): Debug and ReleaseSafe, 149 passed, 9 skipped, 0 failed each; real-waiter NWAKE test passed (elapsed-time assertion, proven to fail with the wake withheld) | 2026-11-24 | [9c77377](https://pacyworld.dev/pacyworld/born/commit/9c773779f86119a928f5afad7c9f75544bf50984) |
-| kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io time route (sleep, now) | born-io-tests Debug and ReleaseSafe on Zig 0.16.0: 34 passed, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
-| kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io time route, default config (stats off) | born-io-tests-default Debug and ReleaseSafe on Zig 0.16.0: 34 passed, 0 failed each; the wake-count test asserts the zero contract | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
-| kqueue, macOS 26.1 arm64 (manual host) | born.io time route (sleep, now) | born-io-tests ReleaseSafe on Zig 0.16.0: 93 passed, 60 skipped, 0 failed; sub-millisecond sleep contract passed | 2026-11-23 | [07a09fb](https://pacyworld.dev/pacyworld/born/commit/07a09fbef1e6e05b89bfe5cbfbf4706c9e6b010c) |
-| kqueue, NetBSD 10.1 amd64 (manual host) | born.io time route (pipe wake) | born-io-tests ReleaseSafe on Zig 0.16.0: 93 passed, 60 skipped, 0 failed; sub-millisecond sleep contract passed | 2026-11-23 | [07a09fb](https://pacyworld.dev/pacyworld/born/commit/07a09fbef1e6e05b89bfe5cbfbf4706c9e6b010c) |
-| epoll, Linux 7.0 (Ubuntu 26.04 VM, manual host) | born.io time route (sleep, now) | born-io-tests Debug and ReleaseSafe on Zig 0.16.0: 33 passed, 1 skipped, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
-| epoll, Linux 7.0 (Ubuntu 26.04 VM, manual host) | born.io time route, default config (stats off) | born-io-tests-default ReleaseSafe on Zig 0.16.0: 33 passed, 1 skipped, 0 failed | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
-| IOCP, Windows 11 build 26100 (manual host) | born.io time route (sleep, now) | born-io-tests.exe Debug and ReleaseSafe on Zig 0.16.0 over OpenSSH: 33 passed, 1 skipped, 0 failed each | 2026-11-15 | [1a008de](https://pacyworld.dev/pacyworld/born/commit/1a008de3a3397e77e5dec2e91b18e7e5b2c3a6cf) |
 | kqueue, FreeBSD 15 (CI FreeBSD runner) | examples smoke suite (echo engine) | [run 297, FreeBSD job (zig 0.15.2)](https://pacyworld.dev/pacyworld/born/actions/runs/297/jobs/1): example-smoke Debug and ReleaseSafe, 7/7 tests passed each; green on all three toolchains | 2026-11-16 | [a474347](https://pacyworld.dev/pacyworld/born/commit/a4743479f711f418f59e9f17c5db9c12cc5af2c4) |
 | epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | examples smoke suite (echo engine) | [run 297, Linux job (zig 0.15.2, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/297/jobs/7): born-example-smoke All 7 tests passed; green on all six legs | 2026-11-16 | [a474347](https://pacyworld.dev/pacyworld/born/commit/a4743479f711f418f59e9f17c5db9c12cc5af2c4) |
 | IOCP, Windows Server 2022 build 20348 (CI Windows runner) | examples smoke suite (echo engine) | [run 297, Windows job (zig 0.15.2, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/297/jobs/13): born-example-smoke.exe 5 passed; 2 skipped; 0 failed (SIGTERM and balanced skip on Windows); green on all six legs | 2026-11-16 | [a474347](https://pacyworld.dev/pacyworld/born/commit/a4743479f711f418f59e9f17c5db9c12cc5af2c4) |
 | kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | examples live drive (echo servers, SIGTERM drain) | born-echo-server and born-echo-per-core ReleaseSafe on Zig 0.15.2: 8 and 24 connections echoed (203105 and 808280 bytes), clean SIGTERM drain exit 0 each | 2026-11-16 | [a474347](https://pacyworld.dev/pacyworld/born/commit/a4743479f711f418f59e9f17c5db9c12cc5af2c4) |
-| kqueue, FreeBSD 15 (CI FreeBSD runner) | born.io network client route (connect, stream I/O, shutdown) | [run 314, FreeBSD job (zig 0.16.0)](https://pacyworld.dev/pacyworld/born/actions/runs/314/jobs/2) and [zig 0.17.1 job](https://pacyworld.dev/pacyworld/born/actions/runs/314/jobs/3): Debug and ReleaseSafe, born-io-tests 77 passed, 5 skipped, 0 failed each | 2026-11-17 | [068212d](https://pacyworld.dev/pacyworld/born/commit/068212d7e73ee0bb4e8c02bdee15ac8c86f314eb) |
-| epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | born.io network client route (connect, stream I/O, shutdown) | [run 314, Linux job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/314/jobs/8): Debug and ReleaseSafe on 0.16.0 and 0.17.1, born-io-tests 76 passed, 6 skipped, 0 failed each | 2026-11-17 | [068212d](https://pacyworld.dev/pacyworld/born/commit/068212d7e73ee0bb4e8c02bdee15ac8c86f314eb) |
-| IOCP, Windows Server 2022 build 20348 (CI Windows runner) | born.io network client route (connect, stream I/O, shutdown) | [run 314, Windows job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/314/jobs/14): Debug and ReleaseSafe on 0.16.0 and 0.17.1, born-io-tests.exe 74 passed, 8 skipped, 0 failed each | 2026-11-17 | [068212d](https://pacyworld.dev/pacyworld/born/commit/068212d7e73ee0bb4e8c02bdee15ac8c86f314eb) |
+| kqueue, FreeBSD 15 (CI FreeBSD runner) | born.io network client route (connect, stream I/O, shutdown) | [run 695, FreeBSD job (zig 0.16.0)](https://pacyworld.dev/pacyworld/born/actions/runs/695/jobs/2) and [zig 0.17.1 job](https://pacyworld.dev/pacyworld/born/actions/runs/695/jobs/3): Debug and ReleaseSafe, born-io-tests 126 passed, 9 skipped, 0 failed each | 2026-11-24 | [1ef9bdb](https://pacyworld.dev/pacyworld/born/commit/1ef9bdb26a694d98944c7fa67f770f739df11c31) |
+| epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | born.io network client route (connect, stream I/O, shutdown) | [run 695, Linux job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/695/jobs/8): Debug and ReleaseSafe on 0.16.0 and 0.17.1, born-io-tests 124 passed, 11 skipped, 0 failed each | 2026-11-24 | [1ef9bdb](https://pacyworld.dev/pacyworld/born/commit/1ef9bdb26a694d98944c7fa67f770f739df11c31) |
+| IOCP, Windows Server 2022 build 20348 (CI Windows runner) | born.io network client route (connect, stream I/O, shutdown) | [run 695, Windows job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/695/jobs/14): Debug and ReleaseSafe on 0.16.0 and 0.17.1, born-io-tests.exe 70 passed, 65 skipped, 0 failed each | 2026-11-24 | [1ef9bdb](https://pacyworld.dev/pacyworld/born/commit/1ef9bdb26a694d98944c7fa67f770f739df11c31) |
 | kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io network client route (connect, stream I/O, shutdown) | born-io-tests Debug and ReleaseSafe on Zig 0.16.0 and 0.17.1: 77 passed, 5 skipped, 0 failed each | 2026-11-17 | [068212d](https://pacyworld.dev/pacyworld/born/commit/068212d7e73ee0bb4e8c02bdee15ac8c86f314eb) |
 | kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io network route, default config (stats off) | born-io-tests-default Debug and ReleaseSafe on Zig 0.16.0 and 0.17.1: 77 passed, 5 skipped, 0 failed each; the echo test asserts the documented zero counter snapshot | 2026-11-17 | [068212d](https://pacyworld.dev/pacyworld/born/commit/068212d7e73ee0bb4e8c02bdee15ac8c86f314eb) |
 | kqueue, macOS 26.1 arm64 (manual host) | born.io network client route (connect, stream I/O, shutdown) | born-io-tests Debug and ReleaseSafe on Zig 0.16.0 and 0.17.1: 77 passed, 5 skipped, 0 failed each | 2026-11-17 | [068212d](https://pacyworld.dev/pacyworld/born/commit/068212d7e73ee0bb4e8c02bdee15ac8c86f314eb) |
@@ -84,9 +73,9 @@ OS per primitive, and lists real runs only.
 | kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io network route, route_dead vs canceled retirement (mutation proof) | the retirement unit and loop-death integration test pass clean; forcing a failure exit to report canceled fails both (75 passed, 5 skipped, 2 failed); reverted, green again | 2026-11-17 | [068212d](https://pacyworld.dev/pacyworld/born/commit/068212d7e73ee0bb4e8c02bdee15ac8c86f314eb) |
 | IOCP, Windows 11 build 26100.6901 (manual host) | born.io network route, two-socket exit drain (mutation proof) | the two-socket drain unit passes clean; reverting registryCloseAll to the per-socket polled drain fails its prompt-drain bound (73 passed, 8 skipped, 1 failed); reverted, green again | 2026-11-17 | [068212d](https://pacyworld.dev/pacyworld/born/commit/068212d7e73ee0bb4e8c02bdee15ac8c86f314eb) |
 | IOCP, Windows 11 build 26100.6901 (manual host) | born.io network route, connect-deadline drain (mutation proof) | the Windows drain unit passes clean; the unconditional slot-free mutation in connectDeadlineFired fails exactly that unit (67 passed, 6 skipped, 1 failed); reverted, green again | 2026-11-17 | [cfe247d](https://pacyworld.dev/pacyworld/born/commit/cfe247d2d92b3442e1262ba2235d458fcdc718bc) |
-| kqueue, FreeBSD 15 (CI FreeBSD runner) | born.io process route (spawn, wait, kill, PATH, stdio pipes) | [run 322, FreeBSD job (zig 0.16.0)](https://pacyworld.dev/pacyworld/born/actions/runs/322/jobs/2) and [zig 0.17.1 job](https://pacyworld.dev/pacyworld/born/actions/runs/322/jobs/3): Debug and ReleaseSafe, born-io-tests 125 passed, 6 skipped, 0 failed each | 2026-11-18 | [0c036c8](https://pacyworld.dev/pacyworld/born/commit/0c036c890752924c9c3e1c259d79a0a7d07d6312) |
-| epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | born.io process route (spawn, wait, kill, PATH, stdio pipes) | [run 322, Linux job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/322/jobs/8): Debug and ReleaseSafe on 0.16.0 and 0.17.1, born-io-tests 122 passed, 9 skipped, 0 failed each; the caller-closed-end fd-reuse regression tests run here | 2026-11-18 | [0c036c8](https://pacyworld.dev/pacyworld/born/commit/0c036c890752924c9c3e1c259d79a0a7d07d6312) |
-| IOCP, Windows Server 2022 build 20348 (CI Windows runner) | born.io process route construction rejection, all-Threaded baseline | [run 322, Windows job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/322/jobs/14): Debug and ReleaseSafe on 0.16.0 and 0.17.1, born-io-tests.exe 74 passed, 57 skipped, 0 failed each; the 49 process tests skip | 2026-11-18 | [0c036c8](https://pacyworld.dev/pacyworld/born/commit/0c036c890752924c9c3e1c259d79a0a7d07d6312) |
+| kqueue, FreeBSD 15 (CI FreeBSD runner) | born.io process route (spawn, wait, kill, PATH, stdio pipes) | [run 695, FreeBSD job (zig 0.16.0)](https://pacyworld.dev/pacyworld/born/actions/runs/695/jobs/2) and [zig 0.17.1 job](https://pacyworld.dev/pacyworld/born/actions/runs/695/jobs/3): Debug and ReleaseSafe, born-io-tests 126 passed, 9 skipped, 0 failed each | 2026-11-24 | [1ef9bdb](https://pacyworld.dev/pacyworld/born/commit/1ef9bdb26a694d98944c7fa67f770f739df11c31) |
+| epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | born.io process route (spawn, wait, kill, PATH, stdio pipes) | [run 695, Linux job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/695/jobs/8): Debug and ReleaseSafe on 0.16.0 and 0.17.1, born-io-tests 124 passed, 11 skipped, 0 failed each; the caller-closed-end fd-reuse regression tests run here | 2026-11-24 | [1ef9bdb](https://pacyworld.dev/pacyworld/born/commit/1ef9bdb26a694d98944c7fa67f770f739df11c31) |
+| IOCP, Windows Server 2022 build 20348 (CI Windows runner) | born.io process route construction rejection, all-Threaded baseline | [run 695, Windows job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/695/jobs/14): Debug and ReleaseSafe on 0.16.0 and 0.17.1, born-io-tests.exe 70 passed, 65 skipped, 0 failed each; the 49 process tests skip | 2026-11-24 | [1ef9bdb](https://pacyworld.dev/pacyworld/born/commit/1ef9bdb26a694d98944c7fa67f770f739df11c31) |
 | kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io process route (spawn, wait, kill, PATH, stdio pipes) | born-io-tests Debug and ReleaseSafe on Zig 0.16.0 and 0.17.1: 125 passed, 6 skipped, 0 failed each; includes the late-arm NOTE_EXIT flush delivery, dead-loop wait6 reap, arm-flush failure and synthetic EV_ERROR units, and the caller-closed-end fd-reuse regression tests | 2026-11-18 | [8f57189](https://pacyworld.dev/pacyworld/born/commit/8f5718976e1f9034f1a7d8a5d13b03caeea2e899) |
 | kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io process route, default config (stats off) | born-io-tests-default Debug and ReleaseSafe on Zig 0.16.0: 125 passed, 6 skipped, 0 failed each; the counters test skips and the zero-contract test passes | 2026-11-18 | [8f57189](https://pacyworld.dev/pacyworld/born/commit/8f5718976e1f9034f1a7d8a5d13b03caeea2e899) |
 | epoll, Linux 7.0.0-34-generic x86_64 (manual host) | born.io process route (spawn, wait, kill, PATH, stdio pipes) | born-io-tests Debug and ReleaseSafe on Zig 0.16.0 and 0.17.1: 122 passed, 9 skipped, 0 failed each; the half-duplex pipe orientation and caller-closed-end fd-reuse regression tests run here, the FreeBSD-only arm-flush units skip | 2026-11-18 | [8f57189](https://pacyworld.dev/pacyworld/born/commit/8f5718976e1f9034f1a7d8a5d13b03caeea2e899) |
@@ -96,9 +85,9 @@ OS per primitive, and lists real runs only.
 | kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io process route, process tag attribution (mutation proof) | the tag-attribution units pass clean; stripping proc_udata_bit from procUdata fails the udata round-trip unit (null udata crash), cross-route attribution, arm-refusal, synthetic EV_ERROR and stolen-reap units (120 passed, 6 skipped, 4 failed, 1 crashed); reverted, green again | 2026-11-18 | [8f57189](https://pacyworld.dev/pacyworld/born/commit/8f5718976e1f9034f1a7d8a5d13b03caeea2e899) |
 | kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io process route, abandon-on-cancel (mutation proof) | the abandon unit and contract tests pass clean; kill-on-cancel (SIGKILL plus blocking reap in abandonWait) fails the abandon unit and both abandon contract tests (122 passed, 6 skipped, 3 failed); reverted, green again | 2026-11-18 | [8f57189](https://pacyworld.dev/pacyworld/born/commit/8f5718976e1f9034f1a7d8a5d13b03caeea2e899) |
 | kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io process route, synchronous arm confirmation (mutation proof) | the arm-confirmation units pass clean; retiring arms before the flush confirmation fails the arm-refusal and arm-flush failure units and crashes the synthetic EV_ERROR unit (122 passed, 6 skipped, 2 failed, 1 crashed); reverted, green again | 2026-11-18 | [8f57189](https://pacyworld.dev/pacyworld/born/commit/8f5718976e1f9034f1a7d8a5d13b03caeea2e899) |
-| kqueue, FreeBSD 15 (CI FreeBSD runner) | born.io network route, close is route death (#106) | [run 330, FreeBSD job (zig 0.16.0)](https://pacyworld.dev/pacyworld/born/actions/runs/330/jobs/2) and [zig 0.17.1 job](https://pacyworld.dev/pacyworld/born/actions/runs/330/jobs/3): Debug and ReleaseSafe, born-io-tests 128 passed, 6 skipped, 0 failed each; the close-retirement unit and the Unexpected close contract run here | 2026-11-19 | [cdc2b58](https://pacyworld.dev/pacyworld/born/commit/cdc2b58b383eb4d697b18ea0a349c3aa0f1eea04) |
-| epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | born.io network route, close is route death (#106) | [run 330, Linux job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/330/jobs/8): Debug and ReleaseSafe on 0.16.0 and 0.17.1, born-io-tests 125 passed, 9 skipped, 0 failed each; the close-retirement unit and the Unexpected close contract run here | 2026-11-19 | [cdc2b58](https://pacyworld.dev/pacyworld/born/commit/cdc2b58b383eb4d697b18ea0a349c3aa0f1eea04) |
-| IOCP, Windows Server 2022 build 20348 (CI Windows runner) | born.io network route, close retirement and failed exit drain leak guard (#106) | [run 330, Windows job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/330/jobs/14): Debug and ReleaseSafe on 0.16.0 and 0.17.1, born-io-tests.exe 76 passed, 58 skipped, 0 failed each; the leak path is tested at the deinit-decision level only (a synthetic drain failure), not by a real GetQueuedCompletionStatusEx failure | 2026-11-19 | [cdc2b58](https://pacyworld.dev/pacyworld/born/commit/cdc2b58b383eb4d697b18ea0a349c3aa0f1eea04) |
+| kqueue, FreeBSD 15 (CI FreeBSD runner) | born.io network route, close is route death (#106) | [run 695, FreeBSD job (zig 0.16.0)](https://pacyworld.dev/pacyworld/born/actions/runs/695/jobs/2) and [zig 0.17.1 job](https://pacyworld.dev/pacyworld/born/actions/runs/695/jobs/3): Debug and ReleaseSafe, born-io-tests 126 passed, 9 skipped, 0 failed each; the close-retirement unit and the Unexpected close contract run here | 2026-11-24 | [1ef9bdb](https://pacyworld.dev/pacyworld/born/commit/1ef9bdb26a694d98944c7fa67f770f739df11c31) |
+| epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | born.io network route, close is route death (#106) | [run 695, Linux job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/695/jobs/8): Debug and ReleaseSafe on 0.16.0 and 0.17.1, born-io-tests 124 passed, 11 skipped, 0 failed each; the close-retirement unit and the Unexpected close contract run here | 2026-11-24 | [1ef9bdb](https://pacyworld.dev/pacyworld/born/commit/1ef9bdb26a694d98944c7fa67f770f739df11c31) |
+| IOCP, Windows Server 2022 build 20348 (CI Windows runner) | born.io network route, close retirement and failed exit drain leak guard (#106) | [run 695, Windows job (zig 0.16.0, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/695/jobs/14): Debug and ReleaseSafe on 0.16.0 and 0.17.1, born-io-tests.exe 70 passed, 65 skipped, 0 failed each; the leak path is tested at the deinit-decision level only (a synthetic drain failure), not by a real GetQueuedCompletionStatusEx failure | 2026-11-24 | [1ef9bdb](https://pacyworld.dev/pacyworld/born/commit/1ef9bdb26a694d98944c7fa67f770f739df11c31) |
 | kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io network route, nats.zig consumer unit suite | nats-unit Debug and ReleaseSafe on Zig 0.16.0, born and all-Threaded baseline, re-run at the W1 facade fix with NATS_SERVER unset (unit provisions no server): 119 passed, 2 skipped, 0 failed each; born connect=2 with threaded connect=0, baseline counters zero, route proof PASS x4 | 2026-11-19 | [7c1f229](https://pacyworld.dev/pacyworld/born/commit/7c1f2298635785766f5522321cd9b0dff11e1347) |
 | kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io network route, nats.zig consumer e2e suite (native nats-server v2.15.0) | nats-e2e Debug and ReleaseSafe on Zig 0.16.0, born and all-Threaded baseline, against the pinned v2.15.0 binary (sha256 d3496cfe2199ef65489d63f2f26e946fc3a77c4a1d9baf424ebe761d7d84d48f) spawned by absolute NATS_SERVER path from a directory outside default_PATH (W1 facade fix): 177 passed, 0 skipped, 0 failed each; born legs connect=192 with threaded connect=0 (fixture-side threaded r=5 w=4 only in the two fake-server tests, per-test gate), baseline legs all counters zero with identical results, route proof PASS x4 | 2026-11-19 | [7c1f229](https://pacyworld.dev/pacyworld/born/commit/7c1f2298635785766f5522321cd9b0dff11e1347) |
 | kqueue, FreeBSD 15.1-RELEASE-p2 amd64 (manual host) | born.io network route, std.http.Client contract suite | http-contract Debug and ReleaseSafe on Zig 0.16.0 and 0.17.1, born and all-Threaded control, re-run at the W1 facade fix with NATS_SERVER unset (http provisions no server): 8 passed, 0 skipped, 0 failed each; born legs connect=8 with all threaded counters zero, control legs identical results, route proof PASS x8 | 2026-11-19 | [7c1f229](https://pacyworld.dev/pacyworld/born/commit/7c1f2298635785766f5522321cd9b0dff11e1347) |
@@ -113,12 +102,9 @@ OS per primitive, and lists real runs only.
 
 Commit 3ed3785 changes only the CI workflow; its library and tests are
 those of master d1017b8. Skips identify platform exclusions or primitives
-not implemented at the recorded commit. The born.io manual runs were built
-from the shim sources of 1a008de; the Linux and Windows runs skip the
-kqueue-only loop-death test. The default-config (stats off) runs use
-born-io-tests-default, the exported module built without -Dtime-stats. The
-commit adding these rows changes only this README; its library, tests and
-CI are those of 1a008de.
+not implemented at the recorded commit. The default-config (stats off) runs
+use born-io-tests-default, the exported module built with the per-route
+counters off (the default; -Dnetwork-stats / -Dprocess-stats enable them).
 
 The consumer rows at 7c1f229 re-run the suites after the W1 facade fix: the
 e2e fixture now spawns the pinned nats-server v2.15.0 by the absolute
@@ -169,16 +155,16 @@ coarse error map, try-before-park, the stale-handle generation guard,
 the provenance gate, the per-route counters, unregister-before-close,
 the two-phase Windows exit drain, route_dead versus canceled retirement
 and persistent read interest. The kqueue POSIX runs skip the four
-Windows-only tests and the Unix-on-Windows test; Linux also skips the
-kqueue-only time loop-death test; Windows skips the POSIX deadline unit,
-both loop-death tests, the four Unix tests and the POSIX handle-reuse
-test. The NetBSD born.io suite is separate from born-tests, whose four
-pre-existing failures are tracked in #76. The mutation rows record three
+Windows-only tests and the Unix-on-Windows test; Windows skips the POSIX
+deadline unit, the loop-death test, the four Unix tests and the POSIX
+handle-reuse test. The NetBSD born.io suite is separate from born-tests,
+whose four pre-existing failures are tracked in #76. The mutation rows record three
 revert experiments: route_dead retirement (FreeBSD) and the two-socket
 exit drain (Windows) at 068212d, and the connect-deadline drain at
 cfe247d; each mutant fails only its targeted tests and the reverted tree
-is green again. The CI rows record run 314 at 068212d; the commit adding
-these rows changes only this README.
+is green again. The CI rows record run 695 at 1ef9bdb; the commit
+updating them changes only this README and docs/RELEASE-0.3.0.md, so its
+library and tests are those of 1ef9bdb.
 
 The born.io process rows record the P5.4 process route: spawn, wait and
 kill through born.process process descriptors (FreeBSD) and pidfds (Linux)
@@ -196,14 +182,15 @@ mechanism units, 27 contract tests) skip there, leaving the P5.3 pass
 counts (77 on macOS and NetBSD, 74 on Windows). FreeBSD and Linux skip the
 zero-contract test when stats are on; the default-config run skips the
 counters test and passes the zero-contract test instead. Linux also skips
-the kqueue-only time loop-death test and the two FreeBSD-only arm-flush
-units. Child piped stdio is an explicit Threaded hybrid: the parent pipe
+the two FreeBSD-only arm-flush units. Child piped stdio is an explicit
+Threaded hybrid: the parent pipe
 ends are Threaded-serviced file I/O and are not claimed by the per-route
 counters. The mutation rows record three revert experiments at 8f57189:
 the process tag strip, kill-on-cancel and the arm retire-before-flush-confirm;
 each mutant fails only its targeted tests and the reverted tree is green
-again. The CI rows record run 322 at
-0c036c8; the commit adding these rows changes only this README.
+again. The CI rows record run 695 at 1ef9bdb; the commit updating them
+changes only this README and docs/RELEASE-0.3.0.md, so its library and
+tests are those of 1ef9bdb.
 
 The born.io hygiene rows record the #106 fixes: a close of the op's socket
 kills the route, so closeDrive retires parked read/write/connect as
@@ -217,8 +204,8 @@ registry deinit-decision units. The leak guard is tested at the
 deinit-decision level only: the unit drives registryDrainFailed with a
 synthetic wait failure and checks the latch and the kept table; no test
 injects a real GetQueuedCompletionStatusEx failure. The CI rows record run
-330 at cdc2b58; the commit adding these rows changes only this README, and
-its library, tests and CI are those of cdc2b58.
+695 at 1ef9bdb; the commit updating them changes only this README and
+docs/RELEASE-0.3.0.md, so its library and tests are those of 1ef9bdb.
 
 ## Programming model
 
@@ -658,36 +645,41 @@ Threaded, and a Born route that is not implemented is rejected at
 construction (`CapabilityUnsupported`), never silently delegated.
 
 **Status in v0.3.0: opt-in and experimental.** `born.io` requires Zig >= 0.16
-and is not exported on 0.15.2. The Born time route
-(`capabilities.time = .born_evented`) is experimental: it currently misses its
-written benchmark target, and the remaining work is tracked in #101. It is not
-recommended for production until #101 meets that target. The Born network
-client route (`capabilities.network = .born_evented`) is likewise opt-in and
+and is not exported on 0.15.2. The Born network client route
+(`capabilities.network = .born_evented`) and, on FreeBSD and Linux, the Born
+process route (`capabilities.process = .born_evented`) are opt-in and
 experimental. The default remains the all-Threaded baseline, which is the
 supported configuration in 0.3.0.
 
-The time family is the first enabled Born route
-(`capabilities.time = .born_evented`): `sleep` runs on Born's timers and
-monotonic `now` on Born's timer clock; every other slot delegates to
-Threaded. One loop thread per instance drives the port. A blocking sleep
-submits a caller-owned operation node through an intrusive queue into a
-loop-owned slot table; the timer identity is the slot index plus a
-generation, so a stale timer fire is dropped without touching caller
-storage. The queue wakes the loop only on empty-to-non-empty transitions,
-and cancellation rides a dedicated cancel list, so neither path scans the
-armed population. Completion returns through a Threaded futex so
-cancellation composes with Threaded's cancel machinery. The queue is
-bounded by caller storage (one node per blocking call), so queue-full
-cannot occur: `sleep`'s only error is `Canceled`, meaning the sleep was
-interrupted (task cancellation, shim stop, or kernel timer exhaustion),
-never overload. Route-level refusals (port wait failures, timer-arm
-refusals, slot-table growth failures) are latched and readable via
-`born_io.loopError(io)`. Born timers are millisecond-granular: a sleep
-shorter than 1 ms costs at least 1 ms. `clockResolution(.awake)` stays on
-Threaded, so on macOS and Windows it reports the resolution of Threaded's
-awake clock, not of the Born timer clock that `now(.awake)` reads. The
-per-slot failure mapping and the Scale model machinery are documented in
-`src/io/shim.zig`.
+The time family (`sleep`, `now`, `clockResolution`) always delegates to
+Threaded. A Born time route was implemented and measured (#101), then
+retired: a blocking sleep routed through the loop costs two cross-thread
+hops (submitter to loop, loop back to submitter) and buys nothing over
+Threaded's in-thread sleep, which is the best case for that workload. The
+written benchmark target was withdrawn; the measured findings are recorded
+in `bench/README.md`, and performance work moves to the native API
+(`bench/suite.sh`, `bench/regress.sh`).
+
+The network and process routes share one loop thread per instance and the
+same machinery: a caller-owned operation node submitted through an intrusive
+queue into a loop-owned slot table, a generation-tagged identity so a stale
+event is dropped without touching caller storage, a dedicated cancel list,
+and completion through a Threaded futex so cancellation composes with
+Threaded's cancel machinery. The queue wakes the loop only on
+empty-to-non-empty transitions. Route-level refusals (port wait failures,
+connect-deadline timer-arm refusals, slot-table growth failures, process
+arm/flush refusals) are latched and readable via `born_io.loopError(io)`.
+The machinery is documented in `src/io/shim.zig`.
+
+Per-family routing:
+
+| family | slots | serviced by |
+|---|---|---|
+| time | the `sleep`, `now`, `clockResolution` slots | Threaded (always; Born time route retired, #101) |
+| network client | connect (IP and pathname Unix, with deadlines), stream read/write, close, shutdown, socket pairs, `netWriteFile`, batch await | Born with `capabilities.network = .born_evented`; otherwise Threaded |
+| network server | listen, accept, DNS resolution | Threaded (hybrid or declared exclusion) |
+| process | the `processSpawn`, `childWait`, `childKill` slots | Born with `capabilities.process = .born_evented` on FreeBSD/Linux; rejected elsewhere; otherwise Threaded |
+| async/await, concurrent, cancel, futex, queue, random, file | the remaining slots | Threaded |
 
 The network client route (`capabilities.network = .born_evented`) services the
 stream client path on Born's reactor: IP and pathname Unix connect (with
@@ -745,20 +737,6 @@ per-slot contracts and the coarse error map are documented in
 const born = b.dependency("born", .{ .target = target, .optimize = optimize });
 exe.root_module.addImport("born", born.module("born"));
 exe.root_module.addImport("born.io", born.module("born.io"));
-```
-
-```zig
-const born = @import("born");
-const born_io = @import("born.io");
-
-var port = try born.EvPort.init(allocator);
-defer port.deinit();
-const io = try born_io.io(&port, .{
-    .allocator = allocator,
-    .capabilities = .{ .time = .born_evented },
-});
-defer born_io.deinit(io);
-try std.Io.sleep(io, .fromMilliseconds(10), .awake);
 ```
 
 ```zig

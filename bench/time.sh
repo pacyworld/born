@@ -1,10 +1,11 @@
 #!/bin/sh
-# Time-route benchmark driver (P5.2): the routed Born time family vs the
-# all-Threaded baseline, under the #31 quiet-host guard. See bench/README.md.
+# Threaded sleep baseline benchmark driver: the all-Threaded sleep family
+# under the #31 quiet-host guard. The Born time route was retired (#101);
+# this records the baseline it was compared against. See bench/README.md.
 #
 #   bench/time.sh BIN [REPS] [extra born-time-bench args...]
 #
-# Each repetition runs both routes in one process. Results are acceptable
+# Each repetition runs the baseline in one process. Results are acceptable
 # only when the quiet guard passes; a busy host fails the guard instead of
 # yielding an accepted measurement.
 set -eu
@@ -37,6 +38,6 @@ esac
 rep=1
 while [ "$rep" -le "$reps" ]; do
     echo "== rep $rep"
-    "$bin" --route both "$@"
+    "$bin" "$@"
     rep=$((rep + 1))
 done

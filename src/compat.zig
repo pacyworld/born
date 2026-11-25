@@ -16,6 +16,11 @@ const is_linux = native_os == .linux;
 const is_freebsd = native_os == .freebsd;
 const has_new_signal_type = builtin.zig_version.minor >= 16;
 
+/// Whether the build is Debug. Zig 0.17 renamed `builtin.mode`'s type to
+/// `std.lang.Optimize` with lowercase fields; the bare `.Debug` literal and the
+/// deprecated `std.builtin.OptimizeMode.Debug` alias both fail there.
+pub const is_debug: bool = if (builtin.zig_version.minor >= 17) builtin.mode == .debug else builtin.mode == .Debug;
+
 /// Returns an empty `std.EnumSet(E)` on every supported toolchain.
 pub fn emptyEnumSet(comptime Enum: type) std.EnumSet(Enum) {
     if (@hasDecl(std.EnumSet(Enum), "empty")) return .empty;
@@ -1322,38 +1327,6 @@ pub fn connectUnixAt(dirfd: fd_t, sock: socket_t, addr: *const sockaddr, len: so
         if (dirfd != AT.FDCWD) return freebsd_at.connectat(dirfd, sock, addr, len);
     }
     return std.c.connect(sock, addr, len);
-}
-
-// FreeBSD _umtx_op ABI for the multi-address private wake. The opcode is 21
-// per the kernel's sys/umtx.h (UMTX_OP_NWAKE_PRIVATE) and the kern_umtx.c
-// dispatch table. std.c.freebsd's UMTX_OP enum misnumbers NWAKE_PRIVATE as 31
-// (an upstream Zig bug; filing it is the maintainer's call), so compat owns the
-// constant and the declaration, the freebsd_at precedent. The kernel copies the
-// address array in 128-entry chunks and wakes every waiter on each word; Born's
-// time route has one waiter per word, so the effect matches per-address single
-// wakes. A stale address wakes at most an unrelated waiter spuriously, which
-// re-checks its word (the same hazard as the immediate wake after the terminal
-// store).
-const freebsd_umtx = if (is_freebsd) struct {
-    extern "c" fn _umtx_op(obj: usize, op: c_int, val: c_ulong, uaddr: usize, uaddr2: usize) c_int;
-    const UMTX_OP_NWAKE_PRIVATE: c_int = 21;
-} else struct {};
-
-/// Wakes an array of private-umtx words in one FreeBSD UMTX_OP_NWAKE_PRIVATE
-/// call. Returns false on kernel refusal so the caller falls back to
-/// per-address wakes; no wake is lost. The array is borrowed for the call only.
-/// FreeBSD-only; other OSes keep per-address wakes in the caller.
-pub fn nwakePrivate(addrs: []const *const u32) bool {
-    if (comptime !is_freebsd) @compileError("nwakePrivate is FreeBSD-only");
-    if (addrs.len == 0) return true;
-    const rc = freebsd_umtx._umtx_op(
-        @intFromPtr(addrs.ptr),
-        freebsd_umtx.UMTX_OP_NWAKE_PRIVATE,
-        @intCast(addrs.len),
-        0,
-        0,
-    );
-    return rc == 0;
 }
 
 /// Reads a socket option into `opt`.

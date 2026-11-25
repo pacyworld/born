@@ -35,8 +35,7 @@ pub fn build(b: *std.Build) void {
     linkPlatform(core_mod, target);
     const io_options = b.addOptions();
     // Route proof needs the network counters (review 192 carry-in 1); the
-    // three flags mirror born's own shim test wiring.
-    io_options.addOption(bool, "time_stats", true);
+    // two flags mirror born's own shim test wiring.
     io_options.addOption(bool, "network_stats", true);
     io_options.addOption(bool, "process_stats", true);
     const io_mod = b.createModule(.{

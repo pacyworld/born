@@ -216,9 +216,9 @@ metadata, locking, terminal handling, or mapping operations.
 | 86 | `progressParentFile(U) std.Progress.ParentFileError!File` (`I:220`): obtain progress-reporting parent file. | missing (`K:613-660`) | hybrid with Io.Threaded | N/A. |
 | 87 | `inheritParentDir(U, handle: Dir.Handle) InheritParentHandleError!Dir` (`I:221`): inherit a parent directory handle. | missing (`K:613-660`) | hybrid with Io.Threaded | N/A; new in 0.17, Threaded body `T:17961-17966`. |
 | 88 | `inheritParentFile(U, handle: File.Handle, flags: File.Flags) InheritParentHandleError!File` (`I:222`): inherit a parent file handle. | missing (`K:613-660`) | hybrid with Io.Threaded | N/A; new in 0.17, Threaded body `T:17968-17977`. |
-| 89 | `now(U, clock: Clock) Timestamp` (`I:224`): read any supported clock. | TODO and stale signature (`K:987-992`) | direct for monotonic only + hybrid with Io.Threaded for full `Clock` | `timer_heap.nowNs` reads only monotonic/QPC (`src/timer_heap.zig:250-255`); Threaded supports all clock tags (`T:11865-11932`). |
+| 89 | `now(U, clock: Clock) Timestamp` (`I:224`): read any supported clock. | TODO and stale signature (`K:987-992`) | hybrid with Io.Threaded (time family delegated, #101) | Threaded supports all clock tags (`T:11865-11932`). Born's monotonic read (`timer_heap.nowNs`, `src/timer_heap.zig:250-255`) exists but is not used for this slot: the time family stays Threaded (#101). |
 | 90 | `clockResolution(U, clock: Clock) Clock.ResolutionError!Duration` (`I:225`): query clock resolution. | missing (`K:613-660`) | hybrid with Io.Threaded | N/A; Threaded body `T:11884-11932`. |
-| 91 | `sleep(U, timeout: Timeout) Cancelable!void` (`I:226`): sleep to duration/deadline with cancellation. | TODO and stale signature (`K:993-998`) | direct | `EvPort.addTimer`/`cancelTimer`/`wait` (`src/evport_kqueue.zig:282-291`, `src/evport_kqueue.zig:332-397`); deadline/cancel adapter required. |
+| 91 | `sleep(U, timeout: Timeout) Cancelable!void` (`I:226`): sleep to duration/deadline with cancellation. | TODO and stale signature (`K:993-998`) | hybrid with Io.Threaded (time family delegated, #101) | Born timers (`EvPort.addTimer`/`cancelTimer`/`wait`, `src/evport_kqueue.zig:282-291`, `src/evport_kqueue.zig:332-397`) support it, but a blocking sleep through the loop costs two cross-thread hops and buys nothing over Threaded's in-thread sleep, so the shim delegates (#101). |
 | 92 | `random(U, buffer: []u8) void` (`I:228`): fill with non-secure random bytes. | missing (`K:613-660`) | hybrid with Io.Threaded | N/A; no Born RNG. Threaded CSPRNG `T:17984-18019`. |
 | 93 | `randomSecure(U, buffer: []u8) RandomSecureError!void` (`I:229`): fill with secure random bytes. | missing (`K:613-660`) | hybrid with Io.Threaded | N/A; no Born OS entropy wrapper. Threaded body `T:18062-18099`. |
 
@@ -508,8 +508,10 @@ names, and function signatures. A count-only assertion would miss the
    must wake blocked loops, remove registrations/timers, await hybrid work, and
    leave no stale userdata. On Windows, `cancelAndClose` cancels and closes the
    socket, but the stream storage must remain stable while every completion is
-   absorbed (`src/socket_windows.zig:347-370`, `README.md:123-130`). Sleep must
-   tie a Born timer to the calling operation's cancellation state.
+   absorbed (`src/socket_windows.zig:347-370`, `README.md:123-130`). A Born
+   timer tied to an operation (the network route's connect deadline) must honor
+   that operation's cancellation state; the time family itself is delegated to
+   Threaded (#101).
 8. **Preserve readiness semantics.** POSIX reads are edge-triggered and must be
    drained; kqueue writes are one-shot and re-armed on demand
    (`src/evport_kqueue.zig:202-230`). Purge staged changes before close
