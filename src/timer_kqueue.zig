@@ -451,15 +451,27 @@ test "timer_kqueue: a deadline beyond the cap re-arms internally and fires once,
     const armed = try compat.monotonicNs();
     try add(&port, 12, &tag, delay, .once);
     const before = port.timers.early_rearms;
-    try testing.expectEqual(@as(usize, 1), try waitOne(&port, &events, 5000));
+    // --- #144 diagnostics: name the failing assertion under load ---------
+    std.debug.print("#144 setup armed={d} delay={d} cap={d} chunk={d} before={d} early_rearms={d}\n", .{ armed, delay, cap, testChunkNs(cap), before, port.timers.early_rearms });
+    const n0 = try waitOne(&port, &events, 5000);
+    std.debug.print("#144 waitOne n={d}\n", .{n0});
+    std.debug.print("#144 CHECK n==1 (line 454): n={d}\n", .{n0});
+    try testing.expectEqual(@as(usize, 1), n0);
+    std.debug.print("#144 CHECK ev.timer (line 455): timer={any} udata_ok={any} fired={d}\n", .{ events[0].timer, events[0].udata == @as(?*anyopaque, &tag), events[0].fired });
     try testing.expect(events[0].timer);
     try testing.expect(events[0].udata == @as(?*anyopaque, &tag));
     try testing.expectEqual(@as(u32, 1), events[0].fired);
     const elapsed = (try compat.monotonicNs()) - armed;
+    std.debug.print("#144 CHECK elapsed>=delay (line 459): elapsed={d} delay={d} pass={any}\n", .{ elapsed, delay, elapsed >= delay });
     try testing.expect(elapsed >= delay);
+    const delta = port.timers.early_rearms - before;
+    std.debug.print("#144 CHECK early_rearms-before>=3 (line 460): early_rearms={d} before={d} delta={d} pass={any}\n", .{ port.timers.early_rearms, before, delta, delta >= 3 });
     try testing.expect(port.timers.early_rearms - before >= 3);
+    std.debug.print("#144 CHECK !live.contains(12) (line 461): contains={any}\n", .{port.timers.live.contains(12)});
     try testing.expect(!port.timers.live.contains(12));
-    try testing.expectEqual(@as(usize, 0), try port.wait(&events, 50));
+    const n1 = try port.wait(&events, 50);
+    std.debug.print("#144 CHECK re-wait==0 (line 462): n={d}\n", .{n1});
+    try testing.expectEqual(@as(usize, 0), n1);
 }
 
 test "timer_kqueue: a repeat period beyond the cap keeps its phase across re-arms" {
