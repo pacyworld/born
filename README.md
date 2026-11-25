@@ -57,7 +57,6 @@ OS per primitive, and lists real runs only.
 | kqueue, FreeBSD 15 (CI FreeBSD runner) | signals (EVFILT_SIGNAL) | [run 275, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/275/jobs/1): Debug and ReleaseSafe, 151 passed, 18 skipped, 0 failed | 2026-11-15 | [2605345](https://pacyworld.dev/pacyworld/born/commit/26053451f8fa4d1fd70973618db28ca69c7ca16e) |
 | kqueue, FreeBSD 15 (CI FreeBSD runner) | TCP listener (accept drain, SO_REUSEPORT_LB) | [run 275, FreeBSD job](https://pacyworld.dev/pacyworld/born/actions/runs/275/jobs/1): Debug and ReleaseSafe, 151 passed, 18 skipped, 0 failed | 2026-11-15 | [2605345](https://pacyworld.dev/pacyworld/born/commit/26053451f8fa4d1fd70973618db28ca69c7ca16e) |
 | epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | TCP listener (accept drain, SO_REUSEPORT) | [run 275, Linux job](https://pacyworld.dev/pacyworld/born/actions/runs/275/jobs/7): ReleaseSafe, 149 passed, 12 skipped, 0 failed | 2026-11-15 | [2605345](https://pacyworld.dev/pacyworld/born/commit/26053451f8fa4d1fd70973618db28ca69c7ca16e) |
-| kqueue, FreeBSD 15 (CI FreeBSD runner) | born.io batched NWAKE completion wake (FreeBSD only; shared by the network and process routes) | [run 682, FreeBSD job (zig 0.16.0)](https://pacyworld.dev/pacyworld/born/actions/runs/682/jobs/2) and [zig 0.17.1 job](https://pacyworld.dev/pacyworld/born/actions/runs/682/jobs/3): Debug and ReleaseSafe, 149 passed, 9 skipped, 0 failed each; real-waiter NWAKE test passed (elapsed-time assertion, proven to fail with the wake withheld) | 2026-11-24 | [9c77377](https://pacyworld.dev/pacyworld/born/commit/9c773779f86119a928f5afad7c9f75544bf50984) |
 | kqueue, FreeBSD 15 (CI FreeBSD runner) | examples smoke suite (echo engine) | [run 297, FreeBSD job (zig 0.15.2)](https://pacyworld.dev/pacyworld/born/actions/runs/297/jobs/1): example-smoke Debug and ReleaseSafe, 7/7 tests passed each; green on all three toolchains | 2026-11-16 | [a474347](https://pacyworld.dev/pacyworld/born/commit/a4743479f711f418f59e9f17c5db9c12cc5af2c4) |
 | epoll, Linux 6.8 (CI Linux runner, Ubuntu 24.04) | examples smoke suite (echo engine) | [run 297, Linux job (zig 0.15.2, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/297/jobs/7): born-example-smoke All 7 tests passed; green on all six legs | 2026-11-16 | [a474347](https://pacyworld.dev/pacyworld/born/commit/a4743479f711f418f59e9f17c5db9c12cc5af2c4) |
 | IOCP, Windows Server 2022 build 20348 (CI Windows runner) | examples smoke suite (echo engine) | [run 297, Windows job (zig 0.15.2, ReleaseSafe)](https://pacyworld.dev/pacyworld/born/actions/runs/297/jobs/13): born-example-smoke.exe 5 passed; 2 skipped; 0 failed (SIGTERM and balanced skip on Windows); green on all six legs | 2026-11-16 | [a474347](https://pacyworld.dev/pacyworld/born/commit/a4743479f711f418f59e9f17c5db9c12cc5af2c4) |
@@ -672,13 +671,10 @@ queue into a loop-owned slot table, a generation-tagged identity so a stale
 event is dropped without touching caller storage, a dedicated cancel list,
 and completion through a Threaded futex so cancellation composes with
 Threaded's cancel machinery. The queue wakes the loop only on
-empty-to-non-empty transitions. On FreeBSD, completion wakes are batched
-into one `UMTX_OP_NWAKE_PRIVATE` call per dispatch batch (a kernel refusal
-falls back to per-address wakes and is counted by `born_io.nwakeRefusals`).
-Route-level refusals (port wait failures, connect-deadline timer-arm
-refusals, slot-table growth failures, process arm/flush refusals) are
-latched and readable via `born_io.loopError(io)`. The machinery is
-documented in `src/io/shim.zig`.
+empty-to-non-empty transitions. Route-level refusals (port wait failures,
+connect-deadline timer-arm refusals, slot-table growth failures, process
+arm/flush refusals) are latched and readable via `born_io.loopError(io)`.
+The machinery is documented in `src/io/shim.zig`.
 
 Per-family routing:
 

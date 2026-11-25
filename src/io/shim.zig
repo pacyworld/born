@@ -46,9 +46,9 @@
 //!   wait on the node's state word. The loop publishes the terminal state with
 //!   a release store and frees the slot under the queue mutex (atomic with the
 //!   cancel path's occupancy check), then signals the futex outside the mutex
-//!   through `wakeOp`. The wake is address-keyed and never reads the word, so
-//!   it is safe even if the submitter has already returned and reused the
-//!   frame; the store precedes the wake, so no wakeup is lost. Cancellation
+//!   with a plain `futexWake`. The wake is address-keyed and never reads the
+//!   word, so it is safe even if the submitter has already returned and reused
+//!   the frame; the store precedes the wake, so no wakeup is lost. Cancellation
 //!   composes: Threaded's cancel interrupts the submitter's futex wait; the
 //!   submitter sets `cancel_requested` and pushes the slot index on a
 //!   dedicated cancel list (links live in the slot table, never in caller
@@ -57,12 +57,6 @@
 //!   never scans the pending population. The submitter drains uncancelably
 //!   until retirement before returning, so the loop never touches stack
 //!   storage after the call unwinds.
-//! - Deferred completion wakes (FreeBSD): while the loop is mid-harvest,
-//!   `wakeOp` records completion words instead of waking immediately, then
-//!   drains them in one `UMTX_OP_NWAKE_PRIVATE` call after dispatch
-//!   (`defer_wake_enabled`), moving per-fire wake-path/IPI cost out of the
-//!   loop. A kernel refusal is counted (`nwakeRefusals`) and falls back to
-//!   per-address wakes so no completion is lost.
 //! - Failure visibility: route-level refusals (port wait failures,
 //!   connect-deadline timer-arm refusals, slot-table growth failures, process
 //!   arm/flush refusals) are latched in the composite and exposed by
@@ -112,25 +106,6 @@ pub const process_supported = born.process.supported;
 /// process path performs no shared counter writes and `processStats` reports
 /// zeros. Set by the `process_stats` build option.
 pub const process_stats_enabled: bool = io_options.process_stats;
-
-/// Whether the Born routes defer submitter completion wakes to the end of the
-/// dispatch batch and drains them in one FreeBSD UMTX_OP_NWAKE_PRIVATE call.
-/// OS-specific default, not a build flag: FreeBSD only. On FreeBSD the batched
-/// wake measurably cuts the per-fire wake-path/IPI cost (umtx chain lock +
-/// sched_add + IPI) without a p99 regression (#101 increment 3, measured on
-/// FreeBSD 15.1). Every other backend keeps immediate per-fire wakes: deferral
-/// relocates completion latency into the submitter's futex wait, and enabling
-/// it elsewhere requires an on-OS runtime measurement showing no p99 regression
-/// first. Compiling on a target is not evidence for it.
-///
-/// Correctness dependency: UMTX_OP_NWAKE_PRIVATE matches only PRIVATE umtx keys,
-/// so the batched drain releases a submitter only because std `Io.Threaded`'s
-/// futexWait parks with UMTX_OP_WAIT_UINT_PRIVATE (verified on Zig 0.16.0
-/// Threaded.zig:1032 and 0.17.1 :1036). If a future std switches that wait to a
-/// shared key, every deferred completion is lost and the affected route hangs;
-/// the real-waiter FreeBSD test below fails on that change instead of leaving
-/// it to surface as a suite timeout.
-const defer_wake_enabled = is_freebsd;
 
 /// Where a capability family is serviced.
 pub const Route = enum {
@@ -852,25 +827,6 @@ pub const Shim = struct {
     /// First route-level failure (wait refusal, timer-arm refusal, slot
     /// growth refusal), as `@intFromError`; 0 = none. First writer wins.
     loop_error: std.atomic.Value(u16) = .init(0),
-    /// FreeBSD NWAKE kernel refusals that fell back to per-address wakes
-    /// (loop-fed). Counted on every refusal: a rare correctness fallback, not
-    /// a hot-path accumulator. A non-zero value means the batched completion
-    /// wake is silently degrading. Read via `nwakeRefusals`.
-    nwake_refusals: std.atomic.Value(u64) = .init(0),
-
-    /// Deferred completion-wake batch (FreeBSD, `defer_wake_enabled`), shared
-    /// by the network and process routes.
-    /// While the loop dispatches a harvest batch, `wakeOp` records fired ops'
-    /// completion words here instead of waking each submitter mid-batch; the
-    /// batch-end drain wakes them all in one NWAKE call. Bounded to the harvest
-    /// buffer capacity (`events[64]`), allocated once at construction, never on
-    /// the hot path; overflow wakes immediately so no wake is dropped. The
-    /// pointer goes to the kernel without dereferencing op fields, so a recorded
-    /// address stays safe even after the submitter returns and reuses its frame.
-    /// Loop-owned; unused on backends that keep immediate wakes.
-    defer_wake_active: bool = false,
-    defer_wake_count: u32 = 0,
-    defer_wake_list: [64]*const u32 = undefined,
 
     // ------------------------------------------------ network route state ----
 
@@ -1117,31 +1073,8 @@ pub const Shim = struct {
                 continue;
             };
             fail_streak = 0;
-            // FreeBSD: record completion wakes during the harvest batch, then
-            // drain them in one NWAKE call after dispatch, moving per-fire
-            // wake-path/IPI cost out of the loop (defer_wake_enabled).
-            if (comptime defer_wake_enabled) {
-                self.defer_wake_active = true;
-                self.defer_wake_count = 0;
-            }
             for (events[0..n]) |ev| {
                 self.dispatchEvent(ev);
-            }
-            if (comptime defer_wake_enabled) {
-                self.defer_wake_active = false;
-                const count = self.defer_wake_count;
-                if (count > 0) {
-                    if (!compat.nwakePrivate(self.defer_wake_list[0..count])) {
-                        // Kernel refusal: count it and fall back to per-address
-                        // wakes so no completion wake is lost.
-                        _ = self.nwake_refusals.fetchAdd(1, .monotonic);
-                        var wi: u32 = 0;
-                        while (wi < count) : (wi += 1) {
-                            self.threaded_io.vtable.futexWake(self.threaded_io.userdata, self.defer_wake_list[wi], 1);
-                        }
-                    }
-                }
-                self.defer_wake_count = 0;
             }
             // Finalize any runtime close whose socket users drained (#115).
             if (self.has_deferred_close.load(.acquire)) self.netCloseDrain();
@@ -1171,31 +1104,6 @@ pub const Shim = struct {
         } else {
             self.socketEvent(ev);
         }
-    }
-
-    /// Wake a submitter's completion word, or record it for the batch-end NWAKE
-    /// drain while the FreeBSD deferred-wake batch is active. The pointer goes
-    /// to the kernel without dereferencing op fields, so recording it for a
-    /// later wake is safe even after the submitter returns and reuses its frame:
-    /// a stale address wakes at most an unrelated waiter spuriously, which
-    /// re-checks its word (the same hazard as the immediate wake after the
-    /// terminal store). On list overflow, wake immediately rather than drop.
-    /// Comptime-dead to a plain futexWake on backends without deferred wakes.
-    /// NWAKE wakes EVERY waiter on each word, where futexWake(.., 1) wakes one;
-    /// the two are equivalent here because each route has exactly one waiter
-    /// per completion word.
-    fn wakeOp(self: *Shim, ptr: *const u32) void {
-        if (comptime defer_wake_enabled) {
-            if (self.defer_wake_active) {
-                if (self.defer_wake_count < self.defer_wake_list.len) {
-                    self.defer_wake_list[self.defer_wake_count] = ptr;
-                    self.defer_wake_count += 1;
-                    return;
-                }
-                // List full: fall through to an immediate wake (no drop).
-            }
-        }
-        self.threaded_io.vtable.futexWake(self.threaded_io.userdata, ptr, 1);
     }
 
     // -------------------------------------------- network engine methods ----
@@ -1468,9 +1376,7 @@ pub const Shim = struct {
         self.net_queue.mutex.lockUncancelable(self.threaded_io);
         self.netRetireLocked(op, op.slot_index, canceled);
         self.net_queue.mutex.unlock(self.threaded_io);
-        // Completion wake rides the shared deferred-wake batch (FreeBSD NWAKE)
-        // when the loop is mid-harvest; immediate otherwise.
-        self.wakeOp(&op.state.raw);
+        self.threaded_io.vtable.futexWake(self.threaded_io.userdata, &op.state.raw, 1);
     }
 
     /// Net queue mutex held: terminal store plus slot release, no wake. A slot
@@ -2979,9 +2885,7 @@ pub const Shim = struct {
         slot.op = null;
         if (!slot.on_cancel_list) self.procFreeSlotLocked(index);
         self.proc_queue.mutex.unlock(self.threaded_io);
-        // Completion wake rides the shared deferred-wake batch (FreeBSD NWAKE)
-        // when the loop is mid-harvest; immediate otherwise.
-        self.wakeOp(&op.state.raw);
+        self.threaded_io.vtable.futexWake(self.threaded_io.userdata, &op.state.raw, 1);
     }
 
     fn procRetireOk(self: *Shim, op: *ProcOp) void {
@@ -3264,15 +3168,6 @@ pub fn testParkHook(interface: Io, hook: ?*std.atomic.Value(u32)) void {
 /// and always returns null.
 pub fn loopError(interface: Io) ?anyerror {
     return shimFrom(interface.userdata).latchedError();
-}
-
-/// Count of FreeBSD NWAKE kernel refusals that fell back to per-address
-/// completion wakes, accumulated since construction. A rare correctness
-/// fallback, not a hot-path accumulator: counted on every refusal regardless
-/// of build options, so a non-zero value means the batched completion wake
-/// (network and process routes) is silently degrading. Always reported.
-pub fn nwakeRefusals(interface: Io) u64 {
-    return shimFrom(interface.userdata).nwake_refusals.load(.monotonic);
 }
 
 /// Per-route network counters (should-fix 4, done-when evidence). `connect`,
@@ -6242,91 +6137,6 @@ test "idle gate: a proc submission racing the emptiness check drains on the next
     try std.testing.expectEqual(&a, state.procDrainLocked().?);
     try std.testing.expect(!state.proc_queue.pending.load(.monotonic));
     try std.testing.expectEqual(@as(?*ProcOp, null), state.procDrainLocked());
-}
-
-test "nwakePrivate accepts a private-umtx address array (FreeBSD ABI)" {
-    if (comptime !is_freebsd) return error.SkipZigTest;
-    // No waiters: the kernel must accept the opcode and array layout and return
-    // success. A misnumbered opcode (std.c.freebsd's UMTX_OP enum has
-    // NWAKE_PRIVATE=31; the kernel's sys/umtx.h defines 21) returns EINVAL and
-    // fails here. Delivery to a real parked waiter is proven by the next test.
-    var word: u32 = 0;
-    try std.testing.expect(compat.nwakePrivate(&.{}));
-    try std.testing.expect(compat.nwakePrivate(&.{&word}));
-}
-
-test "nwakePrivate wakes a real parked private-umtx waiter (FreeBSD)" {
-    if (comptime !is_freebsd) return error.SkipZigTest;
-    // NWAKE_PRIVATE matches only PRIVATE umtx keys, so the batched completion
-    // drain releases a submitter only because std Io.Threaded's futexWait parks
-    // with UMTX_OP_WAIT_UINT_PRIVATE (0.16.0 Threaded.zig:1032, 0.17.1 :1036).
-    // This parks a real thread on that vtable futexWait and proves nwakePrivate
-    // releases it. If a future std switches to a shared wait the wake is lost
-    // and the waiter returns via its own 3s timeout. futexWait reports a timeout
-    // as a NORMAL return (Threaded maps .TIMEDOUT => {} on 0.16.0 and 0.17.1),
-    // so an error/catch cannot detect the lost wake: decide by elapsed monotonic
-    // time instead. A NWAKE release returns well under 1s; a lost wake runs out
-    // the full 3s and fails the assertion, instead of surfacing as a suite hang.
-    var state: Shim = undefined;
-    testShim(&state);
-    defer state.threaded.deinit();
-    const tio = state.threaded_io;
-    var word: std.atomic.Value(u32) = .init(0);
-    var parked: std.atomic.Value(u32) = .init(0);
-    var done: std.atomic.Value(u32) = .init(0);
-    var elapsed_ns: std.atomic.Value(u64) = .init(0);
-
-    const Waiter = struct {
-        fn run(iface: Io, w: *std.atomic.Value(u32), p: *std.atomic.Value(u32), d: *std.atomic.Value(u32), el: *std.atomic.Value(u64)) void {
-            // Handshake: signal about-to-park, then park on the private word.
-            p.store(1, .release);
-            iface.vtable.futexWake(iface.userdata, &p.raw, 1);
-            // Park while word == 0, timing the wait on the monotonic clock. The
-            // elapsed time (not an error) distinguishes a prompt NWAKE release
-            // from a lost wake that runs out the 3s timeout.
-            const t0 = born.nowNs() catch 0;
-            const tmo = Io.Timeout{ .duration = .{ .raw = .fromNanoseconds(3 * std.time.ns_per_s), .clock = .awake } };
-            iface.vtable.futexWait(iface.userdata, &w.raw, 0, tmo) catch {};
-            const t1 = born.nowNs() catch t0;
-            el.store(t1 - t0, .release);
-            d.store(1, .release);
-            iface.vtable.futexWake(iface.userdata, &d.raw, 1);
-        }
-    };
-    const t = try std.Thread.spawn(.{}, Waiter.run, .{ tio, &word, &parked, &done, &elapsed_ns });
-    // On any failure path, release and join the waiter before threaded.deinit:
-    // a live thread outliving `state` would dereference freed Threaded memory.
-    var joined = false;
-    defer {
-        if (!joined) {
-            word.store(1, .release);
-            tio.vtable.futexWake(tio.userdata, &word.raw, 1);
-            t.join();
-        }
-    }
-    // Bounded handshake: wait until the waiter signals it is parking. Futex
-    // re-checks the value under the parking lock, so a wake landing before this
-    // wait is not lost (event-driven, no spin cap).
-    while (parked.load(.acquire) == 0) {
-        tio.vtable.futexWait(tio.userdata, &parked.raw, 0, .none) catch {};
-    }
-    // Deliver the batched wake, retrying to cover the wake-before-park race:
-    // NWAKE is idempotent and the waiter parks momentarily after the handshake.
-    // Each iteration is a real 100ms event wait; the cap is a time bound (~4s,
-    // past the waiter's 3s timeout), not a busy-spin budget.
-    const retry = Io.Timeout{ .duration = .{ .raw = .fromNanoseconds(100 * std.time.ns_per_ms), .clock = .awake } };
-    var tries: u32 = 0;
-    while (done.load(.acquire) == 0 and tries < 40) : (tries += 1) {
-        try std.testing.expect(compat.nwakePrivate(&.{&word.raw}));
-        tio.vtable.futexWait(tio.userdata, &done.raw, 0, retry) catch {};
-    }
-    t.join();
-    joined = true;
-    // The waiter must have returned promptly via NWAKE, not run out its 3s
-    // timeout (which futexWait reports as a normal return). The retry loop
-    // delivers a wake within ~100ms of parking, so a real release is well under
-    // 1s; a lost wake takes the full 3s and fails here.
-    try std.testing.expect(elapsed_ns.load(.acquire) < std.time.ns_per_s);
 }
 
 test "proc cancel request skips a retired slot and refuses a double push" {

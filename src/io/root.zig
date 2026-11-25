@@ -61,11 +61,6 @@ pub const deinit = shim.deinit;
 /// dead route.
 pub const loopError = shim.loopError;
 
-/// Count of FreeBSD NWAKE kernel refusals that fell back to per-address
-/// completion wakes (network and process routes). Always reported; a non-zero
-/// value means the batched completion wake is silently degrading.
-pub const nwakeRefusals = shim.nwakeRefusals;
-
 /// Per-route network counters (Born connect/read/write completions and
 /// Threaded-forward counts).
 pub const NetworkStats = shim.NetworkStats;
