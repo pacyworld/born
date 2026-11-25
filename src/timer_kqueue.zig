@@ -489,9 +489,12 @@ test "timer_kqueue: a repeat period beyond the cap keeps its phase across re-arm
     const armed = try compat.monotonicNs();
     try add(&port, 13, &tag, period, .repeat);
     const before = port.timers.early_rearms;
+    // --- #144 diagnostics: name the failing assertion under load ---------
+    std.debug.print("#144R setup armed={d} period={d} cap={d} chunk={d} before={d} early_rearms={d}\n", .{ armed, period, cap, testChunkNs(cap), before, port.timers.early_rearms });
     var fired: u64 = 0;
     while (fired < 2) {
         const n = try waitOne(&port, &events, 5000);
+        std.debug.print("#144R waitOne n={d} fired_so_far={d}\n", .{ n, fired });
         try testing.expect(n != 0);
         for (events[0..n]) |ev| {
             try testing.expect(ev.timer and ev.udata == @as(?*anyopaque, &tag));
@@ -500,6 +503,9 @@ test "timer_kqueue: a repeat period beyond the cap keeps its phase across re-arm
         }
     }
     const elapsed = (try compat.monotonicNs()) - armed;
+    const delta = port.timers.early_rearms - before;
+    std.debug.print("#144R CHECK elapsed>=2*period (line 503): elapsed={d} period={d} pass={any}\n", .{ elapsed, period, elapsed >= 2 * period });
+    std.debug.print("#144R CHECK early_rearms-before>=2 (line 504): early_rearms={d} before={d} delta={d} pass={any}\n", .{ port.timers.early_rearms, before, delta, delta >= 2 });
     try testing.expect(elapsed >= 2 * period);
     try testing.expect(port.timers.early_rearms - before >= 2);
     cancel(&port, 13);
