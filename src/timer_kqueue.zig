@@ -528,7 +528,7 @@ test "timer_kqueue: the re-arm decision is exact for synthetic firings" {
     // --- .once, early fires: exactly one re-arm of min(cap, remaining),
     // no delivery, deadline untouched ---
     port.timers.test_now = t0;
-    const delay = 10 * test_cap_ns; // 20 ms: five chunks at the 2 ms cap
+    const delay = 10 * test_cap_ns; // 20 ms: ten 2 ms chunks
     try add(&port, 21, &tag, delay, .once);
     try testing.expectEqual(t0 + delay, port.timers.live.get(21).?.deadline_ns);
     // The first staged arm is exactly the cap (the seam bound the dedicated
@@ -587,31 +587,69 @@ test "timer_kqueue: the re-arm decision is exact for synthetic firings" {
     try testing.expect(!port.timers.live.contains(22));
 
     // --- .repeat: an early fire re-arms on the phase; a due fire delivers
-    // the elapsed periods and re-arms on the original phase ---
+    // the elapsed periods and re-arms on the original phase. Every staged
+    // arm is asserted exactly: min(cap, time to the current deadline). ---
     const period = 8 * test_cap_ns; // 16 ms
     port.timers.test_now = t0;
     try add(&port, 23, &tag, period, .repeat);
     const staged3 = port.changes.items.len;
     kev.ident = 23;
-    // 10 ms in: before the first deadline, re-arm the cap, phase untouched.
+    // 10 ms in: before the first deadline (16 ms), 6 ms remain, above the
+    // cap, so the re-arm is exactly the cap and the phase is untouched.
     port.timers.test_now = t0 + 10 * ms;
     kev.data = -1;
     try testing.expect(!observe(&port, &kev));
     try testing.expectEqual(@as(usize, staged3 + 1), port.changes.items.len);
+    {
+        const c = port.changes.items[port.changes.items.len - 1];
+        try testing.expectEqual(@as(u32, 23), c.ident);
+        try testing.expectEqual(EV_ADD | EV_ONESHOT, c.flags);
+        try testing.expectEqual(@as(@TypeOf(c.data), @intCast(test_cap_ns)), c.data);
+    }
     try testing.expectEqual(t0 + period, port.timers.live.get(23).?.deadline_ns);
-    // 20 ms: 4 ms past the first deadline, one period delivered.
+    // 20 ms: 4 ms past the first deadline, one period delivered, 12 ms
+    // remain to the new deadline, above the cap, so the re-arm is the cap.
     port.timers.test_now = t0 + 20 * ms;
     kev.data = -1;
     try testing.expect(observe(&port, &kev));
     try testing.expectEqual(@as(@TypeOf(kev.data), 1), kev.data);
     try testing.expectEqual(t0 + 2 * period, port.timers.live.get(23).?.deadline_ns);
     try testing.expectEqual(@as(usize, staged3 + 2), port.changes.items.len);
-    // 65 ms: 33 ms past the second deadline, three periods delivered.
+    {
+        const c = port.changes.items[port.changes.items.len - 1];
+        try testing.expectEqual(@as(u32, 23), c.ident);
+        try testing.expectEqual(EV_ADD | EV_ONESHOT, c.flags);
+        try testing.expectEqual(@as(@TypeOf(c.data), @intCast(test_cap_ns)), c.data);
+    }
+    // 47 ms: 15 ms past the second deadline, one period delivered; 1 ms
+    // remain to the new deadline, below the cap, so the re-arm is exactly
+    // that remainder, not a period or the cap.
+    port.timers.test_now = t0 + 2 * period + 15 * ms;
+    kev.data = -1;
+    try testing.expect(observe(&port, &kev));
+    try testing.expectEqual(@as(@TypeOf(kev.data), 1), kev.data);
+    try testing.expectEqual(t0 + 3 * period, port.timers.live.get(23).?.deadline_ns);
+    try testing.expectEqual(@as(usize, staged3 + 3), port.changes.items.len);
+    {
+        const c = port.changes.items[port.changes.items.len - 1];
+        try testing.expectEqual(@as(u32, 23), c.ident);
+        try testing.expectEqual(EV_ADD | EV_ONESHOT, c.flags);
+        try testing.expectEqual(@as(@TypeOf(c.data), ms), c.data);
+    }
+    // 65 ms: 17 ms past the third deadline, two periods delivered, 15 ms
+    // remain, above the cap, so the re-arm is the cap.
     port.timers.test_now = t0 + 65 * ms;
     kev.data = -1;
     try testing.expect(observe(&port, &kev));
-    try testing.expectEqual(@as(@TypeOf(kev.data), 3), kev.data);
+    try testing.expectEqual(@as(@TypeOf(kev.data), 2), kev.data);
     try testing.expectEqual(t0 + 5 * period, port.timers.live.get(23).?.deadline_ns);
+    try testing.expectEqual(@as(usize, staged3 + 4), port.changes.items.len);
+    {
+        const c = port.changes.items[port.changes.items.len - 1];
+        try testing.expectEqual(@as(u32, 23), c.ident);
+        try testing.expectEqual(EV_ADD | EV_ONESHOT, c.flags);
+        try testing.expectEqual(@as(@TypeOf(c.data), @intCast(test_cap_ns)), c.data);
+    }
     // Phase: the deadline stays whole periods from the arm.
     try testing.expectEqual(@as(u64, 0), (port.timers.live.get(23).?.deadline_ns - t0) % period);
     // Every change staged for this id is at most the cap.
@@ -622,6 +660,7 @@ test "timer_kqueue: the re-arm decision is exact for synthetic firings" {
     // --- .repeat, the delivered period count saturates at u32 ---
     port.timers.test_now = t0;
     try add(&port, 24, &tag, period, .repeat);
+    const staged4 = port.changes.items.len;
     kev.ident = 24;
     const x: u64 = std.math.maxInt(u32) +| 1;
     port.timers.test_now = t0 + period + x * period;
@@ -629,6 +668,14 @@ test "timer_kqueue: the re-arm decision is exact for synthetic firings" {
     try testing.expect(observe(&port, &kev));
     try testing.expectEqual(@as(@TypeOf(kev.data), std.math.maxInt(u32)), kev.data);
     try testing.expectEqual(t0 + (x + 2) * period, port.timers.live.get(24).?.deadline_ns);
+    // The re-arm covers one full period, above the cap: exactly the cap.
+    try testing.expectEqual(@as(usize, staged4 + 1), port.changes.items.len);
+    {
+        const c = port.changes.items[port.changes.items.len - 1];
+        try testing.expectEqual(@as(u32, 24), c.ident);
+        try testing.expectEqual(EV_ADD | EV_ONESHOT, c.flags);
+        try testing.expectEqual(@as(@TypeOf(c.data), @intCast(test_cap_ns)), c.data);
+    }
 }
 
 test "timer_kqueue: cancelling an expired or unknown id stages nothing" {
