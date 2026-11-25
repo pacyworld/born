@@ -11,16 +11,14 @@
 //! than silently falling back.
 //!
 //! The all-Threaded baseline delegates every vtable slot to Threaded through
-//! forwarding thunks. With `capabilities.time = .born_evented` the time family
-//! (`sleep`, monotonic `now`) runs on Born's reactor through the Scale model
-//! machinery. With `capabilities.network = .born_evented` the network client
+//! forwarding thunks. With `capabilities.network = .born_evented` the network client
 //! path (IP and pathname Unix connect, stream read/write, close, shutdown) runs
 //! on Born; listen/accept, DNS and message I/O stay Threaded hybrids or declared
 //! exclusions. With `capabilities.process = .born_evented` on FreeBSD or Linux
 //! the process family (`processSpawn`, `childWait`, `childKill`) runs on Born
 //! through process descriptors / pidfds; other targets reject the capability at
-//! construction. Every other slot keeps delegating. Later increments enable the
-//! remaining families.
+//! construction. The time family (`sleep`, `now`, `clockResolution`) always
+//! stays on Threaded. Every other slot keeps delegating.
 //!
 //! Removal is `git rm -r src/io` plus the conditional export lines in
 //! `build.zig`; nothing in the core depends on this module.
@@ -48,29 +46,25 @@ pub const InitError = shim.InitError;
 pub const Shim = shim.Shim;
 
 /// Builds a `std.Io` over Born's event port. Release the returned interface
-/// with `deinit`. The time route (`capabilities.time = .born_evented`), the
-/// network client route (`capabilities.network = .born_evented`) and, on
-/// FreeBSD or Linux, the process route (`capabilities.process = .born_evented`)
+/// with `deinit`. The network client route (`capabilities.network = .born_evented`)
+/// and, on FreeBSD or Linux, the process route (`capabilities.process = .born_evented`)
 /// are serviced by Born's reactor; the file family and the process family on
-/// other targets are rejected at construction.
+/// other targets are rejected at construction. The time family stays Threaded.
 pub const io = shim.io;
 /// Releases the composite created by `io`. Stops and joins the Born route's
 /// loop thread first, then joins the Threaded pool.
 pub const deinit = shim.deinit;
 
 /// The first route-level failure latched by a Born route (wait refusal,
-/// timer-arm refusal, slot-table growth refusal), or null. `sleep` surfaces
-/// these as `Canceled`; this exposes the cause.
+/// connect-deadline timer-arm refusal, slot-table growth refusal, process
+/// arm/flush refusal), or null. This exposes the cause behind a refused or
+/// dead route.
 pub const loopError = shim.loopError;
 
-/// Latency breakdown snapshot of completed Born-route sleeps.
-pub const TimeStats = shim.TimeStats;
-/// Snapshot of the time route's latency breakdown accumulators. Reports
-/// zeros when the `time_stats` build option is off (the default).
-pub const timeStats = shim.timeStats;
-/// Comptime gate for the latency-breakdown instrument (`time_stats` build
-/// option): off by default, enabled in the test and bench builds.
-pub const time_stats_enabled = shim.time_stats_enabled;
+/// Count of FreeBSD NWAKE kernel refusals that fell back to per-address
+/// completion wakes (network and process routes). Always reported; a non-zero
+/// value means the batched completion wake is silently degrading.
+pub const nwakeRefusals = shim.nwakeRefusals;
 
 /// Per-route network counters (Born connect/read/write completions and
 /// Threaded-forward counts).
@@ -100,36 +94,22 @@ pub const process_supported = shim.process_supported;
 /// comptime-known constants have no guaranteed unique runtime address.
 pub const baseline_vtable = shim.baseline_vtable;
 
-/// The time-route vtable: the baseline with `sleep` and monotonic `now`
-/// serviced by Born's reactor. Compare slot contents, not the address.
-pub const time_vtable = shim.time_vtable;
-
 /// The network-route vtable: the baseline with the client-path network slots
 /// serviced by Born's reactor. Compare slot contents, not the address.
 pub const network_vtable = shim.network_vtable;
-
-/// Both Born routes active: the network vtable plus the time-route sleep/now.
-pub const time_network_vtable = shim.time_network_vtable;
 
 /// The process-route vtable: the baseline with `processSpawn`, `childWait` and
 /// `childKill` serviced by Born's reactor (FreeBSD and Linux). Compare slot
 /// contents, not the address.
 pub const process_vtable = shim.process_vtable;
 
-/// The time and process routes active.
-pub const time_process_vtable = shim.time_process_vtable;
-
 /// The network and process routes active.
 pub const network_process_vtable = shim.network_process_vtable;
-
-/// All three Born routes active: time, network and process.
-pub const time_network_process_vtable = shim.time_network_process_vtable;
 
 test {
     _ = @import("assert.zig");
     _ = @import("shim.zig");
     _ = @import("shim_test.zig");
-    _ = @import("time_test.zig");
     _ = @import("net_test.zig");
     _ = @import("process_test.zig");
 }

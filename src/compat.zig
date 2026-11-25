@@ -16,6 +16,11 @@ const is_linux = native_os == .linux;
 const is_freebsd = native_os == .freebsd;
 const has_new_signal_type = builtin.zig_version.minor >= 16;
 
+/// Whether the build is Debug. Zig 0.17 renamed `builtin.mode`'s type to
+/// `std.lang.Optimize` with lowercase fields; the bare `.Debug` literal and the
+/// deprecated `std.builtin.OptimizeMode.Debug` alias both fail there.
+pub const is_debug: bool = if (builtin.zig_version.minor >= 17) builtin.mode == .debug else builtin.mode == .Debug;
+
 /// Returns an empty `std.EnumSet(E)` on every supported toolchain.
 pub fn emptyEnumSet(comptime Enum: type) std.EnumSet(Enum) {
     if (@hasDecl(std.EnumSet(Enum), "empty")) return .empty;

@@ -127,7 +127,7 @@ fn mainRaw() !void {
 fn mainWithArgs(argv: anytype) !void {
     var gpa: std.heap.DebugAllocator(.{}) = .init;
     defer _ = gpa.deinit();
-    const alloc = if (builtin.mode == std.builtin.OptimizeMode.Debug) gpa.allocator() else std.heap.smp_allocator;
+    const alloc = if (compat.is_debug) gpa.allocator() else std.heap.smp_allocator;
     const opts = parseArgs(argv) catch |err| switch (err) {
         error.Usage => std.process.exit(2),
         else => return err,

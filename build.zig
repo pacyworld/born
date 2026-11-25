@@ -61,12 +61,12 @@ pub fn build(b: *std.Build) void {
 
     // born.io build options, shared by the exported module and the
     // cross-target gate. Comptime-dead on 0.15.2 (no std.Io), so the graph
-    // there is unchanged. Latency stats are a bench-time instrument: the
-    // exported module defaults to no shared writes on the sleep path
-    // (-Dtime-stats to enable); the test and bench builds always enable them.
+    // there is unchanged. Per-route counters are a bench-time instrument: the
+    // exported module defaults to no shared counter writes
+    // (-Dnetwork-stats / -Dprocess-stats to enable); the test and bench builds
+    // always enable them.
     const io_options_mod = if (builtin.zig_version.minor >= 16) blk: {
         const io_options = b.addOptions();
-        io_options.addOption(bool, "time_stats", b.option(bool, "time-stats", "Enable born.io time-route latency stats (default off)") orelse false);
         io_options.addOption(bool, "network_stats", b.option(bool, "network-stats", "Enable born.io network-route per-route counters (default off)") orelse false);
         io_options.addOption(bool, "process_stats", b.option(bool, "process-stats", "Enable born.io process-route per-route counters (default off)") orelse false);
         break :blk io_options.createModule();
@@ -90,7 +90,6 @@ pub fn build(b: *std.Build) void {
         linkPlatform(io_mod, target);
 
         const io_stats_options = b.addOptions();
-        io_stats_options.addOption(bool, "time_stats", true);
         io_stats_options.addOption(bool, "network_stats", true);
         io_stats_options.addOption(bool, "process_stats", true);
         const io_test_mod = b.createModule(.{
@@ -110,28 +109,27 @@ pub fn build(b: *std.Build) void {
         b.step("test-io-bin", "Install the selected target's born.io test executable without running it").dependOn(&install_io_tests.step);
 
         // Default-config runtime smoke: the same suite against the exported
-        // module (stats off unless -Dtime-stats). The stats-assertion test
-        // checks the zero contract when stats are off.
+        // module (counters off unless -Dnetwork-stats / -Dprocess-stats). The
+        // stats-assertion tests check the zero contract when counters are off.
         const io_default_tests = b.addTest(.{ .name = "born-io-tests-default", .root_module = io_mod });
         const install_io_default = b.addInstallArtifact(io_default_tests, .{});
         b.step("test-io-default-bin", "Install the default-config born.io test executable (stats off)").dependOn(&install_io_default.step);
 
-        // On request only: the time-route benchmark (P5.2), installed as
-        // zig-out/bin/born-time-bench. Driver and acceptance: bench/time.sh.
-        // The bench reads the latency breakdown, so it uses the stats-on
-        // module regardless of -Dtime-stats.
+        // On request only: the Threaded sleep baseline benchmark, installed as
+        // zig-out/bin/born-time-bench. Driver: bench/time.sh. The Born time
+        // route was retired (#101); this measures the Threaded baseline only.
         const time_bench_mod = b.createModule(.{
             .root_source_file = b.path("bench/time.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "born", .module = mod },
-                .{ .name = "born.io", .module = io_test_mod },
+                .{ .name = "born.io", .module = io_mod },
                 .{ .name = "compat", .module = compat_mod },
             },
         });
         const time_bench_exe = b.addExecutable(.{ .name = "born-time-bench", .root_module = time_bench_mod });
-        b.step("bench-time", "Build the born-time-bench time-route benchmark (bench/time.sh)").dependOn(&b.addInstallArtifact(time_bench_exe, .{}).step);
+        b.step("bench-time", "Build the born-time-bench Threaded sleep baseline (bench/time.sh)").dependOn(&b.addInstallArtifact(time_bench_exe, .{}).step);
 
         // On request only: the network-client echo benchmark (P5.3, review 619
         // should-fix 6), installed as zig-out/bin/born-net-bench. It measures

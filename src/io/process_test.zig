@@ -144,15 +144,15 @@ test "process Born route constructs with the process vtable and deinits" {
     defer born_io.deinit(interface);
     try expect(std.meta.eql(interface.vtable.*, born_io.process_vtable));
 
-    // All three routes active select the combined vtable.
+    // Both Born routes active select the combined vtable.
     var port2 = try born.EvPort.init(std.testing.allocator);
     defer port2.deinit();
     const all = try born_io.io(&port2, .{
         .allocator = std.testing.allocator,
-        .capabilities = .{ .time = .born_evented, .network = .born_evented, .process = .born_evented },
+        .capabilities = .{ .network = .born_evented, .process = .born_evented },
     });
     defer born_io.deinit(all);
-    try expect(std.meta.eql(all.vtable.*, born_io.time_network_process_vtable));
+    try expect(std.meta.eql(all.vtable.*, born_io.network_process_vtable));
 }
 
 test "spawn and wait collect an exit code on Born, then invalidate the child" {
