@@ -191,6 +191,12 @@ pub const State = struct {
     /// Early chunk firings re-armed without delivery (diagnostic and test
     /// seam; monotonic, never reset).
     early_rearms: u64 = 0,
+    /// Test-only synthetic monotonic clock (ns): when non-null, `add` and
+    /// `observe` read it instead of the real clock, so the re-arm decision is
+    /// testable with synthetic times without kernel timing (#144). The reads
+    /// are guarded by `builtin.is_test`, so the seam is comptime-dead outside
+    /// test builds.
+    test_now: ?u64 = null,
 
     /// Returns state with no live timers and the real platform arm cap. Tests
     /// that exercise internal re-arm lower `cap_ns` on their own port.
@@ -214,7 +220,12 @@ pub const State = struct {
 pub fn add(port: *EvPort, id: u32, udata: ?*anyopaque, after_ns: u64, mode: TimerMode) TimerError!void {
     if (after_ns > timer_after_ns_max) return TimerError.InvalidArgument;
     if (mode == .repeat and after_ns == 0) return TimerError.InvalidArgument;
-    const now = compat.monotonicNs() catch return TimerError.SystemResources;
+    const now: u64 = blk: {
+        if (builtin.is_test) {
+            if (port.timers.test_now) |t| break :blk t;
+        }
+        break :blk compat.monotonicNs() catch return TimerError.SystemResources;
+    };
     port.changes.ensureUnusedCapacity(port.alloc, 2) catch return TimerError.OutOfMemory;
     const slot = port.timers.live.getOrPut(port.alloc, id) catch return TimerError.OutOfMemory;
     if (slot.found_existing) port.stageRaw(change(id, EV_DELETE, null, 0));
@@ -251,10 +262,15 @@ pub fn observe(port: *EvPort, kev: *Kevent) bool {
     if ((kev.flags & EV_ERROR) != 0) return kev.data != ENOENT;
     const id = std.math.cast(u32, kev.ident) orelse return true;
     const entry = port.timers.live.getPtr(id) orelse return true;
-    const now = compat.monotonicNs() catch {
-        if (port.pending_error == null) port.pending_error = error.WaitFailed;
-        rearm(port, id, entry.udata, port.timers.cap_ns);
-        return false;
+    const now: u64 = blk: {
+        if (builtin.is_test) {
+            if (port.timers.test_now) |t| break :blk t;
+        }
+        break :blk compat.monotonicNs() catch {
+            if (port.pending_error == null) port.pending_error = error.WaitFailed;
+            rearm(port, id, entry.udata, port.timers.cap_ns);
+            return false;
+        };
     };
     if (now < entry.deadline_ns) {
         port.timers.early_rearms += 1;
@@ -450,14 +466,16 @@ test "timer_kqueue: a deadline beyond the cap re-arms internally and fires once,
     const delay = 10 * testChunkNs(cap);
     const armed = try compat.monotonicNs();
     try add(&port, 12, &tag, delay, .once);
-    const before = port.timers.early_rearms;
     try testing.expectEqual(@as(usize, 1), try waitOne(&port, &events, 5000));
     try testing.expect(events[0].timer);
     try testing.expect(events[0].udata == @as(?*anyopaque, &tag));
     try testing.expectEqual(@as(u32, 1), events[0].fired);
     const elapsed = (try compat.monotonicNs()) - armed;
     try testing.expect(elapsed >= delay);
-    try testing.expect(port.timers.early_rearms - before >= 3);
+    // How many internal re-arms the kernel delivers depends on callout
+    // coalescing under load (zero up to nine), so no count is asserted here;
+    // the re-arm decision is pinned by the deterministic test below. This
+    // integration test owns the contract: it fires once, never early.
     try testing.expect(!port.timers.live.contains(12));
     try testing.expectEqual(@as(usize, 0), try port.wait(&events, 50));
 }
@@ -476,7 +494,6 @@ test "timer_kqueue: a repeat period beyond the cap keeps its phase across re-arm
     const period = 8 * testChunkNs(cap);
     const armed = try compat.monotonicNs();
     try add(&port, 13, &tag, period, .repeat);
-    const before = port.timers.early_rearms;
     var fired: u64 = 0;
     while (fired < 2) {
         const n = try waitOne(&port, &events, 5000);
@@ -489,9 +506,129 @@ test "timer_kqueue: a repeat period beyond the cap keeps its phase across re-arm
     }
     const elapsed = (try compat.monotonicNs()) - armed;
     try testing.expect(elapsed >= 2 * period);
-    try testing.expect(port.timers.early_rearms - before >= 2);
+    // As in the once test above: the re-arm count is load-dependent and is
+    // not asserted here; the deterministic test pins the decision.
     cancel(&port, 13);
     try testing.expectEqual(@as(usize, 0), try port.wait(&events, 50));
+}
+
+test "timer_kqueue: the re-arm decision is exact for synthetic firings" {
+    var port = try EvPort.init(testing.allocator);
+    defer port.deinit();
+    // A small cap so a short deadline spans several chunks, plus the
+    // synthetic clock seam so the decision never depends on kernel callout
+    // timing (#144): the real kernel coalesces chunk firings under load.
+    port.timers.cap_ns = test_cap_ns;
+    const t0: u64 = std.time.ns_per_s; // arbitrary monotonic anchor (ns)
+    const ms = std.time.ns_per_ms;
+    var tag: u8 = 1;
+    var kev = std.mem.zeroes(Kevent);
+    kev.filter = kq.EVFILT_TIMER;
+
+    // --- .once, early fires: exactly one re-arm of min(cap, remaining),
+    // no delivery, deadline untouched ---
+    port.timers.test_now = t0;
+    const delay = 10 * test_cap_ns; // 20 ms: five chunks at the 2 ms cap
+    try add(&port, 21, &tag, delay, .once);
+    try testing.expectEqual(t0 + delay, port.timers.live.get(21).?.deadline_ns);
+    // The first staged arm is exactly the cap (the seam bound the dedicated
+    // cap test asserts).
+    {
+        const c = port.changes.items[port.changes.items.len - 1];
+        try testing.expectEqual(EV_ADD | EV_ONESHOT, c.flags);
+        try testing.expectEqual(@as(@TypeOf(c.data), @intCast(test_cap_ns)), c.data);
+    }
+    const staged = port.changes.items.len;
+    const re0 = port.timers.early_rearms;
+    kev.ident = 21;
+    // 5 ms in: 15 ms remain, above the cap, so the re-arm is the cap.
+    port.timers.test_now = t0 + 5 * ms;
+    kev.data = -1;
+    try testing.expect(!observe(&port, &kev));
+    try testing.expectEqual(@as(usize, staged + 1), port.changes.items.len);
+    {
+        const c = port.changes.items[port.changes.items.len - 1];
+        try testing.expectEqual(@as(u32, 21), c.ident);
+        try testing.expectEqual(EV_ADD | EV_ONESHOT, c.flags);
+        try testing.expectEqual(@as(@TypeOf(c.data), @intCast(test_cap_ns)), c.data);
+    }
+    try testing.expectEqual(re0 + 1, port.timers.early_rearms);
+    try testing.expectEqual(t0 + delay, port.timers.live.get(21).?.deadline_ns);
+    // 1 ms short of the deadline: the re-arm is the remainder, below the cap.
+    port.timers.test_now = t0 + delay - ms;
+    kev.data = -1;
+    try testing.expect(!observe(&port, &kev));
+    try testing.expectEqual(@as(usize, staged + 2), port.changes.items.len);
+    {
+        const c = port.changes.items[port.changes.items.len - 1];
+        try testing.expectEqual(@as(u32, 21), c.ident);
+        try testing.expectEqual(EV_ADD | EV_ONESHOT, c.flags);
+        try testing.expectEqual(@as(@TypeOf(c.data), ms), c.data);
+    }
+    try testing.expectEqual(re0 + 2, port.timers.early_rearms);
+
+    // --- .once, a fire at the deadline: delivered, retired, nothing staged ---
+    port.timers.test_now = t0 + delay;
+    kev.data = -1;
+    try testing.expect(observe(&port, &kev));
+    try testing.expectEqual(@as(usize, staged + 2), port.changes.items.len);
+    try testing.expect(!port.timers.live.contains(21));
+    try testing.expectEqual(re0 + 2, port.timers.early_rearms);
+
+    // --- .once, a fire past the deadline: delivered, nothing staged ---
+    port.timers.test_now = t0;
+    try add(&port, 22, &tag, delay, .once);
+    const staged2 = port.changes.items.len;
+    kev.ident = 22;
+    port.timers.test_now = t0 + delay + 7 * ms;
+    kev.data = -1;
+    try testing.expect(observe(&port, &kev));
+    try testing.expectEqual(@as(usize, staged2), port.changes.items.len);
+    try testing.expect(!port.timers.live.contains(22));
+
+    // --- .repeat: an early fire re-arms on the phase; a due fire delivers
+    // the elapsed periods and re-arms on the original phase ---
+    const period = 8 * test_cap_ns; // 16 ms
+    port.timers.test_now = t0;
+    try add(&port, 23, &tag, period, .repeat);
+    const staged3 = port.changes.items.len;
+    kev.ident = 23;
+    // 10 ms in: before the first deadline, re-arm the cap, phase untouched.
+    port.timers.test_now = t0 + 10 * ms;
+    kev.data = -1;
+    try testing.expect(!observe(&port, &kev));
+    try testing.expectEqual(@as(usize, staged3 + 1), port.changes.items.len);
+    try testing.expectEqual(t0 + period, port.timers.live.get(23).?.deadline_ns);
+    // 20 ms: 4 ms past the first deadline, one period delivered.
+    port.timers.test_now = t0 + 20 * ms;
+    kev.data = -1;
+    try testing.expect(observe(&port, &kev));
+    try testing.expectEqual(@as(@TypeOf(kev.data), 1), kev.data);
+    try testing.expectEqual(t0 + 2 * period, port.timers.live.get(23).?.deadline_ns);
+    try testing.expectEqual(@as(usize, staged3 + 2), port.changes.items.len);
+    // 65 ms: 33 ms past the second deadline, three periods delivered.
+    port.timers.test_now = t0 + 65 * ms;
+    kev.data = -1;
+    try testing.expect(observe(&port, &kev));
+    try testing.expectEqual(@as(@TypeOf(kev.data), 3), kev.data);
+    try testing.expectEqual(t0 + 5 * period, port.timers.live.get(23).?.deadline_ns);
+    // Phase: the deadline stays whole periods from the arm.
+    try testing.expectEqual(@as(u64, 0), (port.timers.live.get(23).?.deadline_ns - t0) % period);
+    // Every change staged for this id is at most the cap.
+    for (port.changes.items[staged3..]) |c| {
+        try testing.expect(c.data <= @as(@TypeOf(c.data), @intCast(test_cap_ns)));
+    }
+
+    // --- .repeat, the delivered period count saturates at u32 ---
+    port.timers.test_now = t0;
+    try add(&port, 24, &tag, period, .repeat);
+    kev.ident = 24;
+    const x: u64 = std.math.maxInt(u32) +| 1;
+    port.timers.test_now = t0 + period + x * period;
+    kev.data = -1;
+    try testing.expect(observe(&port, &kev));
+    try testing.expectEqual(@as(@TypeOf(kev.data), std.math.maxInt(u32)), kev.data);
+    try testing.expectEqual(t0 + (x + 2) * period, port.timers.live.get(24).?.deadline_ns);
 }
 
 test "timer_kqueue: cancelling an expired or unknown id stages nothing" {
