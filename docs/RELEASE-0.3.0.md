@@ -61,7 +61,6 @@ they repin or re-vendor onto 0.3.0. xmppd uses its own event loop, not born.
   the loop costs two cross-thread hops and buys nothing over Threaded's in-thread
   sleep. The written benchmark target was withdrawn; the measured findings are
   recorded in `bench/README.md`, and performance work moves to the native API.
-  **[DRAFT retirement note - pending Daniel's approval; not final.]**
 - A Born capability route that is not implemented is rejected at construction
   (`CapabilityUnsupported`), never silently delegated.
 
@@ -78,7 +77,7 @@ once they are merged and tested: P5.3 (Unix streams), P5.4 (process family) and
 P5.5 (proof consumers on all three CI kernels), with #101 (time-route retirement)
 merged, tri-kernel born-io CI green on Zig 0.16.0 and 0.17.1, and the #23
 release-checklist audit at the cut commit. The final shipped surface is recorded
-against #23. **[The #101 retirement wording is DRAFT - pending Daniel's approval.]**
+against #23.
 
 ## Post-0.3.0 (not in this tag)
 
