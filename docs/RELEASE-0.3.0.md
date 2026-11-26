@@ -26,26 +26,39 @@ Handle toolchain-dependent.
 
 POSIX consumers are unchanged: McpBridge (FreeBSD host, 88/88 unit tests)
 and sonya-core (the -Dzmq daemon, 18/18 build steps) build against the RC
-with no source changes. The #23 "consumers build with no source changes"
-check is scoped to POSIX until the Windows migration lands; that
-migration is tracked in mcp-bridge#35 and follows the repin order below.
+(release-prep PR #103, head 7374af0, as recorded in #23) with no source
+changes. The #23 "consumers build with no source changes" check is scoped
+to POSIX until the Windows migration lands; that migration is tracked in
+mcp-bridge#35 and follows the repin order below.
 
 ## Timer unit breaking change
 
 `EvPort.addTimer`'s delay is now `after_ns: u64` (nanoseconds), not
 `after_ms: u32` (milliseconds); the uniform ceiling is
-`born.timer_after_ns_max` (about 292 years). A consumer that passed
-milliseconds must multiply by `std.time.ns_per_ms`. Every backend honors any
-accepted delay up to the ceiling without firing early: each arms at most
-its kernel's exact conversion cap per shot and re-arms the remainder
-internally until the deadline is due.
+`born.timer_after_ns_max` (about 292 years; it fits the platform's signed
+timer data field in both nanoseconds and IOCP's 100 ns ticks). A consumer
+that passed milliseconds must multiply by `std.time.ns_per_ms`. Every
+backend honors any accepted delay up to the ceiling without firing early.
+kqueue arms at most its conversion cap per shot (`State.cap_ns`, the
+largest delay the kernel converts exactly) and re-arms the remainder
+internally until the deadline is due; the chunking is kqueue-specific.
+epoll arms one absolute `timerfd_settime` at the heap's earliest deadline
+and re-arms as it changes. IOCP arms one relative due time in 100 ns
+ticks, rounded up, so a timer never fires early.
 
 Estate consumers audited for the change: none builds against born master
 with the nanosecond API today. McpBridge, identityd, sonya-core,
-sonya-core-port and sonya-studio pin v0.2.3, which has no timers. Antibot's
-gateway (git pin) and HSM (vendored snapshot) are frozen pre-change copies
-that call `addTimer` with millisecond values; they need the unit change when
-they repin or re-vendor onto 0.3.0. xmppd uses its own event loop, not born.
+sonya-core-port and sonya-studio pin v0.2.3, which has no timers.
+pw-spoa (master and tag v0.7.0) pins born at git commit f3b837c, after
+v0.2.3: it drives `born.EvPort` but never calls `addTimer`, so the unit
+change does not touch its source, but it still needs a repin. Antibot's
+gateway pins born at git commit 1f04266 (also pre-change); its single
+`addTimer` call passes a millisecond value (the 1000 ms repeating tick in
+`gateway/src/server.zig`), and the port security/antibot-gw 0.4.0
+(pacyworld/ports#26) builds on that pin. HSM (vendored snapshot) is a
+frozen pre-change copy that calls `addTimer` with millisecond values.
+They need the unit change when they repin or re-vendor onto 0.3.0.
+xmppd uses its own event loop, not born.
 
 ## born.io (std.Io compatibility shim) - experimental, opt-in
 
@@ -53,8 +66,11 @@ they repin or re-vendor onto 0.3.0. xmppd uses its own event loop, not born.
   baseline (every slot delegated, no loop thread) is the default and the supported
   configuration in 0.3.0.
 - The network client route (`capabilities.network = .born_evented`) and, on
-  FreeBSD and Linux, the process route (`capabilities.process = .born_evented`)
-  are opt-in and **experimental** in 0.3.0.
+  FreeBSD and Linux, the process route (`capabilities.process = .born_evented`,
+  where Linux kernels older than 5.4 fail `spawn` with `error.Unsupported`)
+  are opt-in and **experimental** in 0.3.0. The network route runs connect
+  and stream I/O on Born (UDP connect, bind and socketpair return declared
+  unsupported); listen, accept and name resolution stay on Threaded.
 - The time family (`sleep`, `now`, `clockResolution`) always delegates to
   Threaded. A Born time route (`capabilities.time = .born_evented`) was
   implemented and measured, then retired (#101): a blocking sleep routed through
@@ -69,11 +85,16 @@ they repin or re-vendor onto 0.3.0. xmppd uses its own event loop, not born.
 1. Cut the v0.3.0 tag.
 2. mcp-bridge#35 repins onto the tag.
 3. sonya-core moves both pins in one commit.
+4. pw-spoa repins onto the tag; the port security/pw-spoa follows.
+5. Antibot's gateway repins onto the tag; the port security/antibot-gw
+   follows.
+
+The order among the post-tag steps is the owner's call.
 
 ## Scope gated before the tag
 
 Per the owner go-ahead, v0.3.0 ships the born.io P5 increments and is tagged only
-once they are merged and tested: P5.3 (Unix streams), P5.4 (process family) and
+once they are merged and tested: P5.3 (network client family), P5.4 (process family) and
 P5.5 (proof consumers on all three CI kernels), with #101 (time-route retirement)
 merged, tri-kernel born-io CI green on Zig 0.16.0 and 0.17.1, and the #23
 release-checklist audit at the cut commit. The final shipped surface is recorded
