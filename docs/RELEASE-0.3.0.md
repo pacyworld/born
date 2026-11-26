@@ -35,8 +35,9 @@ mcp-bridge#35 and follows the repin order below.
 
 `EvPort.addTimer`'s delay is now `after_ns: u64` (nanoseconds), not
 `after_ms: u32` (milliseconds); the uniform ceiling is
-`born.timer_after_ns_max` (about 292 years; it fits the platform's signed
-timer data field in both nanoseconds and IOCP's 100 ns ticks). A consumer
+`born.timer_after_ns_max` (`maxInt(i64)` nanoseconds, about 292 years; the
+value fits the platform's signed timer data field in both nanoseconds and
+IOCP's 100 ns ticks). A consumer
 that passed milliseconds must multiply by `std.time.ns_per_ms`. Every
 backend honors any accepted delay up to the ceiling without firing early.
 kqueue arms at most its conversion cap per shot (`State.cap_ns`, the
