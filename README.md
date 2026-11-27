@@ -671,15 +671,49 @@ connect-deadline timer-arm refusals, slot-table growth failures, process
 arm/flush refusals) are latched and readable via `born_io.loopError(io)`.
 The machinery is documented in `src/io/shim.zig`.
 
-Per-family routing:
+Operation routing, every family against every route setting. Every cell is
+derived from `src/io/shim.zig` (`base_vtable`, `vtable_table`, the
+`network_route`/`process_route` thunks and the toolchain-specific
+`net016`/`net017` slots). "Threaded" means delegated to upstream's
+`Io.Threaded` worker pool. "Born" means serviced on Born's reactor, within
+the route's documented profile only. Error names in bold are declared
+std error-set members; they are returned, never silently substituted.
 
-| family | slots | serviced by |
-|---|---|---|
-| time | the `sleep`, `now`, `clockResolution` slots | Threaded (always; Born time route retired, #101) |
-| network client | connect (IP and pathname Unix, with deadlines), stream read/write, close, shutdown, socket pairs, `netWriteFile`, batch await | Born with `capabilities.network = .born_evented`; otherwise Threaded |
-| network server | listen, accept, DNS resolution | Threaded (hybrid or declared exclusion) |
-| process | the `processSpawn`, `childWait`, `childKill` slots | Born with `capabilities.process = .born_evented` on FreeBSD/Linux; rejected elsewhere; otherwise Threaded |
-| async/await, concurrent, cancel, futex, queue, random, file | the remaining slots | Threaded |
+| operation family | default (all-Threaded baseline) | `network = .born_evented` | `process = .born_evented` |
+|---|---|---|---|
+| Connect, IP stream TCP (with or without a deadline on any clock) | Threaded | Born | Threaded |
+| Connect, IP non-stream / non-TCP | Threaded | **OptionUnsupported** (declared; never truncated to TCP) | Threaded |
+| Connect, pathname Unix (with or without a deadline) | Threaded | Born | Threaded |
+| Connect, abstract Unix, or embedded NUL in the path (POSIX) | Threaded | Threaded | Threaded |
+| Connect, Unix on Windows (any Unix address) | Threaded | **AddressFamilyUnsupported** (declared) | Threaded |
+| IP or Unix bind (`netBindIp`) | Threaded | **OptionUnsupported** (declared) | Threaded |
+| Socket pairs | Threaded | **OperationUnsupported** (declared) | Threaded |
+| Stream read/write on a Born-owned handle (0.16 `netRead`/`netWrite`; 0.17 `operate` `net_read`/`net_write`) | Threaded | Born | Threaded |
+| Message send/receive, including control buffers | Threaded | **Unexpected** on a Born-owned handle (stream-only profile); Threaded for Threaded-owned handles | Threaded |
+| `netWriteFile` (sendfile) | Threaded | 0.16: read/copy loop through the Born write path; 0.17: **Unimplemented** (declared) | Threaded |
+| Close and shutdown (`netClose`/`netShutdown`) | Threaded | Born for Born-owned handles; Threaded for handles owned by Threaded | Threaded |
+| Listen and accept, IP and Unix | Threaded | **Threaded** | Threaded |
+| DNS resolution and interface name lookup (`netLookup`, `netInterfaceNameResolve`, `netInterfaceName`) | Threaded | Threaded | Threaded |
+| `processSpawn`, `processSpawnPath` (0.16), `childWait`, `childKill` | Threaded | Threaded | Born on FreeBSD and Linux; rejected at construction elsewhere; spawn options outside the profile fail with **OperationUnsupported** (empty argv with **Unexpected**) |
+| `sleep`, `now`, `clockResolution` | Threaded | Threaded | Threaded (always; the Born time route was retired, #101) |
+| File and directory I/O, memory maps, locks, timestamps | Threaded | Threaded | Threaded (`file: .born_evented` is rejected at construction) |
+| `async`/`await`/`cancel`, `concurrent`, groups, futex, `random`/`randomSecure`, `crashHandler` | Threaded | Threaded | Threaded |
+| Batch (`batchAwaitAsync`/`batchAwaitConcurrent`, members are net read/write/send/receive) | Threaded | Born provenance gate (network route only): Born-owned members (net read/write/send/receive ops) are moved to completed with their tag result **Unexpected**; the remainder run on Threaded | Threaded |
+
+Two structural facts follow from the table. First, listen and accept stay on
+Threaded on every route: a server built on `std.Io` gets no Born benefit on
+its accept path today (the full server path is P5.3b, Option A). Second, the
+network route services only the stream client path; out-of-profile requests
+are declared errors, never a silent fallback to Threaded.
+
+**Expectations for `born.io`: compatibility and correctness, not
+performance.** A blocking `std.Io` call still holds an OS thread (Threaded's
+own worker), so throughput through the shim is in the same class as
+Threaded's, with Born I/O underneath on the families that route to Born. The
+performance case for Born is the native API (one loop per core, state
+machines, no hidden pool), not this compatibility layer; see `bench/README.md`
+and `bench/suite.sh` for the native measured evidence and `bench/regress.sh`
+for the regression gate.
 
 The network client route (`capabilities.network = .born_evented`) services the
 stream client path on Born's reactor: IP and pathname Unix connect (with

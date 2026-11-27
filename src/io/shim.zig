@@ -109,20 +109,32 @@ pub const process_stats_enabled: bool = io_options.process_stats;
 
 /// Where a capability family is serviced.
 pub const Route = enum {
-    /// Born's event port (kqueue/epoll/IOCP). Enabled per family in later
-    /// increments; rejected at construction until implemented.
+    /// Born's event port (kqueue/epoll/IOCP). Implemented for the stream
+    /// client family (IP and pathname Unix connect, stream read/write, close,
+    /// shutdown) on every target, and for the process family (spawn, wait,
+    /// kill) on FreeBSD and Linux only. Requesting a family that is not
+    /// implemented rejects at construction (`CapabilityUnsupported`), never
+    /// silently delegates.
     born_evented,
     /// Upstream `Io.Threaded` worker pool.
     threaded,
 };
 
-/// Explicit, compile-time-visible capability routing for the hybrid. The
-/// foundation baseline services every family on Threaded; requesting a Born
-/// route before it is implemented is a construction rejection, never a silent
-/// fallback.
+/// Explicit, compile-time-visible capability routing for the hybrid. Every
+/// unimplemented Born route is a construction rejection, never a silent
+/// fallback. The three remaining families, each with its exact validity:
+/// - `network`: the stream client path is implemented on Born on every target.
+/// - `process`: implemented on Born on FreeBSD and Linux only (process
+///   descriptors / pidfds); elsewhere `.born_evented` rejects at construction.
+/// - `file`: no Born route exists on any target; `.born_evented` rejects at
+///   construction everywhere. The field is kept so capability routing stays
+///   explicit and a future file route has a seam; it carries no route today.
 pub const Capabilities = struct {
+    /// Stream client path on Born. Valid on every target.
     network: Route = .threaded,
+    /// No Born route on any target; `.born_evented` rejects at construction.
     file: Route = .threaded,
+    /// Born process descriptors / pidfds. FreeBSD and Linux only.
     process: Route = .threaded,
 
     pub fn anyBorn(c: Capabilities) bool {
