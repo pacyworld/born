@@ -2773,24 +2773,41 @@ pub fn sleepNs(nanoseconds: u64) void {
     }
 }
 
-/// `struct clockinfo` from `kern.clockrate` (sysctl), identical layout on
-/// the BSDs. `tick` is microseconds per callout tick.
-pub const Clockinfo = extern struct {
-    hz: c_int,
-    tick: c_int,
-    tickadj: c_int,
-    profhz: c_int,
-    stathz: c_int,
-};
+/// `struct clockinfo` from `kern.clockrate` (sysctl). NetBSD (generic-netbsd
+/// <sys/sysctl.h>): `hz, tick, tickadj, stathz, profhz`. OpenBSD
+/// (generic-openbsd <sys/time.h>): `hz, tick, stathz, profhz` (no tickadj).
+/// `tick` is microseconds per callout tick on both.
+pub const Clockinfo = if (native_os == .openbsd)
+    extern struct {
+        hz: c_int,
+        tick: c_int,
+        stathz: c_int,
+        profhz: c_int,
+    }
+else
+    extern struct {
+        hz: c_int,
+        tick: c_int,
+        tickadj: c_int,
+        stathz: c_int,
+        profhz: c_int,
+    };
 
 /// Reads `kern.clockrate` once; null on other targets or a failed sysctl.
 /// The kqueue timer backend uses `tick` to bound an arm below the kernel's
 /// INT_MAX callout ticks, where `tvtohz` would saturate and fire early.
+/// NetBSD reads via `sysctlbyname`. OpenBSD libc has no `sysctlbyname`, so
+/// the OpenBSD path reads the MIB `{ CTL_KERN, KERN_CLOCKRATE }` via sysctl(2).
 pub fn kernClockrate() ?Clockinfo {
     if (comptime !(native_os == .netbsd or native_os == .openbsd)) return null;
     var ci: Clockinfo = undefined;
     var len: usize = @sizeOf(Clockinfo);
-    if (std.c.sysctlbyname("kern.clockrate", &ci, &len, null, 0) != 0) return null;
+    if (comptime native_os == .openbsd) {
+        var mib = [2]c_int{ 1, 12 }; // CTL_KERN=1, KERN_CLOCKRATE=12
+        if (std.c.sysctl(&mib, 2, &ci, &len, null, 0) != 0) return null;
+    } else {
+        if (std.c.sysctlbyname("kern.clockrate", &ci, &len, null, 0) != 0) return null;
+    }
     if (len != @sizeOf(Clockinfo)) return null;
     return ci;
 }
