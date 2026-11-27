@@ -48,8 +48,9 @@ pub const Shim = shim.Shim;
 /// Builds a `std.Io` over Born's event port. Release the returned interface
 /// with `deinit`. The network client route (`capabilities.network = .born_evented`)
 /// and, on FreeBSD or Linux, the process route (`capabilities.process = .born_evented`)
-/// are serviced by Born's reactor; the file family and the process family on
-/// other targets are rejected at construction. The time family stays Threaded.
+/// are serviced by Born's reactor; the file family (no Born route exists on
+/// any target) and the process family on other targets are rejected at
+/// construction. The time family stays Threaded.
 pub const io = shim.io;
 /// Releases the composite created by `io`. Stops and joins the Born route's
 /// loop thread first, then joins the Threaded pool.
