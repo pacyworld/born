@@ -679,7 +679,7 @@ derived from `src/io/shim.zig` (`base_vtable`, `vtable_table`, the
 the route's documented profile only. Error names in bold are declared
 std error-set members; they are returned, never silently substituted.
 
-| operation family | default (all-Threaded baseline) | `network = .born_evented` | `process = .born_evented` |
+| operation family | default (all-Threaded baseline) | network route: born_evented | process route: born_evented |
 |---|---|---|---|
 | Connect, IP stream TCP (with or without a deadline on any clock) | Threaded | Born | Threaded |
 | Connect, IP non-stream / non-TCP | Threaded | **OptionUnsupported** (declared; never truncated to TCP) | Threaded |
@@ -690,14 +690,14 @@ std error-set members; they are returned, never silently substituted.
 | Socket pairs | Threaded | **OperationUnsupported** (declared) | Threaded |
 | Stream read/write on a Born-owned handle (0.16 `netRead`/`netWrite`; 0.17 `operate` `net_read`/`net_write`) | Threaded | Born | Threaded |
 | Message send/receive, including control buffers | Threaded | **Unexpected** on a Born-owned handle (stream-only profile); Threaded for Threaded-owned handles | Threaded |
-| `netWriteFile` (sendfile) | Threaded | 0.16: read/copy loop through the Born write path; 0.17: **Unimplemented** (declared) | Threaded |
+| netWriteFile (sendfile) | Threaded | 0.16: read/copy loop through the Born write path; 0.17: **Unimplemented** (declared) | Threaded |
 | Close and shutdown (`netClose`/`netShutdown`) | Threaded | Born for Born-owned handles; Threaded for handles owned by Threaded | Threaded |
 | Listen and accept, IP and Unix | Threaded | **Threaded** | Threaded |
 | DNS resolution and interface name lookup (`netLookup`, `netInterfaceNameResolve`, `netInterfaceName`) | Threaded | Threaded | Threaded |
-| `processSpawn`, `processSpawnPath` (0.16), `childWait`, `childKill` | Threaded | Threaded | Born on FreeBSD and Linux; rejected at construction elsewhere; spawn options outside the profile fail with **OperationUnsupported** (empty argv with **Unexpected**) |
-| `sleep`, `now`, `clockResolution` | Threaded | Threaded | Threaded (always; the Born time route was retired, #101) |
+| processSpawn, processSpawnPath (0.16), childWait, childKill | Threaded | Threaded | Born on FreeBSD and Linux; rejected at construction elsewhere; spawn options outside the profile fail with **OperationUnsupported** (empty argv with **Unexpected**) |
+| sleep, now, clockResolution | Threaded | Threaded | Threaded (always; the Born time route was retired, #101) |
 | File and directory I/O, memory maps, locks, timestamps | Threaded | Threaded | Threaded (`file: .born_evented` is rejected at construction) |
-| `async`/`await`/`cancel`, `concurrent`, groups, futex, `random`/`randomSecure`, `crashHandler` | Threaded | Threaded | Threaded |
+| async/await/cancel, concurrent, groups, futex, random/randomSecure, crashHandler | Threaded | Threaded | Threaded |
 | Batch (`batchAwaitAsync`/`batchAwaitConcurrent`, members are net read/write/send/receive) | Threaded | Born provenance gate (network route only): Born-owned members (net read/write/send/receive ops) are moved to completed with their tag result **Unexpected**; the remainder run on Threaded | Threaded |
 
 Two structural facts follow from the table. First, listen and accept stay on
