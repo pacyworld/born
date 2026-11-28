@@ -22,3 +22,30 @@ pub fn unmark() void {
 pub fn isMarked() bool {
     return marked;
 }
+
+test "loop_thread: mark is per-thread, unmark clears it" {
+    const builtin = @import("builtin");
+    const std = @import("std");
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    try std.testing.expect(!isMarked());
+
+    const Probe = struct {
+        fn run(seen: *bool) void {
+            seen.* = isMarked();
+        }
+    };
+
+    mark();
+    try std.testing.expect(isMarked());
+
+    // A fresh thread starts unmarked while this thread is marked.
+    var seen: bool = true;
+    const t = try std.Thread.spawn(.{}, Probe.run, .{&seen});
+    t.join();
+    try std.testing.expect(!seen);
+    try std.testing.expect(isMarked());
+
+    unmark();
+    try std.testing.expect(!isMarked());
+}

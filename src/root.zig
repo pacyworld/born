@@ -125,4 +125,5 @@ test {
     _ = @import("process.zig");
     _ = @import("process_test.zig");
     _ = @import("compat_test.zig");
+    _ = @import("loop_thread.zig");
 }

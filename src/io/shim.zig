@@ -7994,8 +7994,7 @@ test "blocking thunks on a Born loop thread trip the loop-thread guard" {
             fwd.unlockStderr(u);
         }
         fn fileClose_(u: ?*anyopaque) void {
-            // 0xc0000000-open handle of the process pseudo-console is not a
-            // file; close an unopened File whose Handle is a fresh pipe's read end.
+            // Close the read end of a fresh pipe: a real descriptor the test owns.
             var fds: [2]std.c.fd_t = undefined;
             const pipe_rc = std.c.pipe(&fds);
             std.debug.assert(pipe_rc == 0);
