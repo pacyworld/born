@@ -43,6 +43,10 @@ fn mainInit(init: std.process.Init.Minimal) !void {
 }
 
 fn run(alloc: std.mem.Allocator, args: anytype) !void {
+    // This loop driver marks the calling thread as a Born loop; blocking
+    // I/O on it would stall every connection.
+    born.loop_thread.mark();
+    defer born.loop_thread.unmark();
     // Required on epoll before any thread exists; a no-op on kqueue/Windows.
     try born.blockSignals(&.{ .terminate, .interrupt });
 

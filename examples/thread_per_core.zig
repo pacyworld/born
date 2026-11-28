@@ -45,6 +45,10 @@ fn mainInit(init: std.process.Init.Minimal) !void {
 }
 
 fn run(alloc: std.mem.Allocator, args: anytype) !void {
+    // The main thread services the signal port; the workers each run their
+    // own Born loop and mark themselves in echo.Worker.run.
+    born.loop_thread.mark();
+    defer born.loop_thread.unmark();
     // Signals are process-wide and must be blocked in every thread on
     // epoll, so block them in main before spawning workers.
     try born.blockSignals(&.{ .terminate, .interrupt });

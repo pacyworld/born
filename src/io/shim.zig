@@ -815,6 +815,38 @@ fn deadRefuse(comptime call: []const u8, comptime T: type) T {
 /// queue went from empty to non-empty (the only case that needs a wake).
 const SubmitResult = struct { index: u32, was_empty: bool };
 
+/// Interception of the loop-thread guard for tests, mirroring the
+/// `test_dead_panic_hook` seam: installing this hook replaces the abort with a
+/// message record so the guard can be observed without killing the suite.
+var test_loop_guard_hook: ?*const fn (msg: []const u8) void = null;
+
+/// Guard against a Born loop thread entering a blocking I/O call.
+/// Exempt slots never park (they do not wait for Threaded or the reactor):
+/// query/status and pure submission slots. Debug and ReleaseSafe trip;
+/// ReleaseFast elides the check entirely. Returns true when the check
+/// tripped under the test hook, so the caller takes its dead-route refusal
+/// instead of forwarding; in production the check panics instead of
+/// returning.
+fn blockingLoopCheck(comptime caller: []const u8) bool {
+    const exempt = [_][]const u8{
+        "now",                  "clockResolution",    "checkCancel", "random",     "randomSecure",
+        "swapCancelProtection", "async",              "concurrent",  "groupAsync", "groupConcurrent",
+        "crashHandler",         "progressParentFile",
+    };
+    inline for (exempt) |e| {
+        if (comptime std.mem.eql(u8, caller, e)) return false;
+    }
+    if (!compat.asserts_active) return false;
+    if (!compat.isLoopThread()) return false;
+    if (builtin.is_test) {
+        if (test_loop_guard_hook) |hook| {
+            hook("Io." ++ caller ++ " called on a Born loop thread");
+            return true;
+        }
+    }
+    std.debug.panic("Io.{s} called on a Born loop thread", .{caller});
+}
+
 /// The composite carried by the single `Io.userdata` pointer.
 pub const Shim = struct {
     /// Born's event port, created and owned by the shim; `deinit` tears it
@@ -1080,6 +1112,8 @@ pub const Shim = struct {
     /// dispatches connect-deadline timer fires, socket events and child
     /// exits. Retires everything on stop or persistent port failure.
     fn loopMain(self: *Shim) void {
+        compat.loopThreadMark();
+        defer compat.loopThreadUnmark();
         var events: [64]born.Event = undefined;
         var fail_streak: u32 = 0;
         while (!self.stopping.load(.acquire)) {
@@ -3325,6 +3359,7 @@ const fwd = struct {
         start: *const fn (context: *const anyopaque, result: *anyopaque) void,
     ) ?*Io.AnyFuture {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadRefuse("async", ?*Io.AnyFuture);
         if (!self.entryEnter()) return deadRefuse("async", ?*Io.AnyFuture);
         defer self.entryExit();
         return self.threaded_io.vtable.async(self.threaded_io.userdata, result, result_alignment, context, context_alignment, start);
@@ -3338,6 +3373,7 @@ const fwd = struct {
         start: *const fn (context: *const anyopaque, result: *anyopaque) void,
     ) Io.ConcurrentError!*Io.AnyFuture {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.ConcurrentError!*Io.AnyFuture);
         if (!self.entryEnter()) return deadResult(Io.ConcurrentError!*Io.AnyFuture);
         defer self.entryExit();
         return self.threaded_io.vtable.concurrent(self.threaded_io.userdata, result_len, result_alignment, context, context_alignment, start);
@@ -3349,6 +3385,7 @@ const fwd = struct {
         result_alignment: std.mem.Alignment,
     ) void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadRefuse("await", void);
         if (!self.entryEnter()) return deadRefuse("await", void);
         defer self.entryExit();
         return self.threaded_io.vtable.await(self.threaded_io.userdata, any_future, result, result_alignment);
@@ -3360,6 +3397,7 @@ const fwd = struct {
         result_alignment: std.mem.Alignment,
     ) void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadRefuse("cancel", void);
         if (!self.entryEnter()) return deadRefuse("cancel", void);
         defer self.entryExit();
         return self.threaded_io.vtable.cancel(self.threaded_io.userdata, any_future, result, result_alignment);
@@ -3372,6 +3410,7 @@ const fwd = struct {
         start: *const fn (context: *const anyopaque) void,
     ) void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadRefuse("groupAsync", void);
         if (!self.entryEnter()) return deadRefuse("groupAsync", void);
         defer self.entryExit();
         return self.threaded_io.vtable.groupAsync(self.threaded_io.userdata, group, context, context_alignment, start);
@@ -3384,12 +3423,14 @@ const fwd = struct {
         start: *const fn (context: *const anyopaque) void,
     ) Io.ConcurrentError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.ConcurrentError!void);
         if (!self.entryEnter()) return deadResult(Io.ConcurrentError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.groupConcurrent(self.threaded_io.userdata, group, context, context_alignment, start);
     }
     fn groupAwait(userdata: ?*anyopaque, group: *Io.Group, token: *anyopaque) Io.Cancelable!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Cancelable!void);
         if (!self.entryEnter()) return deadResult(Io.Cancelable!void);
         defer self.entryExit();
         return self.threaded_io.vtable.groupAwait(self.threaded_io.userdata, group, token);
@@ -3412,30 +3453,35 @@ const fwd = struct {
     }
     fn recancel(userdata: ?*anyopaque) void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadRefuse("recancel", void);
         if (!self.entryEnter()) return deadRefuse("recancel", void);
         defer self.entryExit();
         return self.threaded_io.vtable.recancel(self.threaded_io.userdata);
     }
     fn swapCancelProtection(userdata: ?*anyopaque, new: Io.CancelProtection) Io.CancelProtection {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadRefuse("swapCancelProtection", Io.CancelProtection);
         if (!self.entryEnter()) return deadRefuse("swapCancelProtection", Io.CancelProtection);
         defer self.entryExit();
         return self.threaded_io.vtable.swapCancelProtection(self.threaded_io.userdata, new);
     }
     fn checkCancel(userdata: ?*anyopaque) Io.Cancelable!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Cancelable!void);
         if (!self.entryEnter()) return deadResult(Io.Cancelable!void);
         defer self.entryExit();
         return self.threaded_io.vtable.checkCancel(self.threaded_io.userdata);
     }
     fn futexWait(userdata: ?*anyopaque, ptr: *const u32, expected: u32, timeout: Io.Timeout) Io.Cancelable!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Cancelable!void);
         if (!self.entryEnter()) return deadResult(Io.Cancelable!void);
         defer self.entryExit();
         return self.threaded_io.vtable.futexWait(self.threaded_io.userdata, ptr, expected, timeout);
     }
     fn futexWaitUncancelable(userdata: ?*anyopaque, ptr: *const u32, expected: u32) void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadRefuse("futexWaitUncancelable", void);
         if (!self.entryEnter()) return deadRefuse("futexWaitUncancelable", void);
         defer self.entryExit();
         return self.threaded_io.vtable.futexWaitUncancelable(self.threaded_io.userdata, ptr, expected);
@@ -3453,18 +3499,21 @@ const fwd = struct {
     }
     fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Cancelable!Io.Operation.Result);
         if (!self.entryEnter()) return deadResult(Io.Cancelable!Io.Operation.Result);
         defer self.entryExit();
         return self.threaded_io.vtable.operate(self.threaded_io.userdata, operation);
     }
     fn batchAwaitAsync(userdata: ?*anyopaque, batch: *Io.Batch) Io.Cancelable!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Cancelable!void);
         if (!self.entryEnter()) return deadResult(Io.Cancelable!void);
         defer self.entryExit();
         return self.threaded_io.vtable.batchAwaitAsync(self.threaded_io.userdata, batch);
     }
     fn batchAwaitConcurrent(userdata: ?*anyopaque, batch: *Io.Batch, timeout: Io.Timeout) Io.Batch.AwaitConcurrentError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Batch.AwaitConcurrentError!void);
         if (!self.entryEnter()) return deadResult(Io.Batch.AwaitConcurrentError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.batchAwaitConcurrent(self.threaded_io.userdata, batch, timeout);
@@ -3486,60 +3535,70 @@ const fwd = struct {
     }
     fn dirCreateDir(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, permissions: Io.Dir.Permissions) Io.Dir.CreateDirError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Dir.CreateDirError!void);
         if (!self.entryEnter()) return deadResult(Io.Dir.CreateDirError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.dirCreateDir(self.threaded_io.userdata, dir, sub_path, permissions);
     }
     fn dirCreateDirPath(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, permissions: Io.Dir.Permissions) Io.Dir.CreateDirPathError!Io.Dir.CreatePathStatus {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Dir.CreateDirPathError!Io.Dir.CreatePathStatus);
         if (!self.entryEnter()) return deadResult(Io.Dir.CreateDirPathError!Io.Dir.CreatePathStatus);
         defer self.entryExit();
         return self.threaded_io.vtable.dirCreateDirPath(self.threaded_io.userdata, dir, sub_path, permissions);
     }
     fn dirCreateDirPathOpen(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, permissions: Io.Dir.Permissions, options: Io.Dir.OpenOptions) Io.Dir.CreateDirPathOpenError!Io.Dir {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Dir.CreateDirPathOpenError!Io.Dir);
         if (!self.entryEnter()) return deadResult(Io.Dir.CreateDirPathOpenError!Io.Dir);
         defer self.entryExit();
         return self.threaded_io.vtable.dirCreateDirPathOpen(self.threaded_io.userdata, dir, sub_path, permissions, options);
     }
     fn dirOpenDir(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, options: Io.Dir.OpenOptions) Io.Dir.OpenError!Io.Dir {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Dir.OpenError!Io.Dir);
         if (!self.entryEnter()) return deadResult(Io.Dir.OpenError!Io.Dir);
         defer self.entryExit();
         return self.threaded_io.vtable.dirOpenDir(self.threaded_io.userdata, dir, sub_path, options);
     }
     fn dirStat(userdata: ?*anyopaque, dir: Io.Dir) Io.Dir.StatError!Io.Dir.Stat {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Dir.StatError!Io.Dir.Stat);
         if (!self.entryEnter()) return deadResult(Io.Dir.StatError!Io.Dir.Stat);
         defer self.entryExit();
         return self.threaded_io.vtable.dirStat(self.threaded_io.userdata, dir);
     }
     fn dirStatFile(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, options: Io.Dir.StatFileOptions) Io.Dir.StatFileError!Io.File.Stat {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Dir.StatFileError!Io.File.Stat);
         if (!self.entryEnter()) return deadResult(Io.Dir.StatFileError!Io.File.Stat);
         defer self.entryExit();
         return self.threaded_io.vtable.dirStatFile(self.threaded_io.userdata, dir, sub_path, options);
     }
     fn dirAccess(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, options: Io.Dir.AccessOptions) Io.Dir.AccessError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Dir.AccessError!void);
         if (!self.entryEnter()) return deadResult(Io.Dir.AccessError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.dirAccess(self.threaded_io.userdata, dir, sub_path, options);
     }
     fn dirCreateFile(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, options: Io.Dir.CreateFileOptions) Io.File.OpenError!Io.File {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.OpenError!Io.File);
         if (!self.entryEnter()) return deadResult(Io.File.OpenError!Io.File);
         defer self.entryExit();
         return self.threaded_io.vtable.dirCreateFile(self.threaded_io.userdata, dir, sub_path, options);
     }
     fn dirCreateFileAtomic(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, options: Io.Dir.CreateFileAtomicOptions) Io.Dir.CreateFileAtomicError!Io.File.Atomic {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Dir.CreateFileAtomicError!Io.File.Atomic);
         if (!self.entryEnter()) return deadResult(Io.Dir.CreateFileAtomicError!Io.File.Atomic);
         defer self.entryExit();
         return self.threaded_io.vtable.dirCreateFileAtomic(self.threaded_io.userdata, dir, sub_path, options);
     }
     fn dirOpenFile(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, options: Io.Dir.OpenFileOptions) Io.File.OpenError!Io.File {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.OpenError!Io.File);
         if (!self.entryEnter()) return deadResult(Io.File.OpenError!Io.File);
         defer self.entryExit();
         return self.threaded_io.vtable.dirOpenFile(self.threaded_io.userdata, dir, sub_path, options);
@@ -3554,102 +3613,119 @@ const fwd = struct {
     }
     fn dirRead(userdata: ?*anyopaque, reader: *Io.Dir.Reader, entries: []Io.Dir.Entry) Io.Dir.Reader.Error!usize {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Dir.Reader.Error!usize);
         if (!self.entryEnter()) return deadResult(Io.Dir.Reader.Error!usize);
         defer self.entryExit();
         return self.threaded_io.vtable.dirRead(self.threaded_io.userdata, reader, entries);
     }
     fn dirRealPath(userdata: ?*anyopaque, dir: Io.Dir, out_buffer: []u8) Io.Dir.RealPathError!usize {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Dir.RealPathError!usize);
         if (!self.entryEnter()) return deadResult(Io.Dir.RealPathError!usize);
         defer self.entryExit();
         return self.threaded_io.vtable.dirRealPath(self.threaded_io.userdata, dir, out_buffer);
     }
     fn dirRealPathFile(userdata: ?*anyopaque, dir: Io.Dir, path_name: []const u8, out_buffer: []u8) Io.Dir.RealPathFileError!usize {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Dir.RealPathFileError!usize);
         if (!self.entryEnter()) return deadResult(Io.Dir.RealPathFileError!usize);
         defer self.entryExit();
         return self.threaded_io.vtable.dirRealPathFile(self.threaded_io.userdata, dir, path_name, out_buffer);
     }
     fn dirDeleteFile(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8) Io.Dir.DeleteFileError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Dir.DeleteFileError!void);
         if (!self.entryEnter()) return deadResult(Io.Dir.DeleteFileError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.dirDeleteFile(self.threaded_io.userdata, dir, sub_path);
     }
     fn dirDeleteDir(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8) Io.Dir.DeleteDirError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Dir.DeleteDirError!void);
         if (!self.entryEnter()) return deadResult(Io.Dir.DeleteDirError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.dirDeleteDir(self.threaded_io.userdata, dir, sub_path);
     }
     fn dirRename(userdata: ?*anyopaque, old_dir: Io.Dir, old_sub_path: []const u8, new_dir: Io.Dir, new_sub_path: []const u8) Io.Dir.RenameError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Dir.RenameError!void);
         if (!self.entryEnter()) return deadResult(Io.Dir.RenameError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.dirRename(self.threaded_io.userdata, old_dir, old_sub_path, new_dir, new_sub_path);
     }
     fn dirRenamePreserve(userdata: ?*anyopaque, old_dir: Io.Dir, old_sub_path: []const u8, new_dir: Io.Dir, new_sub_path: []const u8) Io.Dir.RenamePreserveError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Dir.RenamePreserveError!void);
         if (!self.entryEnter()) return deadResult(Io.Dir.RenamePreserveError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.dirRenamePreserve(self.threaded_io.userdata, old_dir, old_sub_path, new_dir, new_sub_path);
     }
     fn dirSymLink(userdata: ?*anyopaque, dir: Io.Dir, target_path: []const u8, sym_link_path: []const u8, flags: Io.Dir.SymLinkFlags) Io.Dir.SymLinkError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Dir.SymLinkError!void);
         if (!self.entryEnter()) return deadResult(Io.Dir.SymLinkError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.dirSymLink(self.threaded_io.userdata, dir, target_path, sym_link_path, flags);
     }
     fn dirReadLink(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, buffer: []u8) Io.Dir.ReadLinkError!usize {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Dir.ReadLinkError!usize);
         if (!self.entryEnter()) return deadResult(Io.Dir.ReadLinkError!usize);
         defer self.entryExit();
         return self.threaded_io.vtable.dirReadLink(self.threaded_io.userdata, dir, sub_path, buffer);
     }
     fn dirSetOwner(userdata: ?*anyopaque, dir: Io.Dir, uid: ?Io.File.Uid, gid: ?Io.File.Gid) Io.Dir.SetOwnerError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Dir.SetOwnerError!void);
         if (!self.entryEnter()) return deadResult(Io.Dir.SetOwnerError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.dirSetOwner(self.threaded_io.userdata, dir, uid, gid);
     }
     fn dirSetFileOwner(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, uid: ?Io.File.Uid, gid: ?Io.File.Gid, options: Io.Dir.SetFileOwnerOptions) Io.Dir.SetFileOwnerError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Dir.SetFileOwnerError!void);
         if (!self.entryEnter()) return deadResult(Io.Dir.SetFileOwnerError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.dirSetFileOwner(self.threaded_io.userdata, dir, sub_path, uid, gid, options);
     }
     fn dirSetPermissions(userdata: ?*anyopaque, dir: Io.Dir, permissions: Io.Dir.Permissions) Io.Dir.SetPermissionsError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Dir.SetPermissionsError!void);
         if (!self.entryEnter()) return deadResult(Io.Dir.SetPermissionsError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.dirSetPermissions(self.threaded_io.userdata, dir, permissions);
     }
     fn dirSetFilePermissions(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, permissions: Io.File.Permissions, options: Io.Dir.SetFilePermissionsOptions) Io.Dir.SetFilePermissionsError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Dir.SetFilePermissionsError!void);
         if (!self.entryEnter()) return deadResult(Io.Dir.SetFilePermissionsError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.dirSetFilePermissions(self.threaded_io.userdata, dir, sub_path, permissions, options);
     }
     fn dirSetTimestamps(userdata: ?*anyopaque, dir: Io.Dir, sub_path: []const u8, options: Io.Dir.SetTimestampsOptions) Io.Dir.SetTimestampsError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Dir.SetTimestampsError!void);
         if (!self.entryEnter()) return deadResult(Io.Dir.SetTimestampsError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.dirSetTimestamps(self.threaded_io.userdata, dir, sub_path, options);
     }
     fn dirHardLink(userdata: ?*anyopaque, old_dir: Io.Dir, old_sub_path: []const u8, new_dir: Io.Dir, new_sub_path: []const u8, options: Io.Dir.HardLinkOptions) Io.Dir.HardLinkError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Dir.HardLinkError!void);
         if (!self.entryEnter()) return deadResult(Io.Dir.HardLinkError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.dirHardLink(self.threaded_io.userdata, old_dir, old_sub_path, new_dir, new_sub_path, options);
     }
     fn fileStat(userdata: ?*anyopaque, file: Io.File) Io.File.StatError!Io.File.Stat {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.StatError!Io.File.Stat);
         if (!self.entryEnter()) return deadResult(Io.File.StatError!Io.File.Stat);
         defer self.entryExit();
         return self.threaded_io.vtable.fileStat(self.threaded_io.userdata, file);
     }
     fn fileLength(userdata: ?*anyopaque, file: Io.File) Io.File.LengthError!u64 {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.LengthError!u64);
         if (!self.entryEnter()) return deadResult(Io.File.LengthError!u64);
         defer self.entryExit();
         return self.threaded_io.vtable.fileLength(self.threaded_io.userdata, file);
@@ -3664,96 +3740,112 @@ const fwd = struct {
     }
     fn fileWritePositional(userdata: ?*anyopaque, file: Io.File, header: []const u8, data: []const []const u8, splat: usize, offset: u64) Io.File.WritePositionalError!usize {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.WritePositionalError!usize);
         if (!self.entryEnter()) return deadResult(Io.File.WritePositionalError!usize);
         defer self.entryExit();
         return self.threaded_io.vtable.fileWritePositional(self.threaded_io.userdata, file, header, data, splat, offset);
     }
     fn fileWriteFileStreaming(userdata: ?*anyopaque, file: Io.File, header: []const u8, reader: *Io.File.Reader, limit: Io.Limit) Io.File.Writer.WriteFileError!usize {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.Writer.WriteFileError!usize);
         if (!self.entryEnter()) return deadResult(Io.File.Writer.WriteFileError!usize);
         defer self.entryExit();
         return self.threaded_io.vtable.fileWriteFileStreaming(self.threaded_io.userdata, file, header, reader, limit);
     }
     fn fileWriteFilePositional(userdata: ?*anyopaque, file: Io.File, header: []const u8, reader: *Io.File.Reader, limit: Io.Limit, offset: u64) Io.File.WriteFilePositionalError!usize {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.WriteFilePositionalError!usize);
         if (!self.entryEnter()) return deadResult(Io.File.WriteFilePositionalError!usize);
         defer self.entryExit();
         return self.threaded_io.vtable.fileWriteFilePositional(self.threaded_io.userdata, file, header, reader, limit, offset);
     }
     fn fileReadPositional(userdata: ?*anyopaque, file: Io.File, data: []const []u8, offset: u64) Io.File.ReadPositionalError!usize {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.ReadPositionalError!usize);
         if (!self.entryEnter()) return deadResult(Io.File.ReadPositionalError!usize);
         defer self.entryExit();
         return self.threaded_io.vtable.fileReadPositional(self.threaded_io.userdata, file, data, offset);
     }
     fn fileSeekBy(userdata: ?*anyopaque, file: Io.File, relative_offset: i64) Io.File.SeekError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.SeekError!void);
         if (!self.entryEnter()) return deadResult(Io.File.SeekError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.fileSeekBy(self.threaded_io.userdata, file, relative_offset);
     }
     fn fileSeekTo(userdata: ?*anyopaque, file: Io.File, absolute_offset: u64) Io.File.SeekError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.SeekError!void);
         if (!self.entryEnter()) return deadResult(Io.File.SeekError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.fileSeekTo(self.threaded_io.userdata, file, absolute_offset);
     }
     fn fileSync(userdata: ?*anyopaque, file: Io.File) Io.File.SyncError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.SyncError!void);
         if (!self.entryEnter()) return deadResult(Io.File.SyncError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.fileSync(self.threaded_io.userdata, file);
     }
     fn fileIsTty(userdata: ?*anyopaque, file: Io.File) Io.Cancelable!bool {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Cancelable!bool);
         if (!self.entryEnter()) return deadResult(Io.Cancelable!bool);
         defer self.entryExit();
         return self.threaded_io.vtable.fileIsTty(self.threaded_io.userdata, file);
     }
     fn fileEnableAnsiEscapeCodes(userdata: ?*anyopaque, file: Io.File) Io.File.EnableAnsiEscapeCodesError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.EnableAnsiEscapeCodesError!void);
         if (!self.entryEnter()) return deadResult(Io.File.EnableAnsiEscapeCodesError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.fileEnableAnsiEscapeCodes(self.threaded_io.userdata, file);
     }
     fn fileSupportsAnsiEscapeCodes(userdata: ?*anyopaque, file: Io.File) Io.Cancelable!bool {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Cancelable!bool);
         if (!self.entryEnter()) return deadResult(Io.Cancelable!bool);
         defer self.entryExit();
         return self.threaded_io.vtable.fileSupportsAnsiEscapeCodes(self.threaded_io.userdata, file);
     }
     fn fileSetLength(userdata: ?*anyopaque, file: Io.File, length: u64) Io.File.SetLengthError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.SetLengthError!void);
         if (!self.entryEnter()) return deadResult(Io.File.SetLengthError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.fileSetLength(self.threaded_io.userdata, file, length);
     }
     fn fileSetOwner(userdata: ?*anyopaque, file: Io.File, uid: ?Io.File.Uid, gid: ?Io.File.Gid) Io.File.SetOwnerError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.SetOwnerError!void);
         if (!self.entryEnter()) return deadResult(Io.File.SetOwnerError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.fileSetOwner(self.threaded_io.userdata, file, uid, gid);
     }
     fn fileSetPermissions(userdata: ?*anyopaque, file: Io.File, permissions: Io.File.Permissions) Io.File.SetPermissionsError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.SetPermissionsError!void);
         if (!self.entryEnter()) return deadResult(Io.File.SetPermissionsError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.fileSetPermissions(self.threaded_io.userdata, file, permissions);
     }
     fn fileSetTimestamps(userdata: ?*anyopaque, file: Io.File, options: Io.File.SetTimestampsOptions) Io.File.SetTimestampsError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.SetTimestampsError!void);
         if (!self.entryEnter()) return deadResult(Io.File.SetTimestampsError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.fileSetTimestamps(self.threaded_io.userdata, file, options);
     }
     fn fileLock(userdata: ?*anyopaque, file: Io.File, lock: Io.File.Lock) Io.File.LockError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.LockError!void);
         if (!self.entryEnter()) return deadResult(Io.File.LockError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.fileLock(self.threaded_io.userdata, file, lock);
     }
     fn fileTryLock(userdata: ?*anyopaque, file: Io.File, lock: Io.File.Lock) Io.File.LockError!bool {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.LockError!bool);
         if (!self.entryEnter()) return deadResult(Io.File.LockError!bool);
         defer self.entryExit();
         return self.threaded_io.vtable.fileTryLock(self.threaded_io.userdata, file, lock);
@@ -3768,24 +3860,28 @@ const fwd = struct {
     }
     fn fileDowngradeLock(userdata: ?*anyopaque, file: Io.File) Io.File.DowngradeLockError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.DowngradeLockError!void);
         if (!self.entryEnter()) return deadResult(Io.File.DowngradeLockError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.fileDowngradeLock(self.threaded_io.userdata, file);
     }
     fn fileRealPath(userdata: ?*anyopaque, file: Io.File, out_buffer: []u8) Io.File.RealPathError!usize {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.RealPathError!usize);
         if (!self.entryEnter()) return deadResult(Io.File.RealPathError!usize);
         defer self.entryExit();
         return self.threaded_io.vtable.fileRealPath(self.threaded_io.userdata, file, out_buffer);
     }
     fn fileHardLink(userdata: ?*anyopaque, file: Io.File, dir: Io.Dir, sub_path: []const u8, options: Io.File.HardLinkOptions) Io.File.HardLinkError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.HardLinkError!void);
         if (!self.entryEnter()) return deadResult(Io.File.HardLinkError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.fileHardLink(self.threaded_io.userdata, file, dir, sub_path, options);
     }
     fn fileMemoryMapCreate(userdata: ?*anyopaque, file: Io.File, options: Io.File.MemoryMap.CreateOptions) Io.File.MemoryMap.CreateError!Io.File.MemoryMap {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.MemoryMap.CreateError!Io.File.MemoryMap);
         if (!self.entryEnter()) return deadResult(Io.File.MemoryMap.CreateError!Io.File.MemoryMap);
         defer self.entryExit();
         return self.threaded_io.vtable.fileMemoryMapCreate(self.threaded_io.userdata, file, options);
@@ -3804,42 +3900,49 @@ const fwd = struct {
     }
     fn fileMemoryMapSetLength(userdata: ?*anyopaque, map: *Io.File.MemoryMap, length: usize) Io.File.MemoryMap.SetLengthError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.MemoryMap.SetLengthError!void);
         if (!self.entryEnter()) return deadResult(Io.File.MemoryMap.SetLengthError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.fileMemoryMapSetLength(self.threaded_io.userdata, map, length);
     }
     fn fileMemoryMapRead(userdata: ?*anyopaque, map: *Io.File.MemoryMap) Io.File.ReadPositionalError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.ReadPositionalError!void);
         if (!self.entryEnter()) return deadResult(Io.File.ReadPositionalError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.fileMemoryMapRead(self.threaded_io.userdata, map);
     }
     fn fileMemoryMapWrite(userdata: ?*anyopaque, map: *Io.File.MemoryMap) Io.File.WritePositionalError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.File.WritePositionalError!void);
         if (!self.entryEnter()) return deadResult(Io.File.WritePositionalError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.fileMemoryMapWrite(self.threaded_io.userdata, map);
     }
     fn processExecutableOpen(userdata: ?*anyopaque, options: Io.Dir.OpenFileOptions) std.process.OpenExecutableError!Io.File {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(std.process.OpenExecutableError!Io.File);
         if (!self.entryEnter()) return deadResult(std.process.OpenExecutableError!Io.File);
         defer self.entryExit();
         return self.threaded_io.vtable.processExecutableOpen(self.threaded_io.userdata, options);
     }
     fn processExecutablePath(userdata: ?*anyopaque, buffer: []u8) std.process.ExecutablePathError!usize {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(std.process.ExecutablePathError!usize);
         if (!self.entryEnter()) return deadResult(std.process.ExecutablePathError!usize);
         defer self.entryExit();
         return self.threaded_io.vtable.processExecutablePath(self.threaded_io.userdata, buffer);
     }
     fn lockStderr(userdata: ?*anyopaque, mode: ?Io.Terminal.Mode) Io.Cancelable!Io.LockedStderr {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Cancelable!Io.LockedStderr);
         if (!self.entryEnter()) return deadResult(Io.Cancelable!Io.LockedStderr);
         defer self.entryExit();
         return self.threaded_io.vtable.lockStderr(self.threaded_io.userdata, mode);
     }
     fn tryLockStderr(userdata: ?*anyopaque, mode: ?Io.Terminal.Mode) Io.Cancelable!?Io.LockedStderr {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Cancelable!?Io.LockedStderr);
         if (!self.entryEnter()) return deadResult(Io.Cancelable!?Io.LockedStderr);
         defer self.entryExit();
         return self.threaded_io.vtable.tryLockStderr(self.threaded_io.userdata, mode);
@@ -3860,36 +3963,42 @@ const fwd = struct {
     }
     fn processCurrentPath(userdata: ?*anyopaque, buffer: []u8) std.process.CurrentPathError!usize {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(std.process.CurrentPathError!usize);
         if (!self.entryEnter()) return deadResult(std.process.CurrentPathError!usize);
         defer self.entryExit();
         return self.threaded_io.vtable.processCurrentPath(self.threaded_io.userdata, buffer);
     }
     fn processSetCurrentDir(userdata: ?*anyopaque, dir: Io.Dir) std.process.SetCurrentDirError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(std.process.SetCurrentDirError!void);
         if (!self.entryEnter()) return deadResult(std.process.SetCurrentDirError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.processSetCurrentDir(self.threaded_io.userdata, dir);
     }
     fn processSetCurrentPath(userdata: ?*anyopaque, sub_path: []const u8) std.process.SetCurrentPathError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(std.process.SetCurrentPathError!void);
         if (!self.entryEnter()) return deadResult(std.process.SetCurrentPathError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.processSetCurrentPath(self.threaded_io.userdata, sub_path);
     }
     fn processReplace(userdata: ?*anyopaque, options: std.process.ReplaceOptions) std.process.ReplaceError {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(std.process.ReplaceError);
         if (!self.entryEnter()) return deadResult(std.process.ReplaceError);
         defer self.entryExit();
         return self.threaded_io.vtable.processReplace(self.threaded_io.userdata, options);
     }
     fn processSpawn(userdata: ?*anyopaque, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(std.process.SpawnError!std.process.Child);
         if (!self.entryEnter()) return deadResult(std.process.SpawnError!std.process.Child);
         defer self.entryExit();
         return self.threaded_io.vtable.processSpawn(self.threaded_io.userdata, options);
     }
     fn childWait(userdata: ?*anyopaque, child: *std.process.Child) std.process.Child.WaitError!std.process.Child.Term {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(std.process.Child.WaitError!std.process.Child.Term);
         if (!self.entryEnter()) return deadResult(std.process.Child.WaitError!std.process.Child.Term);
         defer self.entryExit();
         return self.threaded_io.vtable.childWait(self.threaded_io.userdata, child);
@@ -3905,60 +4014,70 @@ const fwd = struct {
     }
     fn progressParentFile(userdata: ?*anyopaque) std.Progress.ParentFileError!Io.File {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(std.Progress.ParentFileError!Io.File);
         if (!self.entryEnter()) return deadResult(std.Progress.ParentFileError!Io.File);
         defer self.entryExit();
         return self.threaded_io.vtable.progressParentFile(self.threaded_io.userdata);
     }
     fn now(userdata: ?*anyopaque, clock: Io.Clock) Io.Timestamp {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadRefuse("now", Io.Timestamp);
         if (!self.entryEnter()) return deadRefuse("now", Io.Timestamp);
         defer self.entryExit();
         return self.threaded_io.vtable.now(self.threaded_io.userdata, clock);
     }
     fn clockResolution(userdata: ?*anyopaque, clock: Io.Clock) Io.Clock.ResolutionError!Io.Duration {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Clock.ResolutionError!Io.Duration);
         if (!self.entryEnter()) return deadResult(Io.Clock.ResolutionError!Io.Duration);
         defer self.entryExit();
         return self.threaded_io.vtable.clockResolution(self.threaded_io.userdata, clock);
     }
     fn sleep(userdata: ?*anyopaque, timeout: Io.Timeout) Io.Cancelable!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Cancelable!void);
         if (!self.entryEnter()) return deadResult(Io.Cancelable!void);
         defer self.entryExit();
         return self.threaded_io.vtable.sleep(self.threaded_io.userdata, timeout);
     }
     fn random(userdata: ?*anyopaque, buffer: []u8) void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadRefuse("random", void);
         if (!self.entryEnter()) return deadRefuse("random", void);
         defer self.entryExit();
         return self.threaded_io.vtable.random(self.threaded_io.userdata, buffer);
     }
     fn randomSecure(userdata: ?*anyopaque, buffer: []u8) Io.RandomSecureError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.RandomSecureError!void);
         if (!self.entryEnter()) return deadResult(Io.RandomSecureError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.randomSecure(self.threaded_io.userdata, buffer);
     }
     fn netListenIp(userdata: ?*anyopaque, address: *const Io.net.IpAddress, options: Io.net.IpAddress.ListenOptions) Io.net.IpAddress.ListenError!Io.net.Socket {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.net.IpAddress.ListenError!Io.net.Socket);
         if (!self.entryEnter()) return deadResult(Io.net.IpAddress.ListenError!Io.net.Socket);
         defer self.entryExit();
         return self.threaded_io.vtable.netListenIp(self.threaded_io.userdata, address, options);
     }
     fn netAccept(userdata: ?*anyopaque, server: Io.net.Socket.Handle, options: Io.net.Server.AcceptOptions) Io.net.Server.AcceptError!Io.net.Socket {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.net.Server.AcceptError!Io.net.Socket);
         if (!self.entryEnter()) return deadResult(Io.net.Server.AcceptError!Io.net.Socket);
         defer self.entryExit();
         return self.threaded_io.vtable.netAccept(self.threaded_io.userdata, server, options);
     }
     fn netBindIp(userdata: ?*anyopaque, address: *const Io.net.IpAddress, options: Io.net.IpAddress.BindOptions) Io.net.IpAddress.BindError!Io.net.Socket {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.net.IpAddress.BindError!Io.net.Socket);
         if (!self.entryEnter()) return deadResult(Io.net.IpAddress.BindError!Io.net.Socket);
         defer self.entryExit();
         return self.threaded_io.vtable.netBindIp(self.threaded_io.userdata, address, options);
     }
     fn netConnectIp(userdata: ?*anyopaque, address: *const Io.net.IpAddress, options: Io.net.IpAddress.ConnectOptions) Io.net.IpAddress.ConnectError!Io.net.Socket {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.net.IpAddress.ConnectError!Io.net.Socket);
         if (!self.entryEnter()) return deadResult(Io.net.IpAddress.ConnectError!Io.net.Socket);
         defer self.entryExit();
         // Windows + 0.16: the shim owns connect to keep the CONNECT NTSTATUS
@@ -3968,48 +4087,56 @@ const fwd = struct {
     }
     fn netListenUnix(userdata: ?*anyopaque, address: *const Io.net.UnixAddress, options: Io.net.UnixAddress.ListenOptions) Io.net.UnixAddress.ListenError!Io.net.Socket.Handle {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.net.UnixAddress.ListenError!Io.net.Socket.Handle);
         if (!self.entryEnter()) return deadResult(Io.net.UnixAddress.ListenError!Io.net.Socket.Handle);
         defer self.entryExit();
         return self.threaded_io.vtable.netListenUnix(self.threaded_io.userdata, address, options);
     }
     fn netConnectUnix(userdata: ?*anyopaque, address: *const Io.net.UnixAddress) Io.net.UnixAddress.ConnectError!Io.net.Socket.Handle {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.net.UnixAddress.ConnectError!Io.net.Socket.Handle);
         if (!self.entryEnter()) return deadResult(Io.net.UnixAddress.ConnectError!Io.net.Socket.Handle);
         defer self.entryExit();
         return self.threaded_io.vtable.netConnectUnix(self.threaded_io.userdata, address);
     }
     fn netSocketCreatePair(userdata: ?*anyopaque, options: Io.net.Socket.CreatePairOptions) Io.net.Socket.CreatePairError![2]Io.net.Socket {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.net.Socket.CreatePairError![2]Io.net.Socket);
         if (!self.entryEnter()) return deadResult(Io.net.Socket.CreatePairError![2]Io.net.Socket);
         defer self.entryExit();
         return self.threaded_io.vtable.netSocketCreatePair(self.threaded_io.userdata, options);
     }
     fn netWriteFile(userdata: ?*anyopaque, handle: Io.net.Socket.Handle, header: []const u8, reader: *Io.File.Reader, limit: Io.Limit) Io.net.Stream.Writer.WriteFileError!usize {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.net.Stream.Writer.WriteFileError!usize);
         if (!self.entryEnter()) return deadResult(Io.net.Stream.Writer.WriteFileError!usize);
         defer self.entryExit();
         return self.threaded_io.vtable.netWriteFile(self.threaded_io.userdata, handle, header, reader, limit);
     }
     fn netShutdown(userdata: ?*anyopaque, handle: Io.net.Socket.Handle, how: Io.net.ShutdownHow) Io.net.ShutdownError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.net.ShutdownError!void);
         if (!self.entryEnter()) return deadResult(Io.net.ShutdownError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.netShutdown(self.threaded_io.userdata, handle, how);
     }
     fn netInterfaceNameResolve(userdata: ?*anyopaque, name: *const Io.net.Interface.Name) Io.net.Interface.Name.ResolveError!Io.net.Interface {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.net.Interface.Name.ResolveError!Io.net.Interface);
         if (!self.entryEnter()) return deadResult(Io.net.Interface.Name.ResolveError!Io.net.Interface);
         defer self.entryExit();
         return self.threaded_io.vtable.netInterfaceNameResolve(self.threaded_io.userdata, name);
     }
     fn netInterfaceName(userdata: ?*anyopaque, interface: Io.net.Interface) Io.net.Interface.NameError!Io.net.Interface.Name {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.net.Interface.NameError!Io.net.Interface.Name);
         if (!self.entryEnter()) return deadResult(Io.net.Interface.NameError!Io.net.Interface.Name);
         defer self.entryExit();
         return self.threaded_io.vtable.netInterfaceName(self.threaded_io.userdata, interface);
     }
     fn netLookup(userdata: ?*anyopaque, hostname: Io.net.HostName, queue: *Io.Queue(Io.net.HostName.LookupResult), options: Io.net.HostName.LookupOptions) Io.net.HostName.LookupError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.net.HostName.LookupError!void);
         if (!self.entryEnter()) return deadResult(Io.net.HostName.LookupError!void);
         defer self.entryExit();
         return self.threaded_io.vtable.netLookup(self.threaded_io.userdata, hostname, queue, options);
@@ -4020,18 +4147,21 @@ const fwd = struct {
 const fwd016 = if (!is_017) struct {
     fn processReplacePath(userdata: ?*anyopaque, dir: Io.Dir, options: std.process.ReplaceOptions) std.process.ReplaceError {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(std.process.ReplaceError);
         if (!self.entryEnter()) return deadResult(std.process.ReplaceError);
         defer self.entryExit();
         return self.threaded_io.vtable.processReplacePath(self.threaded_io.userdata, dir, options);
     }
     fn processSpawnPath(userdata: ?*anyopaque, dir: Io.Dir, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(std.process.SpawnError!std.process.Child);
         if (!self.entryEnter()) return deadResult(std.process.SpawnError!std.process.Child);
         defer self.entryExit();
         return self.threaded_io.vtable.processSpawnPath(self.threaded_io.userdata, dir, options);
     }
     fn netSend(userdata: ?*anyopaque, handle: Io.net.Socket.Handle, messages: []Io.net.OutgoingMessage, flags: Io.net.SendFlags) struct { ?Io.net.Socket.SendError, usize } {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return .{ error.Unexpected, 0 };
         if (!self.entryEnter()) return .{ error.Unexpected, 0 };
         defer self.entryExit();
         const result = self.threaded_io.vtable.netSend(self.threaded_io.userdata, handle, messages, flags);
@@ -4048,6 +4178,7 @@ const fwd016 = if (!is_017) struct {
     }
     fn netRead(userdata: ?*anyopaque, src: Io.net.Socket.Handle, data: [][]u8) Io.net.Stream.Reader.Error!usize {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.net.Stream.Reader.Error!usize);
         if (!self.entryEnter()) return deadResult(Io.net.Stream.Reader.Error!usize);
         defer self.entryExit();
         // Windows: recover the sticky terminal state behind error.Unexpected;
@@ -4064,6 +4195,7 @@ const fwd016 = if (!is_017) struct {
     }
     fn netWrite(userdata: ?*anyopaque, dest: Io.net.Socket.Handle, header: []const u8, data: []const []const u8, splat: usize) Io.net.Stream.Writer.Error!usize {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.net.Stream.Writer.Error!usize);
         if (!self.entryEnter()) return deadResult(Io.net.Stream.Writer.Error!usize);
         defer self.entryExit();
         // Windows: recover the sticky terminal state behind error.Unexpected;
@@ -4093,12 +4225,14 @@ const fwd016 = if (!is_017) struct {
 const fwd017 = if (is_017) struct {
     fn inheritParentDir(userdata: ?*anyopaque, handle: Io.Dir.Handle) Io.InheritParentHandleError!Io.Dir {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.InheritParentHandleError!Io.Dir);
         if (!self.entryEnter()) return deadResult(Io.InheritParentHandleError!Io.Dir);
         defer self.entryExit();
         return self.threaded_io.vtable.inheritParentDir(self.threaded_io.userdata, handle);
     }
     fn inheritParentFile(userdata: ?*anyopaque, handle: Io.File.Handle, flags: Io.File.Flags) Io.InheritParentHandleError!Io.File {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.InheritParentHandleError!Io.File);
         if (!self.entryEnter()) return deadResult(Io.InheritParentHandleError!Io.File);
         defer self.entryExit();
         return self.threaded_io.vtable.inheritParentFile(self.threaded_io.userdata, handle, flags);
@@ -4351,6 +4485,7 @@ const base_vtable: Io.VTable = if (is_017) .{
 const process_route = struct {
     fn processSpawn(userdata: ?*anyopaque, options: std.process.SpawnOptions) std.process.SpawnError!std.process.Child {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(std.process.SpawnError!std.process.Child);
         if (!self.entryEnter()) return deadResult(std.process.SpawnError!std.process.Child);
         defer self.entryExit();
         if (self.capabilities.process != .born_evented) {
@@ -4456,6 +4591,7 @@ const process_route = struct {
 
     fn childWait(userdata: ?*anyopaque, child: *std.process.Child) std.process.Child.WaitError!std.process.Child.Term {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(std.process.Child.WaitError!std.process.Child.Term);
         if (!self.entryEnter()) return deadResult(std.process.Child.WaitError!std.process.Child.Term);
         defer self.entryExit();
         if (self.capabilities.process != .born_evented) {
@@ -4774,6 +4910,7 @@ const network_route = struct {
     /// address via getsockname (section 5).
     fn netConnectIp(userdata: ?*anyopaque, address: *const Io.net.IpAddress, options: Io.net.IpAddress.ConnectOptions) Io.net.IpAddress.ConnectError!Io.net.Socket {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.net.IpAddress.ConnectError!Io.net.Socket);
         if (!self.entryEnter()) return deadResult(Io.net.IpAddress.ConnectError!Io.net.Socket);
         defer self.entryExit();
         if (options.mode != .stream) return error.OptionUnsupported;
@@ -4798,6 +4935,7 @@ const network_route = struct {
     /// that later read/write/close dispatch correctly via the provenance gate.
     fn netConnectUnix(userdata: ?*anyopaque, address: *const Io.net.UnixAddress) Io.net.UnixAddress.ConnectError!Io.net.Socket.Handle {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.net.UnixAddress.ConnectError!Io.net.Socket.Handle);
         if (!self.entryEnter()) return deadResult(Io.net.UnixAddress.ConnectError!Io.net.Socket.Handle);
         defer self.entryExit();
         if (is_windows) return error.AddressFamilyUnsupported;
@@ -4822,6 +4960,7 @@ const network_route = struct {
     /// forwards (section 6, Q6).
     fn netShutdown(userdata: ?*anyopaque, handle: Io.net.Socket.Handle, how: Io.net.ShutdownHow) Io.net.ShutdownError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.net.ShutdownError!void);
         if (!self.entryEnter()) return deadResult(Io.net.ShutdownError!void);
         defer self.entryExit();
         const index = switch (self.lookupBorn(handle)) {
@@ -4862,6 +5001,7 @@ const network_route = struct {
     /// for the Born members, never a canceled await.
     fn batchAwaitAsync(userdata: ?*anyopaque, batch: *Io.Batch) Io.Cancelable!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Cancelable!void);
         if (!self.entryEnter()) return deadResult(Io.Cancelable!void);
         defer self.entryExit();
         _ = self.batchPartitionBorn(batch);
@@ -4871,6 +5011,7 @@ const network_route = struct {
 
     fn batchAwaitConcurrent(userdata: ?*anyopaque, batch: *Io.Batch, timeout: Io.Timeout) Io.Batch.AwaitConcurrentError!void {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Batch.AwaitConcurrentError!void);
         if (!self.entryEnter()) return deadResult(Io.Batch.AwaitConcurrentError!void);
         defer self.entryExit();
         _ = self.batchPartitionBorn(batch);
@@ -4885,6 +5026,7 @@ const network_route = struct {
 const net016 = if (!is_017) struct {
     fn netRead(userdata: ?*anyopaque, src: Io.net.Socket.Handle, data: [][]u8) Io.net.Stream.Reader.Error!usize {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.net.Stream.Reader.Error!usize);
         if (!self.entryEnter()) return deadResult(Io.net.Stream.Reader.Error!usize);
         defer self.entryExit();
         const index = switch (self.lookupBorn(src)) {
@@ -4904,6 +5046,7 @@ const net016 = if (!is_017) struct {
 
     fn netWrite(userdata: ?*anyopaque, dest: Io.net.Socket.Handle, header: []const u8, data: []const []const u8, splat: usize) Io.net.Stream.Writer.Error!usize {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.net.Stream.Writer.Error!usize);
         if (!self.entryEnter()) return deadResult(Io.net.Stream.Writer.Error!usize);
         defer self.entryExit();
         const index = switch (self.lookupBorn(dest)) {
@@ -4925,6 +5068,7 @@ const net016 = if (!is_017) struct {
     /// completes with the per-message tag result error.Unexpected (section 8).
     fn netSend(userdata: ?*anyopaque, handle: Io.net.Socket.Handle, messages: []Io.net.OutgoingMessage, flags: Io.net.SendFlags) struct { ?Io.net.Socket.SendError, usize } {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return .{ error.Unexpected, 0 };
         if (!self.entryEnter()) return .{ error.Unexpected, 0 };
         defer self.entryExit();
         if (self.sockClassify(handle) == .absent) return fwd016.netSend(userdata, handle, messages, flags);
@@ -4958,6 +5102,7 @@ const net016 = if (!is_017) struct {
 
     fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Cancelable!Io.Operation.Result);
         if (!self.entryEnter()) return deadResult(Io.Cancelable!Io.Operation.Result);
         defer self.entryExit();
         switch (operation) {
@@ -4976,6 +5121,7 @@ const net016 = if (!is_017) struct {
     /// forwards to Threaded's panicking slot.
     fn netWriteFile(userdata: ?*anyopaque, handle: Io.net.Socket.Handle, header: []const u8, reader: *Io.File.Reader, limit: Io.Limit) Io.net.Stream.Writer.WriteFileError!usize {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.net.Stream.Writer.WriteFileError!usize);
         if (!self.entryEnter()) return deadResult(Io.net.Stream.Writer.WriteFileError!usize);
         defer self.entryExit();
         var written: usize = 0;
@@ -5053,6 +5199,7 @@ const net017 = if (is_017) struct {
 
     fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
         const self = shimFrom(userdata);
+        if (blockingLoopCheck(@src().fn_name)) return deadResult(Io.Cancelable!Io.Operation.Result);
         if (!self.entryEnter()) return deadResult(Io.Cancelable!Io.Operation.Result);
         defer self.entryExit();
         switch (operation) {
@@ -7766,6 +7913,60 @@ test "B1c: infallible value producers take the panic refusal path after deinit (
         defer std.testing.allocator.free(expect);
         try std.testing.expectEqualStrings(expect, msg);
     }
+}
+
+test "blocking thunks on a Born loop thread trip the loop-thread guard" {
+    // Item 4 of #140: a blocking call on a Born loop thread stalls every
+    // connection on the loop, so blocking shim thunks panic in Debug and
+    // ReleaseSafe. The #117-style hook records the message instead of
+    // aborting; the marker must be set on the calling thread.
+    if (!compat.asserts_active) return error.SkipZigTest; // the guard compiles out in ReleaseFast
+    var state: Shim = undefined;
+    testShim(&state);
+    defer testShimDeinit(&state);
+    const ud: ?*anyopaque = @ptrCast(&state);
+
+    const Hook = struct {
+        var captured: ?[]const u8 = null;
+        fn record(msg: []const u8) void {
+            captured = msg;
+        }
+    };
+    test_loop_guard_hook = &Hook.record;
+    defer test_loop_guard_hook = null;
+
+    compat.loopThreadMark();
+    defer compat.loopThreadUnmark();
+
+    const W = struct {
+        fn sleep_(u: ?*anyopaque) void {
+            fwd.sleep(u, .none) catch {};
+        }
+        fn futexWait_(u: ?*anyopaque) void {
+            fwd.futexWait(u, undefined, undefined, .none) catch {};
+        }
+        fn groupAwait_(u: ?*anyopaque) void {
+            fwd.groupAwait(u, undefined, undefined) catch {};
+        }
+    };
+    Hook.captured = null;
+    W.sleep_(ud);
+    try std.testing.expectEqualStrings("Io.sleep called on a Born loop thread", Hook.captured orelse "uncaptured");
+
+    Hook.captured = null;
+    W.futexWait_(ud);
+    try std.testing.expectEqualStrings("Io.futexWait called on a Born loop thread", Hook.captured orelse "uncaptured");
+
+    Hook.captured = null;
+    W.groupAwait_(ud);
+    try std.testing.expectEqualStrings("Io.groupAwait called on a Born loop thread", Hook.captured orelse "uncaptured");
+
+    // An exempt slot on the same marked thread does not trip the guard.
+    Hook.captured = null;
+    _ = fwd.now(ud, .awake);
+    var byte: [1]u8 = .{0};
+    _ = fwd.random(ud, &byte);
+    try std.testing.expectEqual(@as(?[]const u8, null), Hook.captured);
 }
 
 test "close in flight must not let a resolved handle read a recycled fd (#115 poison)" {

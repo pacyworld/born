@@ -673,6 +673,21 @@ connect-deadline timer-arm refusals, slot-table growth failures, process
 arm/flush refusals) are latched and readable via `born_io.loopError(io)`.
 The machinery is documented in `src/io/shim.zig`.
 
+**Loop threads and blocking calls.** A Born-native loop driver marks its
+loop thread at start and clears the mark at exit (`born.loop_thread.mark()`
+/ `born.loop_thread.unmark()`; `born.loop_thread.isMarked()`
+inspects). The `born.io` shim's loop thread marks itself the same way, and
+the Born-native example loop drivers do too. A blocking I/O call on a
+marked thread stalls every connection the loop services, so in Debug and
+ReleaseSafe every blocking shim thunk panics naming the call
+(`Io.<call> called on a Born loop thread`). Non-blocking slots (now,
+clockResolution, random/randomSecure, checkCancel, swapCancelProtection,
+the async/concurrent spawning slots, crashHandler and progressParentFile)
+never park and stay callable. ReleaseFast elides the check. The marker is
+internal, not a stable API: use only `mark`, `unmark` and `isMarked`, and
+clear it on loop thread exit wherever the thread can be rejoined and
+reused.
+
 Operation routing, every family against every route setting. Every cell is
 derived from `src/io/shim.zig` (`base_vtable`, `vtable_table`, the
 `network_route`/`process_route` thunks and the toolchain-specific

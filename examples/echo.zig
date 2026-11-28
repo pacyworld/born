@@ -471,6 +471,8 @@ pub const Worker = struct {
     }
 
     fn run(self: *Worker) void {
+        born.loop_thread.mark();
+        defer born.loop_thread.unmark();
         self.setup() catch |err| {
             self.last_error = err;
             self.failed.store(true, .release);
