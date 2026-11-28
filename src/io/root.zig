@@ -117,7 +117,7 @@ test "module exposes the pinned interface shape" {
         assert.verify();
         if (@TypeOf(baseline_vtable) != std.Io.VTable)
             @compileError("baseline_vtable is not an Io.VTable");
-        if (@TypeOf(io) != fn (*born.EvPort, InitOptions) InitError!std.Io)
+        if (@TypeOf(io) != fn (InitOptions) InitError!std.Io)
             @compileError("io constructor signature drifted");
     }
 }

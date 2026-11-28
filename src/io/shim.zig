@@ -159,6 +159,11 @@ pub const InitOptions = struct {
 pub const InitError = error{
     OutOfMemory,
     CapabilityUnsupported,
+    /// The shim's own event port could not be created (the kernel refused
+    /// the reactor or its wake source, or the port bookkeeping allocation
+    /// failed). Only reachable when the shim creates the port, never from a
+    /// caller-supplied one (there is none).
+    SystemResources,
     /// A Born route's loop thread could not be spawned
     /// (`std.Thread.SpawnError`: thread quota, system resources, memory).
     /// Distinct from `OutOfMemory`, which reports composite/pool allocation.
@@ -806,9 +811,10 @@ const SubmitResult = struct { index: u32, was_empty: bool };
 
 /// The composite carried by the single `Io.userdata` pointer.
 pub const Shim = struct {
-    /// Born's event port. With a Born route enabled the loop thread is its
-    /// sole driver; the baseline leaves it untouched.
-    port: *born.EvPort,
+    /// Born's event port, created and owned by the shim; `deinit` tears it
+    /// down. With a Born route enabled the loop thread is its sole driver;
+    /// the baseline leaves it untouched.
+    port: born.EvPort,
     allocator: std.mem.Allocator,
     capabilities: Capabilities,
     threaded: Io.Threaded,
@@ -937,6 +943,12 @@ pub const Shim = struct {
     /// unit). Reset by the flush. The flush check is guarded by
     /// `builtin.is_test`, so the hook is comptime-dead outside test builds.
     test_flush_fault: bool = false,
+    /// Test-only fault injection: when true, the loop's `port.wait` calls
+    /// report failure without touching the port, driving the failure exit
+    /// (netRetireAll stopped=false) so parked ops retire as route_dead.
+    /// Persistent, not consumed: the loop exits after `wait_fail_limit`
+    /// consecutive failures. Comptime-dead outside test builds.
+    test_wait_fault: bool = false,
 
     /// Test-only fault injection: when non-null, procRetireOp overwrites the
     /// retiring node's slot_index with this value right after the terminal
@@ -1076,7 +1088,14 @@ pub const Shim = struct {
             self.netArmBatch(net_batch);
             const proc_batch = self.procDrainLocked();
             self.procArmBatch(proc_batch);
-            const n = self.port.wait(&events, null) catch |err| {
+            var n: usize = undefined;
+            if (builtin.is_test and self.test_wait_fault) {
+                self.latch(error.WaitFailed);
+                fail_streak += 1;
+                if (fail_streak >= wait_fail_limit) break;
+                continue;
+            }
+            n = self.port.wait(&events, null) catch |err| {
                 self.latch(err);
                 fail_streak += 1;
                 if (fail_streak >= wait_fail_limit) break;
@@ -1869,13 +1888,13 @@ pub const Shim = struct {
         const start_err: ?NetError = blk: {
             switch (c.target) {
                 .ip => |addr| {
-                    state.plain.startConnectAddrInto(addr, self.port, udata) catch |err| break :blk switch (err) {
+                    state.plain.startConnectAddrInto(addr, &self.port, udata) catch |err| break :blk switch (err) {
                         error.ConnectFailed => NetError.connect_refused,
                         error.SocketError => NetError.connect_setup,
                     };
                 },
                 .unix => |path| {
-                    state.plain.startConnectUnixInto(self.allocator, path, self.port, udata) catch |err| break :blk switch (err) {
+                    state.plain.startConnectUnixInto(self.allocator, path, &self.port, udata) catch |err| break :blk switch (err) {
                         error.ConnectFailed => NetError.unix_refused,
                         error.SocketError => NetError.unix_setup,
                         error.NameTooLong => NetError.unix_name_too_long,
@@ -3064,16 +3083,18 @@ pub fn clampTimerNs(remaining_ns: u64) u64 {
 }
 
 /// Builds a `std.Io` over Born's event port. The returned interface owns a
-/// heap-allocated composite; release it with `deinit`. A Born route
+/// heap-allocated composite, including its event port; release it with
+/// `deinit`. One instance per core is the intended shape: each instance
+/// carries its own port, loop thread and slot tables. A Born route
 /// (`capabilities.network` or `.process = .born_evented`) spawns the
-/// loop thread and services that family on Born; the caller must
-/// not drive the port itself afterwards. `sleep`, `now` and `clockResolution`
-/// always delegate to Threaded. The network route services the client path (IP and pathname
-/// Unix connect, stream read/write, close, shutdown); the process route
-/// (FreeBSD and Linux only) services `processSpawn`, `childWait` and `childKill`.
-/// The file family and the process family on other targets are rejected at
-/// construction, never silently delegated.
-pub fn io(port: *born.EvPort, opts: InitOptions) InitError!Io {
+/// loop thread and services that family on Born; `sleep`, `now` and
+/// `clockResolution` always delegate to Threaded. The network route services
+/// the client path (IP and pathname Unix connect, stream read/write, close,
+/// shutdown); the process route (FreeBSD and Linux only) services
+/// `processSpawn`, `childWait` and `childKill`. The file family and the
+/// process family on other targets are rejected at construction, never
+/// silently delegated.
+pub fn io(opts: InitOptions) InitError!Io {
     const caps = opts.capabilities;
     if (caps.file == .born_evented)
         return error.CapabilityUnsupported;
@@ -3088,12 +3109,13 @@ pub fn io(port: *born.EvPort, opts: InitOptions) InitError!Io {
     const shim = opts.allocator.create(Shim) catch return error.OutOfMemory;
     errdefer opts.allocator.destroy(shim);
     shim.* = .{
-        .port = port,
+        .port = born.EvPort.init(opts.allocator) catch return error.SystemResources,
         .allocator = opts.allocator,
         .capabilities = caps,
         .threaded = Io.Threaded.init(opts.allocator, opts.threaded),
         .threaded_io = undefined,
     };
+    errdefer shim.port.deinit();
     shim.threaded_io = shim.threaded.io();
     errdefer shim.threaded.deinit();
     if (net_born or proc_born) {
@@ -3156,6 +3178,7 @@ pub fn deinit(interface: Io) void {
     shim.registryDeinit();
     shim.procFreeChunks();
     shim.childRegistryDeinit();
+    shim.port.deinit();
     allocator.destroy(shim);
 }
 
@@ -3164,6 +3187,14 @@ pub fn deinit(interface: Io) void {
 pub fn testParkHook(interface: Io, hook: ?*std.atomic.Value(u32)) void {
     if (!builtin.is_test) return;
     shimFrom(interface.userdata).test_net_parked.store(if (hook) |h| @intFromPtr(h) else 0, .release);
+}
+
+/// Test-only: make every subsequent port.wait in the loop fail, driving the
+/// failure exit (route_dead retires as Unexpected). Comptime-dead outside
+/// test builds.
+pub fn testFailWait(interface: Io) void {
+    if (!builtin.is_test) return;
+    shimFrom(interface.userdata).test_wait_fault = true;
 }
 
 /// The first route-level failure latched by any Born route: a port `wait`
@@ -5172,6 +5203,12 @@ fn testShim(state: *Shim) void {
         .threaded_io = undefined,
     };
     state.threaded_io = state.threaded.io();
+    state.port = born.EvPort.init(std.testing.allocator) catch @panic("test port create failed");
+}
+
+fn testShimDeinit(state: *Shim) void {
+    state.threaded.deinit();
+    state.port.deinit();
 }
 
 // ------------------------------------------- network mechanism units (P5.3) ----
@@ -5199,7 +5236,7 @@ fn testHandle(n: usize) born.Handle {
 test "net submit reports only the empty-to-non-empty transition" {
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     try testNetGrow(&state, 1);
     defer state.netFreeChunks();
 
@@ -5227,7 +5264,7 @@ test "idle gate: a submission racing the emptiness check drains on the next cycl
     // production guarantee that a skipped drain is followed by another cycle.
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     try testNetGrow(&state, 1);
     defer state.netFreeChunks();
 
@@ -5270,7 +5307,7 @@ test "idle gate: concurrent submissions are never lost across emptiness checks" 
     // fail loudly instead of hanging.
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     try testNetGrow(&state, 4);
     defer state.netFreeChunks();
 
@@ -5314,7 +5351,7 @@ test "idle gate: concurrent submissions are never lost across emptiness checks" 
 test "net cancel request skips a retired slot and refuses a double push" {
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     try testNetGrow(&state, 1);
     defer state.netFreeChunks();
 
@@ -5347,7 +5384,7 @@ test "net retired slot pending a cancel entry is not reallocated until drained" 
     // frees it for reuse. Deterministic: no loop thread, no socket.
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     try testNetGrow(&state, 1);
     defer state.netFreeChunks();
 
@@ -5377,7 +5414,7 @@ test "net retired slot pending a cancel entry is not reallocated until drained" 
 test "net slot table grows in non-moving chunks up to the ceiling" {
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     defer state.netFreeChunks();
     try testNetGrow(&state, 1);
     const first = state.netSlotAt(0);
@@ -5400,7 +5437,7 @@ test "net slot table grows in non-moving chunks up to the ceiling" {
 test "registry maps handles to indices and unregisters conditionally" {
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     try state.registryInit();
     defer state.registryDeinit();
 
@@ -5454,7 +5491,7 @@ test "stale socket events drop without touching the pending op" {
     // ceiling must drop before any access to the caller's node or socket.
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     try state.registryInit();
     defer state.registryDeinit();
 
@@ -5491,12 +5528,10 @@ test "connect deadline fire retires Timeout and frees the socket (POSIX)" {
     // Windows drain unit below; this unit covers the POSIX purge-before-deinit
     // retire on a real unconnected socket.
     if (is_windows) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
-    state.port = &port;
+    defer testShimDeinit(&state);
+
     try testNetGrow(&state, 1);
     defer state.netFreeChunks();
     try state.registryInit();
@@ -5518,7 +5553,7 @@ test "connect deadline fire retires Timeout and frees the socket (POSIX)" {
     state.netSlotAt(op.slot_index).op = &op;
     s.pending_connect = &op;
     // Arm a real far-future deadline timer so the retire path cancels it.
-    try port.addTimer(net_timer_id_base + op.slot_index, netTimerUdata(index, s.generation), 60_000 * std.time.ns_per_ms, .once);
+    try state.port.addTimer(net_timer_id_base + op.slot_index, netTimerUdata(index, s.generation), 60_000 * std.time.ns_per_ms, .once);
     s.deadline_armed = true;
 
     // The deadline fires: Timeout retire (not canceled), socket closed and
@@ -5547,12 +5582,10 @@ test "connect deadline fire drains the pending ConnectEx before freeing (Windows
     // mutation) leaves the aborted completion unabsorbed and fails the
     // occupied assertion below.
     if (!is_windows) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
-    state.port = &port;
+    defer testShimDeinit(&state);
+
     try testNetGrow(&state, 1);
     defer state.netFreeChunks();
     try state.registryInit();
@@ -5581,7 +5614,7 @@ test "connect deadline fire drains the pending ConnectEx before freeing (Windows
     s.deadline_armed = false;
     s.plain = .{};
     const udata = slotUdata(index, s.generation);
-    try s.plain.startConnectAddrInto(target, &port, udata);
+    try s.plain.startConnectAddrInto(target, &state.port, udata);
     s.handle = s.plain.handle();
     try state.registerHandle(s.handle, index);
     try std.testing.expectEqual(@as(usize, 1), s.plain.pendingOps());
@@ -5590,7 +5623,7 @@ test "connect deadline fire drains the pending ConnectEx before freeing (Windows
     op.slot_index = try state.netAllocSlotLocked();
     state.netSlotAt(op.slot_index).op = &op;
     s.pending_connect = &op;
-    try port.addTimer(net_timer_id_base + op.slot_index, netTimerUdata(index, s.generation), 60_000 * std.time.ns_per_ms, .once);
+    try state.port.addTimer(net_timer_id_base + op.slot_index, netTimerUdata(index, s.generation), 60_000 * std.time.ns_per_ms, .once);
     s.deadline_armed = true;
 
     // The deadline fires while ConnectEx is pending: Timeout retire (not
@@ -5615,7 +5648,7 @@ test "connect deadline fire drains the pending ConnectEx before freeing (Windows
     var events: [8]born.Event = undefined;
     var guard: u32 = 0;
     while (s.occupied and guard < 100) : (guard += 1) {
-        const n = try port.wait(&events, 100);
+        const n = try state.port.wait(&events, 100);
         for (events[0..n]) |ev| {
             if (ev.timer or ev.wake) continue;
             state.socketEvent(ev);
@@ -5634,12 +5667,10 @@ test "registryCloseAll drains two sockets' completions to their owners (Windows)
     // pendingOps != 0 after a 100 s guard. The two-phase drain (cancel all, then
     // dispatch through socketEvent with no timeout) frees both promptly.
     if (!is_windows) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
-    state.port = &port;
+    defer testShimDeinit(&state);
+
     try testNetGrow(&state, 1);
     defer state.netFreeChunks();
     try state.registryInit();
@@ -5667,7 +5698,7 @@ test "registryCloseAll drains two sockets' completions to their owners (Windows)
         s.read_armed = false;
         s.write_armed = false;
         s.deadline_armed = false;
-        try s.plain.startConnectAddrInto(target, &port, slotUdata(index.*, s.generation));
+        try s.plain.startConnectAddrInto(target, &state.port, slotUdata(index.*, s.generation));
         s.handle = s.plain.handle();
         try state.registerHandle(s.handle, index.*);
         peers[i] = try server.accept(fio);
@@ -5676,7 +5707,7 @@ test "registryCloseAll drains two sockets' completions to their owners (Windows)
         var events: [8]born.Event = undefined;
         var guard: u32 = 0;
         while (!s.plain.connect_done and guard < 100) : (guard += 1) {
-            const n = try port.wait(&events, 100);
+            const n = try state.port.wait(&events, 100);
             for (events[0..n]) |ev| {
                 if (ev.timer or ev.wake) continue;
                 state.socketEvent(ev);
@@ -5719,7 +5750,7 @@ test "net submit refusal and loop-exit retirement distinguish route_dead from ca
     // op whose submitter requested cancellation stays canceled.
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     try testNetGrow(&state, 1);
     defer state.netFreeChunks();
     try state.registryInit();
@@ -5770,12 +5801,10 @@ test "close retires parked ops as route_dead, not the caller's Canceled (#106)" 
     // connection; the full close path on every kernel is covered by the
     // net_test close contract, and the Windows drain by registryCloseAll.
     if (is_windows) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
-    state.port = &port;
+    defer testShimDeinit(&state);
+
     try testNetGrow(&state, 1);
     defer state.netFreeChunks();
     try state.registryInit();
@@ -5846,7 +5875,7 @@ test "close retires parked ops as route_dead, not the caller's Canceled (#106)" 
 test "registryDeinit frees the chunk table on a clean drain" {
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     try state.registryInit();
     try std.testing.expect(state.registry.chunks[0].load(.monotonic) != null);
     state.registryDeinit();
@@ -5862,7 +5891,7 @@ test "failed exit drain latches and leaks the chunk table (#106)" {
     // flag must fail (a freed chunk's published pointer is nulled).
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     try state.registryInit();
     const chunk = state.registry.chunks[0].load(.monotonic).?;
     const free_head = chunk.socks[0].next_free;
@@ -5883,7 +5912,7 @@ test "concurrent read or write on a parked op is rejected busy, not orphaned" {
     // It retires busy (mapped to Unexpected); the parked op stays pending.
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     try testNetGrow(&state, 1);
     defer state.netFreeChunks();
     try state.registryInit();
@@ -5930,7 +5959,7 @@ test "concurrent read or write on a parked op is rejected busy, not orphaned" {
 test "batch partition detaches Born members with tag Unexpected, keeps Threaded" {
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     try state.registryInit();
     defer state.registryDeinit();
 
@@ -6108,7 +6137,7 @@ test "proc submit reports only the empty-to-non-empty transition" {
     if (comptime !process_supported) return error.SkipZigTest;
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     defer state.procFreeChunks();
 
     var a: ProcOp = .{ .kind = .arm };
@@ -6135,7 +6164,7 @@ test "idle gate: a proc submission racing the emptiness check drains on the next
     if (comptime !process_supported) return error.SkipZigTest;
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     defer state.procFreeChunks();
 
     try std.testing.expectEqual(@as(?*ProcOp, null), state.procDrainLocked());
@@ -6155,7 +6184,7 @@ test "proc cancel request skips a retired slot and refuses a double push" {
     if (comptime !process_supported) return error.SkipZigTest;
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     try testProcGrow(&state, 1);
     defer state.procFreeChunks();
 
@@ -6192,7 +6221,7 @@ test "proc retirement snapshots the slot index before the terminal store" {
     if (comptime !process_supported) return error.SkipZigTest;
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     try testProcGrow(&state, 1);
     defer state.procFreeChunks();
 
@@ -6218,7 +6247,7 @@ test "proc retirement under frame reuse leaves other slots occupied" {
     if (comptime !process_supported) return error.SkipZigTest;
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     try testProcGrow(&state, 1);
     defer state.procFreeChunks();
 
@@ -6245,7 +6274,7 @@ test "proc retired slot pending a cancel entry is not reallocated until drained"
     if (comptime !process_supported) return error.SkipZigTest;
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     try testProcGrow(&state, 1);
     defer state.procFreeChunks();
 
@@ -6276,7 +6305,7 @@ test "proc slot table grows in non-moving chunks up to the ceiling" {
     if (comptime !process_supported) return error.SkipZigTest;
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     defer state.procFreeChunks();
     try testProcGrow(&state, 1);
     const first = state.procSlotAt(0);
@@ -6317,7 +6346,7 @@ test "child reservation bumps generation; a stale exit cannot complete a new occ
     if (comptime !process_supported) return error.SkipZigTest;
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     try state.childRegistryInit();
     defer state.childRegistryDeinit();
 
@@ -6345,7 +6374,7 @@ test "child provenance lookup hits a published child and misses once unpublished
     if (comptime !process_supported) return error.SkipZigTest;
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     try state.childRegistryInit();
     defer state.childRegistryDeinit();
 
@@ -6376,12 +6405,10 @@ test "childCleanup closes a local copy, not a reused slot (#114)" {
     // through the slot (child.child.close(), as on master) must fail the
     // closed-first-descriptor and intact-second-handle assertions.
     if (comptime !process_supported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
-    state.port = &port;
+    defer testShimDeinit(&state);
+
     try state.childRegistryInit();
     defer state.childRegistryDeinit();
     defer state.procFreeChunks();
@@ -6452,7 +6479,7 @@ test "child reservation refuses at the registry ceiling with SystemResources" {
     if (comptime !process_supported) return error.SkipZigTest;
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     try state.childRegistryInit();
     defer state.childRegistryDeinit();
     while (state.child_registry.chunk_count < max_child_chunks) try state.childGrowLocked();
@@ -6467,7 +6494,7 @@ test "child registry growth reports OutOfMemory on allocator refusal" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     state.allocator = failing.allocator();
     defer state.childRegistryDeinit();
     try std.testing.expectError(error.OutOfMemory, state.childRegistryInit());
@@ -6480,7 +6507,7 @@ test "cross-route error attribution: the process tag decides the registry" {
     if (comptime !process_supported) return error.SkipZigTest;
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     try state.childRegistryInit();
     defer state.childRegistryDeinit();
 
@@ -6519,12 +6546,10 @@ test "synchronous arm confirms the exit watch and a fast exit latches for the wa
     // zero-timeout flush). The FreeBSD NOTE_EXIT registration delivery is
     // required evidence. A fast-exiting child's exit is latched for the wait.
     if (comptime !process_supported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
-    state.port = &port;
+    defer testShimDeinit(&state);
+
     try state.childRegistryInit();
     defer state.childRegistryDeinit();
     defer state.procFreeChunks();
@@ -6546,7 +6571,7 @@ test "synchronous arm confirms the exit watch and a fast exit latches for the wa
     // Harvest the exit if the arm flush did not already latch it.
     if (child.exit == null and !child.exit_failed) {
         var events: [8]born.Event = undefined;
-        const n = try port.wait(&events, 2000);
+        const n = try state.port.wait(&events, 2000);
         for (events[0..n]) |ev| state.dispatchEvent(ev);
     }
     try std.testing.expect(child.exit != null);
@@ -6570,12 +6595,10 @@ test "arm watchProcess refusal retires arm_failed and the kill drain cleans up" 
     // drives armFailedCleanup. Mutation: returning the child after an arm
     // refusal, or retiring the arm before the flush confirmation, must fail.
     if (comptime !process_supported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
-    state.port = &port;
+    defer testShimDeinit(&state);
+
     try state.childRegistryInit();
     defer state.childRegistryDeinit();
     defer state.procFreeChunks();
@@ -6629,12 +6652,10 @@ test "arm flush wait failure marks arm_failed and the kill drain cleans up" {
     // Mutation: retiring .arm_failed without setting child.arm_failed must
     // fail (the kill op would park forever).
     if (comptime !process_supported or !is_freebsd) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
-    state.port = &port;
+    defer testShimDeinit(&state);
+
     try state.childRegistryInit();
     defer state.childRegistryDeinit();
     defer state.procFreeChunks();
@@ -6683,12 +6704,10 @@ test "synthetic EV_ERROR while arming marks arm_failed; flush retires failed" {
     // itself succeeded, and the cleanup kill op drives armFailedCleanup.
     // Synthetic event injection mirrors the stolen-reap unit's dispatchEvent.
     if (comptime !process_supported or !is_freebsd) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
-    state.port = &port;
+    defer testShimDeinit(&state);
+
     try state.childRegistryInit();
     defer state.childRegistryDeinit();
     defer state.procFreeChunks();
@@ -6738,7 +6757,7 @@ test "dead-loop kill reaps a running child via wait6/waitid with no zombie" {
     if (comptime !process_supported) return error.SkipZigTest;
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     try state.childRegistryInit();
     defer state.childRegistryDeinit();
     defer state.procFreeChunks();
@@ -6765,12 +6784,10 @@ test "abandoned wait keeps the child running; the loop reaps it on exit" {
     // its exit arrives. Mutation: reverting to kill-on-cancel must fail the
     // "still running after the canceled wait" assertion.
     if (comptime !process_supported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
-    state.port = &port;
+    defer testShimDeinit(&state);
+
     try state.childRegistryInit();
     defer state.childRegistryDeinit();
     defer state.procFreeChunks();
@@ -6809,7 +6826,7 @@ test "abandoned wait keeps the child running; the loop reaps it on exit" {
     // Trigger the exit and harvest it: the loop reaps the abandoned child.
     bc.kill(compat.signalNumber(std.posix.SIG.TERM)) catch {};
     var events: [8]born.Event = undefined;
-    const n = try port.wait(&events, 2000);
+    const n = try state.port.wait(&events, 2000);
     for (events[0..n]) |ev| state.dispatchEvent(ev);
     try std.testing.expect(!state.childAt(r.index).?.occupied);
 }
@@ -6818,12 +6835,10 @@ test "deinit kills a still-running abandoned child" {
     // R2 teardown: a canceled wait left the child running and abandoned;
     // childRegistryCloseAll (deinit, after the loop joins) SIGKILLs and reaps it.
     if (comptime !process_supported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
-    state.port = &port;
+    defer testShimDeinit(&state);
+
     try state.childRegistryInit();
     defer state.childRegistryDeinit();
     defer state.procFreeChunks();
@@ -6868,12 +6883,10 @@ test "a stolen reap latches wait_failed, completing a parked wait with Unexpecte
     // Failure latch: a tagged error after the arm (stolen reap, port failure)
     // latches exit_failed and completes a parked wait as wait_failed, not a hang.
     if (comptime !process_supported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
-    state.port = &port;
+    defer testShimDeinit(&state);
+
     try state.childRegistryInit();
     defer state.childRegistryDeinit();
     defer state.procFreeChunks();
@@ -6901,12 +6914,10 @@ test "kill drain collects the exit and releases the slot" {
     // it and tears down (7). Mutation: reverting to signal-only without exit
     // collection (skip childCleanup in killFinish) must fail this.
     if (comptime !process_supported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
-    state.port = &port;
+    defer testShimDeinit(&state);
+
     try state.childRegistryInit();
     defer state.childRegistryDeinit();
     defer state.procFreeChunks();
@@ -6931,7 +6942,7 @@ test "kill drain collects the exit and releases the slot" {
     // Caller SIGTERM through the descriptor; harvest the exit.
     bc.kill(compat.signalNumber(std.posix.SIG.TERM)) catch {};
     var events: [8]born.Event = undefined;
-    const n = try port.wait(&events, 2000);
+    const n = try state.port.wait(&events, 2000);
     for (events[0..n]) |ev| state.dispatchEvent(ev);
     try std.testing.expectEqual(@as(u32, 1), k.state.load(.acquire));
     try std.testing.expectEqual(@as(?ProcError, null), k.result.err);
@@ -6945,9 +6956,7 @@ test "public spawn refuses at the registry ceiling with SystemResources, no chil
     // reservations below are slot-only (handle sentinel -1, no descriptor); they
     // are released before deinit so close-all never purges a fake handle.
     if (comptime !process_supported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const interface = try io(&port, .{
+    const interface = try io(.{
         .allocator = std.testing.allocator,
         .capabilities = .{ .process = .born_evented },
     });
@@ -6984,9 +6993,7 @@ test "public spawn reports OutOfMemory on registry growth refusal, no child" {
     // that growth allocation (forwarding the spawn arena's requests), so spawn
     // returns OutOfMemory before any fork; no chunk grows, no child is published.
     if (comptime !process_supported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const interface = try io(&port, .{
+    const interface = try io(.{
         .allocator = std.testing.allocator,
         .capabilities = .{ .process = .born_evented },
     });
@@ -7029,12 +7036,10 @@ test "close defers while a consumer holds the socket, then finalizes on drain (#
     // waits for the hold to release, then retires atomically. POSIX unit; the
     // threaded race itself is the net_test close contract plus stress.
     if (is_windows) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
-    state.port = &port;
+    defer testShimDeinit(&state);
+
     try testNetGrow(&state, 1);
     defer state.netFreeChunks();
     try state.registryInit();
@@ -7098,12 +7103,10 @@ test "a reused socket slot starts with clean teardown state (#115)" {
     // sockFreeLocked must reset closing/users/pending_close: a stale `closing`
     // would make the next closeDrive early-return and strand its parked ops.
     if (is_windows) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
-    state.port = &port;
+    defer testShimDeinit(&state);
+
     try testNetGrow(&state, 1);
     defer state.netFreeChunks();
     try state.registryInit();
@@ -7158,7 +7161,7 @@ test "a reused socket slot starts with clean teardown state (#115)" {
 test "entry gate refuses consumer thunks once closing and drains to zero (#113)" {
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
 
     // A consumer claims a slot; the count rises.
     try std.testing.expect(state.entryEnter());
@@ -7180,7 +7183,7 @@ test "B1a: error-bearing thunks refuse with a dead error after the gate closes (
     // Post-gate the refusal returns before any forward, so the count stays zero.
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     state.entryCloseAndDrain();
     const ud: ?*anyopaque = @ptrCast(&state);
 
@@ -7202,7 +7205,7 @@ test "B1b: a release thunk still forwards after the gate closes (#117)" {
     // runs: a waiter on `word` is woken by a post-gate futexWake.
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     const ud: ?*anyopaque = @ptrCast(&state);
     var word: std.atomic.Value(u32) = .init(0);
 
@@ -7229,7 +7232,7 @@ test "B1b: futexWake during deinit drains a counted waiter without hanging (#117
     // the test instead of hanging the suite.
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     const ud: ?*anyopaque = @ptrCast(&state);
     const tio = state.threaded_io;
     var word: std.atomic.Value(u32) = .init(0);
@@ -7295,7 +7298,7 @@ test "B1b: drain-window unlockStderr releases a counted lockStderr waiter (#117)
     // it; Y acquires and completes. Watchdog-bounded so a no-op fails, not hangs.
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     const ud: ?*anyopaque = @ptrCast(&state);
     const tio = state.threaded_io;
     var done: std.atomic.Value(u32) = .init(0);
@@ -7365,7 +7368,7 @@ test "B1b: drain-window groupCancel returns only after its task finishes (#117)"
     // done is provably set before the return. Watchdog-bounded throughout.
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     const ud: ?*anyopaque = @ptrCast(&state);
     const tio = state.threaded_io;
     var go: std.atomic.Value(u32) = .init(0);
@@ -7471,12 +7474,10 @@ test "B2: racing closer and releaser never lose the deferred-close wake (#117)" 
     // finalize pass itself; a lost wake fails the invariant instead of hanging
     // the suite, and a watchdog bounds every wait regardless.
     if (is_windows) return error.SkipZigTest; // POSIX slot lifecycle, as the #115 poison
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
-    state.port = &port;
+    defer testShimDeinit(&state);
+
     try testNetGrow(&state, 1);
     defer state.netFreeChunks();
     try state.registryInit();
@@ -7682,7 +7683,7 @@ test "B1c: infallible value producers take the panic refusal path after deinit (
     // stress suite and #108-style external rc=134 checks).
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
+    defer testShimDeinit(&state);
     state.entryCloseAndDrain();
     const ud: ?*anyopaque = @ptrCast(&state);
 
@@ -7764,12 +7765,10 @@ test "close in flight must not let a resolved handle read a recycled fd (#115 po
     // master and this branch (lookupBorn's result is discarded; it compiles
     // against both the ?u32 and the counting SockLookup signatures).
     if (is_windows) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
     var state: Shim = undefined;
     testShim(&state);
-    defer state.threaded.deinit();
-    state.port = &port;
+    defer testShimDeinit(&state);
+
     try testNetGrow(&state, 1);
     defer state.netFreeChunks();
     try state.registryInit();

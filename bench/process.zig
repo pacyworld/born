@@ -142,9 +142,7 @@ fn roundTrip(io: Io, mode: Mode) !void {
 const RouteResult = struct { ops_per_sec: f64, p99_us: f64 };
 
 fn runRoute(alloc: std.mem.Allocator, route: Route, o: Options) !RouteResult {
-    var port = try born.EvPort.init(alloc);
-    defer port.deinit();
-    const interface = try born_io.io(&port, .{
+    const interface = try born_io.io(.{
         .allocator = alloc,
         .capabilities = if (route == .born) .{ .process = .born_evented } else .{},
     });

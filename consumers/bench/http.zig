@@ -180,9 +180,7 @@ fn fillPattern(buf: []u8) void {
 // ---------------------------------------------------------------------------
 
 fn runRoute(alloc: std.mem.Allocator, route: Route, o: Options) !RouteResult {
-    var port = try born.EvPort.init(alloc);
-    defer port.deinit();
-    const io = try born_io.io(&port, .{
+    const io = try born_io.io(.{
         .allocator = alloc,
         .capabilities = if (route == .born) .{ .network = .born_evented } else .{},
     });

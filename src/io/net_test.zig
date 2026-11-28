@@ -27,8 +27,8 @@ const is_017 = builtin.zig_version.minor >= 17;
 const is_windows = builtin.os.tag == .windows;
 const has_unix = !is_windows;
 
-fn initNetIo(port: *born.EvPort) born_io.InitError!Io {
-    return born_io.io(port, .{
+fn initNetIo() born_io.InitError!Io {
+    return born_io.io(.{
         .allocator = std.testing.allocator,
         .capabilities = .{ .network = .born_evented },
     });
@@ -124,9 +124,7 @@ fn setupPair(io: Io, fixture: *Io.Threaded, server: *Io.net.Server, client: *Io.
 
 test "network route constructs with the Born network vtable and deinits" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const interface = try initNetIo(&port);
+    const interface = try initNetIo();
     defer born_io.deinit(interface);
 
     try expect(std.meta.eql(interface.vtable.*, born_io.network_vtable));
@@ -146,9 +144,7 @@ test "TCP client consumer runs on Born: per-route counters prove the reactor pat
     // provenance gate never forwarded a Born-owned handle). The fixture peer is
     // a separate Threaded instance, so its I/O does not touch the shim counters.
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
 
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
@@ -208,9 +204,7 @@ test "TCP client consumer runs on Born: per-route counters prove the reactor pat
 
 test "connect populates the local address and an ephemeral port" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
@@ -233,9 +227,7 @@ test "connect populates the local address and an ephemeral port" {
 
 test "connect to a closed port returns ConnectionRefused" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
@@ -252,9 +244,7 @@ test "connect to a closed port returns ConnectionRefused" {
 
 test "connect with an expired deadline returns Timeout without connecting" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
 
     const now_ns = try born.nowNs();
@@ -273,9 +263,7 @@ test "connect with an expired deadline returns Timeout without connecting" {
 
 test "connect rejects non-stream modes and non-TCP protocols with OptionUnsupported" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     const target: Io.net.IpAddress = .{ .ip4 = .loopback(9) };
     try expectError(error.OptionUnsupported, target.connect(io, .{ .mode = .dgram }));
@@ -284,9 +272,7 @@ test "connect rejects non-stream modes and non-TCP protocols with OptionUnsuppor
 
 test "Unix pathname connect and echo run on Born" {
     if (!has_unix or builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
@@ -328,9 +314,7 @@ test "Unix pathname connect and echo run on Born" {
 
 test "Unix connect on Windows returns AddressFamilyUnsupported" {
     if (!is_windows or builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     const ua: Io.net.UnixAddress = .{ .path = "born-test.sock" };
     try expectError(error.AddressFamilyUnsupported, io.vtable.netConnectUnix(io.userdata, &ua));
@@ -338,9 +322,7 @@ test "Unix connect on Windows returns AddressFamilyUnsupported" {
 
 test "Unix abstract address forwards to Threaded (provenance fallback)" {
     if (!has_unix or builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
 
     // An abstract address (leading NUL) is delegated to Threaded per call. The
@@ -365,9 +347,7 @@ test "Unix abstract address forwards to Threaded (provenance fallback)" {
 
 test "Unix over-long pathname maps NameTooLong to FileNotFound" {
     if (!has_unix or builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     // 108 bytes passes std's max_len (108) but exceeds Born's sun_path on
     // every POSIX platform (104 on BSD/macOS, 108 on Linux, counting the NUL),
@@ -380,9 +360,7 @@ test "Unix over-long pathname maps NameTooLong to FileNotFound" {
 
 test "Unix connect to a missing pathname surfaces the coarse ConnectFailed row" {
     if (!has_unix or builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     // A path that fits sun_path but names no socket: the kernel answers ENOENT,
     // which Born folds into ConnectFailed (no errno until the post-0.3.0
@@ -410,9 +388,7 @@ test "Unix connect to a missing pathname surfaces the coarse ConnectFailed row" 
 
 test "stream write flattens header, vectored data and splat; read drains vectored" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
@@ -446,9 +422,7 @@ test "stream write flattens header, vectored data and splat; read drains vectore
 
 test "read returns a partial count and EOF is zero bytes" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
@@ -479,9 +453,7 @@ test "try-before-park: two small reads drain one larger peer write" {
     // remainder without a fresh readiness event. A mutation that arms-and-parks
     // without the try-first attempt strands the second read (born#103 shape).
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
@@ -510,9 +482,7 @@ test "try-before-park: two small reads drain one larger peer write" {
 
 test "shutdown(.recv) completes a pending Born read with EOF (Blocker 1)" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
@@ -551,9 +521,7 @@ test "shutdown(.recv) completes a pending Born read with EOF (Blocker 1)" {
 
 test "shutdown(.send) gives the peer EOF" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
@@ -577,9 +545,7 @@ test "shutdown(.send) completes a pending Born write with an error (Windows)" {
     // (ConnectionResetByPeer). POSIX plain shutdown(2) is the Threaded baseline
     // and is covered by the peer-EOF test above.
     if (!is_windows or builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
@@ -621,9 +587,7 @@ test "shutdown(.recv) drains buffered bytes then EOF (Windows)" {
     // still drain; the next read completes with EOF. Windows-only: POSIX
     // shutdown(SHUT_RD) kernel-buffer semantics differ per OS.
     if (!is_windows or builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
@@ -655,9 +619,7 @@ test "shutdown(.recv) drains buffered bytes then EOF (Windows)" {
 
 test "close retires a pending Born read as Unexpected, not Canceled" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
@@ -695,9 +657,7 @@ test "close retires a pending Born read as Unexpected, not Canceled" {
 
 test "peer reset maps read and write failures to ConnectionResetByPeer" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
@@ -725,9 +685,7 @@ test "peer reset maps read and write failures to ConnectionResetByPeer" {
 
 test "message I/O on a Born-owned handle is excluded with tag Unexpected" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
@@ -771,9 +729,7 @@ test "message I/O on a Born-owned handle is excluded with tag Unexpected" {
 
 test "bind-only and socketpair are declared rejections" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     const addr: Io.net.IpAddress = .{ .ip4 = .loopback(0) };
     try expectError(error.OptionUnsupported, io.vtable.netBindIp(io.userdata, &addr, .{ .mode = .stream }));
@@ -782,9 +738,7 @@ test "bind-only and socketpair are declared rejections" {
 
 test "netWriteFile: 0.17 declares Unimplemented, 0.16 copies internally" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
@@ -824,9 +778,7 @@ test "netWriteFile: 0.17 declares Unimplemented, 0.16 copies internally" {
 
 test "batch over a Born-owned member completes Unexpected and awaits normally" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
@@ -890,9 +842,7 @@ test "batch over a Born-owned member completes Unexpected and awaits normally" {
 
 test "provenance gate: Threaded-owned handles forward, Born-owned never do" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
@@ -924,9 +874,7 @@ test "provenance gate: Threaded-owned handles forward, Born-owned never do" {
 
 test "resolve composes Threaded resolution with a Born connect" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
@@ -951,9 +899,7 @@ test "resolve composes Threaded resolution with a Born connect" {
 
 test "close and reconnect repeatedly never corrupts the registry (stale-fd guard)" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
@@ -982,9 +928,7 @@ test "close and reconnect repeatedly never corrupts the registry (stale-fd guard
 
 test "network route keeps listen, accept and DNS on Threaded" {
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
 
     // Listen/accept on the shim interface itself still forward to Threaded and
@@ -1046,9 +990,7 @@ const Counting = struct {
 test "steady-state Born read and write perform no shim allocations" {
     if (builtin.single_threaded) return error.SkipZigTest;
     var counting: Counting = .{ .child = std.testing.allocator };
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try born_io.io(&port, .{
+    const io = try born_io.io(.{
         .allocator = counting.allocator(),
         .capabilities = .{ .network = .born_evented },
     });
@@ -1079,28 +1021,16 @@ test "steady-state Born read and write perform no shim allocations" {
 test "loop death retires network ops as Unexpected, not Canceled" {
     // Required 3: a persistently broken port kills the loop; a driven connect
     // is retired as route_dead (Unexpected), and a later connect's submit
-    // refusal also surfaces Unexpected, never the caller's Canceled. kqueue
-    // and epoll: the port descriptor is closed BEFORE the loop starts, so its
-    // first waits fail deterministically (closing a descriptor behind an
-    // already-blocked kqueue wait would not wake it, since the wait holds a
-    // reference). No event is ever delivered, so the connect cannot complete;
-    // the failure exit retires it route_dead. Parked-read retirement on a
-    // failure exit is asserted by the shim unit (netRetireAll stopped=false).
+    // refusal also surfaces Unexpected, never the caller's Canceled. The
+    // shim owns its port, so the test failure seam lives inside the shim
+    // (`testFailWait`): every loop wait fails, the failure exit retires
+    // parked ops with netRetireAll(stopped=false) and the connect completes
+    // as Unexpected. Parked-read retirement on a failure exit is asserted by
+    // the shim unit (netRetireAll stopped=false).
     if (builtin.single_threaded) return error.SkipZigTest;
-    const has_kq = @hasField(born.EvPort, "kq");
-    const has_ep = @hasField(born.EvPort, "ep");
-    if (!has_kq and !has_ep) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    if (has_kq) {
-        _ = std.c.close(port.kq);
-        port.kq = -1;
-    } else {
-        _ = std.c.close(port.ep);
-        port.ep = -1;
-    }
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
+    shim.testFailWait(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
     const fio = fixture.io();
@@ -1124,9 +1054,7 @@ test "handle reuse after close routes a Threaded socket away from Born (POSIX)" 
     // unregister-before-close ordering itself is asserted by the Windows drain
     // unit, where the drain window makes it observable.)
     if (is_windows or builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
@@ -1175,9 +1103,7 @@ test "deinit with two parked Born reads retires them and drains promptly" {
     // two-phase exit drain frees both promptly. All platforms: deinit returns
     // promptly and both readers observe cancellation.
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
     const fio = fixture.io();
@@ -1230,9 +1156,7 @@ test "connect timeouts on non-awake clocks stay on the Born route" {
     // refused connect with a future .real deadline and a successful connect with
     // a .boot duration both run on Born (the Threaded-forward counter stays zero).
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
@@ -1287,9 +1211,7 @@ test "a concurrent read on a parked Born read returns Unexpected" {
     // (Unexpected), not orphaned; the parked read still completes when data
     // arrives.
     if (builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initNetIo(&port);
+    const io = try initNetIo();
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
@@ -1340,9 +1262,7 @@ test "a concurrent read on a parked Born read returns Unexpected" {
 
 test "Windows 0.16 threaded connect to a closed port returns ConnectionRefused (#126)" {
     if (!is_windows or is_017 or builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try born_io.io(&port, .{ .allocator = std.testing.allocator });
+    const io = try born_io.io(.{ .allocator = std.testing.allocator });
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
@@ -1361,9 +1281,7 @@ test "Windows 0.16 threaded connect to a closed port returns ConnectionRefused (
 
 test "Windows 0.16 threaded read after abortive peer close returns ConnectionResetByPeer (#126)" {
     if (!is_windows or is_017 or builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try born_io.io(&port, .{ .allocator = std.testing.allocator });
+    const io = try born_io.io(.{ .allocator = std.testing.allocator });
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();
@@ -1401,9 +1319,7 @@ test "Windows 0.16 threaded read after abortive peer close returns ConnectionRes
 
 test "Windows 0.16 threaded connect canceled while pending returns Canceled promptly (#126)" {
     if (!is_windows or is_017 or builtin.single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try born_io.io(&port, .{ .allocator = std.testing.allocator });
+    const io = try born_io.io(.{ .allocator = std.testing.allocator });
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
     defer fixture.deinit();

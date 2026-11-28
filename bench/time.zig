@@ -113,20 +113,16 @@ fn stats(samples: []u64) Stats {
 }
 
 fn runBaseline(alloc: std.mem.Allocator, o: Options) !void {
-    // One port and one instance per thread-per-core shard; the default is a
-    // single instance. Sleepers are spread round-robin over the instances.
+    // One instance per thread-per-core shard; the default is a single
+    // instance. Sleepers are spread round-robin over the instances.
     // The baseline spawns no loop thread; each instance owns a Threaded pool.
-    const ports = try alloc.alloc(born.EvPort, o.instances);
-    defer alloc.free(ports);
     const interfaces = try alloc.alloc(Io, o.instances);
     defer alloc.free(interfaces);
-    for (ports, 0..) |*port, i| {
-        port.* = try born.EvPort.init(alloc);
-        interfaces[i] = try born_io.io(port, .{ .allocator = alloc });
+    for (interfaces) |*i| {
+        i.* = try born_io.io(.{ .allocator = alloc });
     }
-    defer for (ports, 0..) |*port, i| {
-        born_io.deinit(interfaces[i]);
-        port.deinit();
+    defer for (interfaces) |i| {
+        born_io.deinit(i);
     };
     const interface = interfaces[0];
     const dur: Io.Duration = .fromMilliseconds(o.sleep_ms);

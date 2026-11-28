@@ -639,7 +639,10 @@ POSIX provides `Listener.openUnix(path, opts)` and
 ## std.Io compatibility shim (born.io)
 
 On Zig >= 0.16, born also exports `born.io`: a `std.Io` interface composing
-Born's event port with upstream's `Io.Threaded` worker pool. Capability
+Born's event port with upstream's `Io.Threaded` worker pool. The shim
+creates and owns its event `EvPort`; the caller passes no port, one
+instance per core is the intended shape, and `deinit` tears the port down.
+Capability
 routing is explicit: each family is serviced either by Born's reactor or by
 Threaded, and a Born route that is not implemented is rejected at
 construction (`CapabilityUnsupported`), never silently delegated.
@@ -775,7 +778,8 @@ exe.root_module.addImport("born.io", born.module("born.io"));
 
 ```zig
 // Network client route: DNS stays Threaded, connect and stream I/O run on Born.
-const io = try born_io.io(&port, .{
+// The shim creates and owns its event port; one instance per core is the shape.
+const io = try born_io.io(.{
     .allocator = allocator,
     .capabilities = .{ .network = .born_evented },
 });

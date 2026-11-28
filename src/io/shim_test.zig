@@ -25,8 +25,6 @@ test "baseline vtable is a complete Io.VTable of forwarding thunks" {
 }
 
 test "io rejects an unimplemented Born route at construction" {
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
 
     // No silent fallback: a Born route that is not implemented is a
     // construction error, not a delegation to Threaded. The network client
@@ -34,12 +32,12 @@ test "io rejects an unimplemented Born route at construction" {
     // exercised in net_test.zig / process_test.zig; file remains rejected
     // everywhere, and process is rejected on targets without process
     // descriptors / pidfds. The time family always stays Threaded (#101).
-    try std.testing.expectError(error.CapabilityUnsupported, born_io.io(&port, .{
+    try std.testing.expectError(error.CapabilityUnsupported, born_io.io(.{
         .allocator = std.testing.allocator,
         .capabilities = .{ .file = .born_evented },
     }));
     if (!born_io.process_supported) {
-        try std.testing.expectError(error.CapabilityUnsupported, born_io.io(&port, .{
+        try std.testing.expectError(error.CapabilityUnsupported, born_io.io(.{
             .allocator = std.testing.allocator,
             .capabilities = .{ .process = .born_evented },
         }));
@@ -48,10 +46,8 @@ test "io rejects an unimplemented Born route at construction" {
 
 test "network Born route constructs with the network vtable and deinits" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
 
-    const interface = try born_io.io(&port, .{
+    const interface = try born_io.io(.{
         .allocator = std.testing.allocator,
         .capabilities = .{ .network = .born_evented },
     });
@@ -64,10 +60,7 @@ test "network Born route constructs with the network vtable and deinits" {
 }
 
 test "baseline io constructs, delegates to Threaded, and deinits" {
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-
-    const interface = try born_io.io(&port, .{ .allocator = std.testing.allocator });
+    const interface = try born_io.io(.{ .allocator = std.testing.allocator });
     defer born_io.deinit(interface);
 
     // The returned interface dispatches every slot through the explicit
@@ -98,8 +91,8 @@ test "baseline io constructs, delegates to Threaded, and deinits" {
 
 const Io = std.Io;
 
-fn initNetIo(port: *born.EvPort) born_io.InitError!Io {
-    return born_io.io(port, .{
+fn initNetIo() born_io.InitError!Io {
+    return born_io.io(.{
         .allocator = std.testing.allocator,
         .capabilities = .{ .network = .born_evented },
     });
@@ -111,9 +104,7 @@ fn addOne(x: u32) u32 {
 
 test "network route keeps async and await on Threaded" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const interface = try initNetIo(&port);
+    const interface = try initNetIo();
     defer born_io.deinit(interface);
 
     var future = Io.async(interface, addOne, .{@as(u32, 41)});
@@ -128,9 +119,7 @@ fn futexWaiter(io: Io, word: *std.atomic.Value(u32)) Io.Cancelable!void {
 
 test "network route keeps futex delegation with cross-thread wake" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const interface = try initNetIo(&port);
+    const interface = try initNetIo();
     defer born_io.deinit(interface);
 
     var word: std.atomic.Value(u32) = .init(0);
@@ -145,9 +134,7 @@ test "network route keeps futex delegation with cross-thread wake" {
 
 test "network route cancels a Threaded futex wait" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const interface = try initNetIo(&port);
+    const interface = try initNetIo();
     defer born_io.deinit(interface);
 
     var word: std.atomic.Value(u32) = .init(0);
@@ -162,9 +149,7 @@ fn producer(io: Io, queue: *Io.Queue(u32)) (Io.Cancelable || error{Closed})!void
 
 test "network route keeps queue delegation" {
     if (@import("builtin").single_threaded) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const interface = try initNetIo(&port);
+    const interface = try initNetIo();
     defer born_io.deinit(interface);
 
     var buffer: [4]u32 = undefined;

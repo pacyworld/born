@@ -103,18 +103,13 @@ pub fn customLogFn(
 // use in custom panic handler
 var current_test: ?[]const u8 = null;
 
-// Fresh born reactor per test (and per setup/teardown test). The port lives
-// in the caller's frame: born_io.io borrows its address, so init in place
-// rather than returning the struct by value. The caller owns the port;
-// born_io.deinit does not deinit it.
+// Fresh born reactor per test (and per setup/teardown test). The shim owns
+// its port; deinit releases it.
 const TestIo = struct {
-    port: born.EvPort = undefined,
     tio: Io = undefined,
 
     fn init(self: *TestIo, gpa: Allocator) !void {
-        self.port = try born.EvPort.init(gpa);
-        errdefer self.port.deinit();
-        self.tio = try born_io.io(&self.port, .{
+        self.tio = try born_io.io(.{
             .allocator = gpa,
             .capabilities = .{
                 // Time/file/process stay Threaded (design section 1); the
@@ -126,7 +121,6 @@ const TestIo = struct {
 
     fn deinit(self: *TestIo) void {
         born_io.deinit(self.tio);
-        self.port.deinit();
     }
 };
 

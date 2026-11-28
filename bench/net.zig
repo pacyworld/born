@@ -195,9 +195,7 @@ const ClientCtx = struct {
 };
 
 fn client(alloc: std.mem.Allocator, o: Options) !void {
-    var port = try born.EvPort.init(alloc);
-    defer port.deinit();
-    const io = try born_io.io(&port, .{
+    const io = try born_io.io(.{
         .allocator = alloc,
         .capabilities = if (o.route == .born) .{ .network = .born_evented } else .{},
     });

@@ -30,8 +30,8 @@ const is_017 = builtin.zig_version.minor >= 17;
 /// targets without the route, where the POSIX-only probes would not compile.
 const skip_unsupported = !born_io.process_supported or builtin.single_threaded;
 
-fn initProcIo(port: *born.EvPort) born_io.InitError!Io {
-    return born_io.io(port, .{
+fn initProcIo() born_io.InitError!Io {
+    return born_io.io(.{
         .allocator = std.testing.allocator,
         .capabilities = .{ .process = .born_evented },
     });
@@ -137,17 +137,13 @@ fn expectPidGone(pid: i32) !void {
 
 test "process Born route constructs with the process vtable and deinits" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
 
-    const interface = try initProcIo(&port);
+    const interface = try initProcIo();
     defer born_io.deinit(interface);
     try expect(std.meta.eql(interface.vtable.*, born_io.process_vtable));
 
     // Both Born routes active select the combined vtable.
-    var port2 = try born.EvPort.init(std.testing.allocator);
-    defer port2.deinit();
-    const all = try born_io.io(&port2, .{
+    const all = try born_io.io(.{
         .allocator = std.testing.allocator,
         .capabilities = .{ .network = .born_evented, .process = .born_evented },
     });
@@ -157,9 +153,7 @@ test "process Born route constructs with the process vtable and deinits" {
 
 test "spawn and wait collect an exit code on Born, then invalidate the child" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
     defer born_io.deinit(io);
 
     var child = try std.process.spawn(io, .{
@@ -187,9 +181,7 @@ test "spawn and wait collect an exit code on Born, then invalidate the child" {
 
 test "wait collects a signal termination as Term.signal" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
     defer born_io.deinit(io);
 
     var child = try std.process.spawn(io, .{
@@ -205,9 +197,7 @@ test "wait collects a signal termination as Term.signal" {
 
 test "spawn with a stdout pipe: child stream I/O is Threaded, exit is Born" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
     defer born_io.deinit(io);
 
     var child = try std.process.spawn(io, .{
@@ -228,9 +218,7 @@ test "spawn with a stdout pipe: child stream I/O is Threaded, exit is Born" {
 
 test "spawn honors an explicit environ_map" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
     defer born_io.deinit(io);
 
     var env = std.process.Environ.Map.init(std.testing.allocator);
@@ -253,9 +241,7 @@ test "spawn honors an explicit environ_map" {
 
 test "spawn with stdin and stdout pipes: parent writes stdin, reads stdout" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
     defer born_io.deinit(io);
 
     // The child reads one line from stdin and echoes it without the newline,
@@ -285,9 +271,7 @@ test "spawn with stdin and stdout pipes: parent writes stdin, reads stdout" {
 
 test "caller-closed stdin end is not closed again by wait (fd-reuse guard)" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
     defer born_io.deinit(io);
 
     // R1: the std EOF pattern closes child.stdin and nulls the field before
@@ -322,9 +306,7 @@ test "caller-closed stdin end is not closed again by wait (fd-reuse guard)" {
 
 test "caller-closed stdout/stderr ends are not closed again by kill (fd-reuse guard)" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
     defer born_io.deinit(io);
 
     // R1 kill variant: the caller closes stdout/stderr and nulls the fields
@@ -365,9 +347,7 @@ test "caller-closed stdout/stderr ends are not closed again by kill (fd-reuse gu
 
 test "spawn resolves argv[0] against PATH when it has no slash" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
     defer born_io.deinit(io);
 
     var child = try std.process.spawn(io, .{
@@ -382,9 +362,7 @@ test "spawn resolves argv[0] against PATH when it has no slash" {
 
 test "spawn of a missing program returns FileNotFound" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
     defer born_io.deinit(io);
 
     try expectError(error.FileNotFound, std.process.spawn(io, .{
@@ -397,9 +375,7 @@ test "spawn of a missing program returns FileNotFound" {
 
 test "spawn rejects options born.process cannot express with OperationUnsupported" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
     defer born_io.deinit(io);
 
     const argv = &.{ "/bin/sh", "-c", "exit 0" };
@@ -417,9 +393,7 @@ test "spawn rejects options born.process cannot express with OperationUnsupporte
 
 test "kill terminates a running child, is idempotent, and invalidates the child" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
     defer born_io.deinit(io);
 
     var child = try std.process.spawn(io, .{
@@ -445,9 +419,7 @@ test "kill terminates a running child, is idempotent, and invalidates the child"
 
 test "kill of an already-exited unwaited child collects the latch and cleans up" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
     defer born_io.deinit(io);
 
     var child = try std.process.spawn(io, .{
@@ -464,14 +436,10 @@ test "kill of an already-exited unwaited child collects the latch and cleans up"
 
 test "provenance gate: a Threaded-owned child forwards, never serviced on Born" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port_b = try born.EvPort.init(std.testing.allocator);
-    defer port_b.deinit();
-    const baseline = try born_io.io(&port_b, .{ .allocator = std.testing.allocator });
+    const baseline = try born_io.io(.{ .allocator = std.testing.allocator });
     defer born_io.deinit(baseline);
 
-    var port_p = try born.EvPort.init(std.testing.allocator);
-    defer port_p.deinit();
-    const io = try initProcIo(&port_p);
+    const io = try initProcIo();
     defer born_io.deinit(io);
 
     // Spawned through the all-Threaded baseline: not in the process registry.
@@ -494,9 +462,7 @@ test "provenance gate: a Threaded-owned child forwards, never serviced on Born" 
 test "per-route counters prove a spawn/wait/kill exchange ran on Born" {
     if (skip_unsupported) return error.SkipZigTest;
     if (!born_io.process_stats_enabled) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
     defer born_io.deinit(io);
 
     var waited = try std.process.spawn(io, .{
@@ -527,9 +493,7 @@ test "per-route counters prove a spawn/wait/kill exchange ran on Born" {
 test "process counters report zero when the process_stats option is off" {
     if (skip_unsupported) return error.SkipZigTest;
     if (born_io.process_stats_enabled) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
     defer born_io.deinit(io);
 
     var child = try std.process.spawn(io, .{
@@ -551,9 +515,7 @@ test "process counters report zero when the process_stats option is off" {
 
 test "deinit kills a still-running child the caller never waited or killed" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
 
     var child = try std.process.spawn(io, .{
         .argv = &.{ "/bin/sh", "-c", "sleep 30" },
@@ -572,9 +534,7 @@ test "deinit kills a still-running child the caller never waited or killed" {
 
 test "PATH search skips a directory candidate and keeps searching" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
     defer born_io.deinit(io);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -599,9 +559,7 @@ test "PATH search skips a directory candidate and keeps searching" {
 
 test "PATH search accepts a symlink to an executable via stat, not lstat" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
     defer born_io.deinit(io);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -626,9 +584,7 @@ test "PATH search accepts a symlink to an executable via stat, not lstat" {
 
 test "PATH search skips empty tokens: no implicit cwd entry" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
     defer born_io.deinit(io);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -661,9 +617,7 @@ test "PATH search skips empty tokens: no implicit cwd entry" {
 
 test "PATH search latches AccessDenied over FileNotFound" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
     defer born_io.deinit(io);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -695,9 +649,7 @@ test "PATH search latches AccessDenied over FileNotFound" {
 
 test "PATH execute-bit probe uses faccessat AT_EACCESS (effective uid)" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
     defer born_io.deinit(io);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -733,9 +685,7 @@ test "PATH execute-bit probe uses faccessat AT_EACCESS (effective uid)" {
 
 test "PATH resolution uses the parent environ, never environ_map's PATH" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
     defer born_io.deinit(io);
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -764,9 +714,7 @@ test "PATH resolution uses the parent environ, never environ_map's PATH" {
 
 test "spawn uses the per-toolchain default PATH when the parent has none" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
     defer born_io.deinit(io);
 
     // The shim mirrors each toolchain's own Io.Threaded.default_PATH at comptime.
@@ -789,9 +737,7 @@ test "spawn uses the per-toolchain default PATH when the parent has none" {
 
 test "canceled wait abandons the child: running, stdio closed, id null, Canceled" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
     defer born_io.deinit(io);
 
     var child = try std.process.spawn(io, .{
@@ -825,9 +771,7 @@ test "canceled wait abandons the child: running, stdio closed, id null, Canceled
 
 test "deinit kills a still-running abandoned child" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
 
     var child = try std.process.spawn(io, .{
         .argv = &.{ "/bin/sh", "-c", "sleep 30" },
@@ -903,9 +847,7 @@ fn concurrentSpawnWorker(ctx: *ConcurrentSpawn, worker: usize) void {
 
 test "concurrent spawn/wait from many workers runs on Born without lost wakeups" {
     if (skip_unsupported) return error.SkipZigTest;
-    var port = try born.EvPort.init(std.testing.allocator);
-    defer port.deinit();
-    const io = try initProcIo(&port);
+    const io = try initProcIo();
     defer born_io.deinit(io);
 
     // Regression guard for the FreeBSD arm-flush lost wakeup: the flush sits

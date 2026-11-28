@@ -65,7 +65,9 @@ xmppd uses its own event loop, not born.
 
 - `born.io` requires Zig >= 0.16 and is not exported on 0.15.2. The all-Threaded
   baseline (every slot delegated, no loop thread) is the default and the supported
-  configuration in 0.3.0.
+  configuration in 0.3.0. `io` takes a single options argument (no port
+  parameter since this release); the shim creates and owns its `EvPort`,
+  `deinit` tears it down, and one instance per core is the intended shape.
 - The network client route (`capabilities.network = .born_evented`) and, on
   FreeBSD and Linux, the process route (`capabilities.process = .born_evented`,
   where Linux kernels older than 5.4 fail `spawn` with `error.Unsupported`)
