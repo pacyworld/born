@@ -7614,6 +7614,7 @@ test "B1b: release thunks after threaded.deinit touch no freed Threaded memory (
     // no-op instead. The shim itself stays live on the stack.
     var state: Shim = undefined;
     testShim(&state);
+    defer state.port.deinit(); // the port is not part of the dead-Threaded scenario
     state.threaded.deinit(); // the unused testing-allocator instance
     const t = try std.heap.page_allocator.create(Io.Threaded);
     t.* = Io.Threaded.init(std.heap.page_allocator, .{});
@@ -7675,7 +7676,6 @@ test "B1b: release thunks after threaded.deinit touch no freed Threaded memory (
 
     // The gate is intact (closing + dead) and no counted call leaked in.
     try std.testing.expectEqual(Shim.entry_closing | Shim.entry_dead, state.entry.load(.acquire));
-    state.port.deinit();
 }
 
 test "B1c: infallible value producers take the panic refusal path after deinit (#117)" {
