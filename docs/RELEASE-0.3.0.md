@@ -98,7 +98,10 @@ The order among the post-tag steps is the owner's call.
 
 Per the owner go-ahead, v0.3.0 ships the born.io P5 increments and is tagged only
 once they are merged and tested: P5.3 (network client family), P5.4 (process family) and
-P5.5 (proof consumers on all three CI kernels), with #101 (time-route retirement)
+P5.5 (proof consumers on all three CI kernels), the port-ownership and
+loop-thread-marker increments (#140 items 1 and 4, born_io.io creating and
+owning its EvPort and blocking shim thunks asserting on a loop-thread marker),
+with #101 (time-route retirement)
 merged, tri-kernel born-io CI green on Zig 0.16.0 and 0.17.1, and the #23
 release-checklist audit at the cut commit. The final shipped surface is recorded
 against #23.

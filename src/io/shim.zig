@@ -152,6 +152,9 @@ pub const InitOptions = struct {
     threaded: Io.Threaded.InitOptions = .{},
     /// Capability routing. Defaults to the all-Threaded foundation baseline.
     capabilities: Capabilities = .{},
+    /// Test-only: close the owned port's kernel descriptor(s) right after
+    /// creation, so the loop's first waits fail deterministically.
+    test_poison_port: bool = false,
 };
 
 /// Construction failures. Capability rejection is explicit; no slot error is
@@ -160,9 +163,8 @@ pub const InitError = error{
     OutOfMemory,
     CapabilityUnsupported,
     /// The shim's own event port could not be created (the kernel refused
-    /// the reactor or its wake source, or the port bookkeeping allocation
-    /// failed). Only reachable when the shim creates the port, never from a
-    /// caller-supplied one (there is none).
+    /// the reactor or its wake source). A port bookkeeping allocation
+    /// failure surfaces as `error.OutOfMemory`.
     SystemResources,
     /// A Born route's loop thread could not be spawned
     /// (`std.Thread.SpawnError`: thread quota, system resources, memory).
@@ -944,12 +946,6 @@ pub const Shim = struct {
     /// `builtin.is_test`, so the hook is comptime-dead outside test builds.
     test_flush_fault: bool = false,
     /// Test-only fault injection: when true, the loop's `port.wait` calls
-    /// report failure without touching the port, driving the failure exit
-    /// (netRetireAll stopped=false) so parked ops retire as route_dead.
-    /// Persistent, not consumed: the loop exits after `wait_fail_limit`
-    /// consecutive failures. Comptime-dead outside test builds.
-    test_wait_fault: bool = false,
-
     /// Test-only fault injection: when non-null, procRetireOp overwrites the
     /// retiring node's slot_index with this value right after the terminal
     /// store, simulating a submitter that returned and reused its frame
@@ -1088,14 +1084,7 @@ pub const Shim = struct {
             self.netArmBatch(net_batch);
             const proc_batch = self.procDrainLocked();
             self.procArmBatch(proc_batch);
-            var n: usize = undefined;
-            if (builtin.is_test and self.test_wait_fault) {
-                self.latch(error.WaitFailed);
-                fail_streak += 1;
-                if (fail_streak >= wait_fail_limit) break;
-                continue;
-            }
-            n = self.port.wait(&events, null) catch |err| {
+            const n = self.port.wait(&events, null) catch |err| {
                 self.latch(err);
                 fail_streak += 1;
                 if (fail_streak >= wait_fail_limit) break;
@@ -3082,6 +3071,27 @@ pub fn clampTimerNs(remaining_ns: u64) u64 {
     return @min(remaining_ns, born.timer_after_ns_max);
 }
 
+/// Test-only: break the port so every `wait()` fails. Mirrors the old
+/// caller-side poison (`std.c.close(port.kq)` / `std.c.close(port.ep)`) that
+/// the loop-death test relies on; nothing blocks on the port yet at the time
+/// the shim calls this, so the wait fails instead of hanging. No-op on
+/// targets without a descriptor of this shape.
+fn poisonOwnedPort(port: *born.EvPort) void {
+    if (comptime @hasField(born.EvPort, "kq")) {
+        if (port.kq >= 0) {
+            _ = std.c.close(port.kq);
+            port.kq = -1;
+        }
+        return;
+    }
+    if (comptime @hasField(born.EvPort, "ep")) {
+        if (port.ep >= 0) {
+            _ = std.c.close(port.ep);
+            port.ep = -1;
+        }
+    }
+}
+
 /// Builds a `std.Io` over Born's event port. The returned interface owns a
 /// heap-allocated composite, including its event port; release it with
 /// `deinit`. One instance per core is the intended shape: each instance
@@ -3109,13 +3119,16 @@ pub fn io(opts: InitOptions) InitError!Io {
     const shim = opts.allocator.create(Shim) catch return error.OutOfMemory;
     errdefer opts.allocator.destroy(shim);
     shim.* = .{
-        .port = born.EvPort.init(opts.allocator) catch return error.SystemResources,
+        .port = try born.EvPort.init(opts.allocator),
         .allocator = opts.allocator,
         .capabilities = caps,
         .threaded = Io.Threaded.init(opts.allocator, opts.threaded),
         .threaded_io = undefined,
     };
     errdefer shim.port.deinit();
+    if (comptime builtin.is_test) {
+        if (opts.test_poison_port) poisonOwnedPort(&shim.port);
+    }
     shim.threaded_io = shim.threaded.io();
     errdefer shim.threaded.deinit();
     if (net_born or proc_born) {
@@ -3187,14 +3200,6 @@ pub fn deinit(interface: Io) void {
 pub fn testParkHook(interface: Io, hook: ?*std.atomic.Value(u32)) void {
     if (!builtin.is_test) return;
     shimFrom(interface.userdata).test_net_parked.store(if (hook) |h| @intFromPtr(h) else 0, .release);
-}
-
-/// Test-only: make every subsequent port.wait in the loop fail, driving the
-/// failure exit (route_dead retires as Unexpected). Comptime-dead outside
-/// test builds.
-pub fn testFailWait(interface: Io) void {
-    if (!builtin.is_test) return;
-    shimFrom(interface.userdata).test_wait_fault = true;
 }
 
 /// The first route-level failure latched by any Born route: a port `wait`
