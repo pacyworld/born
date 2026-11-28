@@ -642,10 +642,9 @@ On Zig >= 0.16, born also exports `born.io`: a `std.Io` interface composing
 Born's event port with upstream's `Io.Threaded` worker pool. The shim
 creates and owns its event `EvPort`; the caller passes no port, one
 instance per core is the intended shape, and `deinit` tears the port down.
-Capability
-routing is explicit: each family is serviced either by Born's reactor or by
-Threaded, and a Born route that is not implemented is rejected at
-construction (`CapabilityUnsupported`), never silently delegated.
+Capability routing is explicit: each family is serviced either by Born's
+reactor or by Threaded, and a Born route that is not implemented is rejected
+at construction (`CapabilityUnsupported`), never silently delegated.
 
 **Status in v0.3.0: opt-in and experimental.** `born.io` requires Zig >= 0.16
 and is not exported on 0.15.2. The Born network client route
