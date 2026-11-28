@@ -152,9 +152,6 @@ pub const InitOptions = struct {
     threaded: Io.Threaded.InitOptions = .{},
     /// Capability routing. Defaults to the all-Threaded foundation baseline.
     capabilities: Capabilities = .{},
-    /// Test-only: close the owned port's kernel descriptor(s) right after
-    /// creation, so the loop's first waits fail deterministically.
-    test_poison_port: bool = false,
 };
 
 /// Construction failures. Capability rejection is explicit; no slot error is
@@ -785,6 +782,13 @@ fn deadPanic(comptime call: []const u8) noreturn {
     @panic("Io." ++ call ++ " used during or after deinit");
 }
 
+/// Test-only poison for the owned port: the loop-death test sets this before
+/// constructing the instance, `io()` closes the port's kernel descriptor(s)
+/// right after creation and clears the flag, so the loop's first waits fail
+/// deterministically. Read and cleared only inside test builds; no effect in
+/// any other build.
+pub var test_poison_port: bool = false;
+
 /// Test-only interception of the group (c) refusal. The 0.16 standalone test
 /// runner has no `--test-filter`, so an in-suite subprocess cannot assert the
 /// real `@panic` abort portably; instead a test installs `test_dead_panic_hook`
@@ -945,7 +949,6 @@ pub const Shim = struct {
     /// unit). Reset by the flush. The flush check is guarded by
     /// `builtin.is_test`, so the hook is comptime-dead outside test builds.
     test_flush_fault: bool = false,
-    /// Test-only fault injection: when true, the loop's `port.wait` calls
     /// Test-only fault injection: when non-null, procRetireOp overwrites the
     /// retiring node's slot_index with this value right after the terminal
     /// store, simulating a submitter that returned and reused its frame
@@ -3132,7 +3135,8 @@ pub fn io(opts: InitOptions) InitError!Io {
     };
     errdefer shim.port.deinit();
     if (comptime builtin.is_test) {
-        if (opts.test_poison_port) poisonOwnedPort(&shim.port);
+        if (test_poison_port) poisonOwnedPort(&shim.port);
+        test_poison_port = false;
     }
     shim.threaded_io = shim.threaded.io();
     errdefer shim.threaded.deinit();

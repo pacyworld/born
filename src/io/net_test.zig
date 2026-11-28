@@ -1034,10 +1034,10 @@ test "loop death retires network ops as Unexpected, not Canceled" {
     // failure, so the loop-death retirement path is not reachable this way.
     // Parked-read retirement is still covered by the shim unit.
     if (builtin.single_threaded or is_windows) return error.SkipZigTest;
+    shim.test_poison_port = true;
     const io = try born_io.io(.{
         .allocator = std.testing.allocator,
         .capabilities = .{ .network = .born_evented },
-        .test_poison_port = true,
     });
     defer born_io.deinit(io);
     var fixture: Io.Threaded = Io.Threaded.init(std.testing.allocator, .{});
