@@ -7675,6 +7675,7 @@ test "B1b: release thunks after threaded.deinit touch no freed Threaded memory (
 
     // The gate is intact (closing + dead) and no counted call leaked in.
     try std.testing.expectEqual(Shim.entry_closing | Shim.entry_dead, state.entry.load(.acquire));
+    state.port.deinit();
 }
 
 test "B1c: infallible value producers take the panic refusal path after deinit (#117)" {
