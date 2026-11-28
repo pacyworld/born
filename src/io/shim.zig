@@ -3089,6 +3089,18 @@ fn poisonOwnedPort(port: *born.EvPort) void {
             _ = std.c.close(port.ep);
             port.ep = -1;
         }
+        return;
+    }
+    if (comptime @hasField(born.EvPort, "iocp")) {
+        const INVALID = compat.windows.INVALID_HANDLE_VALUE;
+        if (port.iocp != INVALID) {
+            // An IOCP handle is a kernel reference like a kqueue/epoll
+            // descriptor: closing it before the loop starts makes the
+            // loop's first GetQueuedCompletionStatusEx fail, so the failure
+            // path is taken instead of hanging or never firing.
+            _ = compat.windows.kernel32.CloseHandle(port.iocp);
+            port.iocp = INVALID;
+        }
     }
 }
 

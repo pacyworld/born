@@ -1021,14 +1021,13 @@ test "steady-state Born read and write perform no shim allocations" {
 test "loop death retires network ops as Unexpected, not Canceled" {
     // Required 3: a persistently broken port kills the loop; a driven connect
     // is retired as route_dead (Unexpected), and a later connect's submit
-    // refusal also surfaces Unexpected, never the caller's Canceled. kqueue
-    // and epoll: the owned port's descriptor is closed BEFORE the loop
+    // refusal also surfaces Unexpected, never the caller's Canceled. kqueue,
+    // epoll and IOCP: the owned port's handle is closed BEFORE the loop
     // starts, so its first waits fail deterministically (closing a
-    // descriptor behind an already-blocked kqueue wait would not wake it,
-    // since the wait holds a reference). No event is ever delivered, so the
-    // connect cannot complete; the failure exit retires it route_dead.
-    // Parked-read retirement on a failure exit is asserted by the shim unit
-    // (netRetireAll stopped=false).
+    // descriptor behind an already-blocked wait would not wake it). No
+    // event is ever delivered, so the connect cannot complete; the failure
+    // exit retires it route_dead. Parked-read retirement on a failure exit
+    // is asserted by the shim unit (netRetireAll stopped=false).
     if (builtin.single_threaded) return error.SkipZigTest;
     const io = try born_io.io(.{
         .allocator = std.testing.allocator,
