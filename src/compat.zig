@@ -28,31 +28,6 @@ pub const asserts_active: bool = if (builtin.zig_version.minor >= 17)
 else
     builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
 
-/// Loop-thread marker (internal). Born-native loop drivers, and the born.io
-/// shim's Born route loop thread, set this once at the thread's start and
-/// clear it at the thread's exit. A blocking input/output call on a Born
-/// loop thread stalls every connection on that loop, so blocking shim
-/// thunks assert the marker in Debug and ReleaseSafe. ReleaseFast compiles
-/// the check out entirely. The marker is not a stable API; only
-/// `loopThreadMark`, `loopThreadUnmark` and `isLoopThread` are usable.
-threadlocal var born_loop_thread: bool = false;
-
-/// Mark the calling thread as a Born loop. Pair with `loopThreadUnmark` at
-/// thread exit.
-pub fn loopThreadMark() void {
-    born_loop_thread = true;
-}
-
-/// Unmark the calling thread. Pair with `loopThreadMark` at thread entry.
-pub fn loopThreadUnmark() void {
-    born_loop_thread = false;
-}
-
-/// Whether the calling thread is marked as a Born loop thread.
-pub fn isLoopThread() bool {
-    return born_loop_thread;
-}
-
 /// Returns an empty `std.EnumSet(E)` on every supported toolchain.
 pub fn emptyEnumSet(comptime Enum: type) std.EnumSet(Enum) {
     if (@hasDecl(std.EnumSet(Enum), "empty")) return .empty;

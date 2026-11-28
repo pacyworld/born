@@ -820,6 +820,22 @@ const SubmitResult = struct { index: u32, was_empty: bool };
 /// message record so the guard can be observed without killing the suite.
 var test_loop_guard_hook: ?*const fn (msg: []const u8) void = null;
 
+/// Slots that never wait and so stay callable on a Born loop thread. Names
+/// are checked at comptime against the active Io.VTable (below).
+const loop_exempt = [_][]const u8{
+    "now",                  "clockResolution",    "checkCancel", "random",     "randomSecure",
+    "swapCancelProtection", "async",              "concurrent",  "groupAsync", "groupConcurrent",
+    "crashHandler",         "progressParentFile",
+};
+
+comptime {
+    // Toolchain drift in a slot name must be a build error, not a silently
+    // dead exemption.
+    for (loop_exempt) |name| {
+        if (!@hasField(Io.VTable, name)) @compileError("blockingLoopCheck exemption '" ++ name ++ "' is not an Io.VTable field on this toolchain");
+    }
+}
+
 /// Guard against a Born loop thread entering a blocking I/O call.
 /// Exempt slots never park (they do not wait for Threaded or the reactor):
 /// query/status and pure submission slots. Debug and ReleaseSafe trip;
@@ -828,16 +844,11 @@ var test_loop_guard_hook: ?*const fn (msg: []const u8) void = null;
 /// instead of forwarding; in production the check panics instead of
 /// returning.
 fn blockingLoopCheck(comptime caller: []const u8) bool {
-    const exempt = [_][]const u8{
-        "now",                  "clockResolution",    "checkCancel", "random",     "randomSecure",
-        "swapCancelProtection", "async",              "concurrent",  "groupAsync", "groupConcurrent",
-        "crashHandler",         "progressParentFile",
-    };
-    inline for (exempt) |e| {
+    inline for (loop_exempt) |e| {
         if (comptime std.mem.eql(u8, caller, e)) return false;
     }
     if (!compat.asserts_active) return false;
-    if (!compat.isLoopThread()) return false;
+    if (!born.loop_thread.isMarked()) return false;
     if (builtin.is_test) {
         if (test_loop_guard_hook) |hook| {
             hook("Io." ++ caller ++ " called on a Born loop thread");
@@ -1112,8 +1123,8 @@ pub const Shim = struct {
     /// dispatches connect-deadline timer fires, socket events and child
     /// exits. Retires everything on stop or persistent port failure.
     fn loopMain(self: *Shim) void {
-        compat.loopThreadMark();
-        defer compat.loopThreadUnmark();
+        born.loop_thread.mark();
+        defer born.loop_thread.unmark();
         var events: [64]born.Event = undefined;
         var fail_streak: u32 = 0;
         while (!self.stopping.load(.acquire)) {
@@ -7935,8 +7946,12 @@ test "blocking thunks on a Born loop thread trip the loop-thread guard" {
     test_loop_guard_hook = &Hook.record;
     defer test_loop_guard_hook = null;
 
-    compat.loopThreadMark();
-    defer compat.loopThreadUnmark();
+    // Hold the stderr lock for the unlockStderr case; take it on the
+    // unmarked thread because lockStderr is a guarded (blocking) slot.
+    _ = fwd.lockStderr(ud, null) catch return error.TestUnexpectedResult;
+
+    born.loop_thread.mark();
+    defer born.loop_thread.unmark();
 
     const W = struct {
         fn sleep_(u: ?*anyopaque) void {
@@ -7967,6 +7982,42 @@ test "blocking thunks on a Born loop thread trip the loop-thread guard" {
     var byte: [1]u8 = .{0};
     _ = fwd.random(ud, &byte);
     try std.testing.expectEqual(@as(?[]const u8, null), Hook.captured);
+
+    // The wake/release class is unguarded by omission, not by the exempt
+    // list: a loop thread must be able to wake or release without tripping.
+    const release = struct {
+        fn futexWake_(u: ?*anyopaque) void {
+            var word: u32 = 1;
+            fwd.futexWake(u, &word, 1);
+        }
+        fn unlockStderr_(u: ?*anyopaque) void {
+            fwd.unlockStderr(u);
+        }
+        fn fileClose_(u: ?*anyopaque) void {
+            // 0xc0000000-open handle of the process pseudo-console is not a
+            // file; close an unopened File whose Handle is a fresh pipe's read end.
+            var fds: [2]std.c.fd_t = undefined;
+            const pipe_rc = std.c.pipe(&fds);
+            std.debug.assert(pipe_rc == 0);
+            const f: Io.File = .{ .handle = fds[0], .flags = .{ .nonblocking = false } };
+            const files = [_]Io.File{f};
+            fwd.fileClose(u, &files);
+            _ = std.c.close(fds[1]);
+        }
+    };
+    Hook.captured = null;
+    release.futexWake_(ud);
+    try std.testing.expectEqual(@as(?[]const u8, null), Hook.captured);
+
+    Hook.captured = null;
+    release.unlockStderr_(ud);
+    try std.testing.expectEqual(@as(?[]const u8, null), Hook.captured);
+
+    if (!is_windows) {
+        Hook.captured = null;
+        release.fileClose_(ud);
+        try std.testing.expectEqual(@as(?[]const u8, null), Hook.captured);
+    }
 }
 
 test "close in flight must not let a resolved handle read a recycled fd (#115 poison)" {

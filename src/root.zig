@@ -105,14 +105,10 @@ pub const backend_name: []const u8 = @tagName(select.backend);
 /// Never wall time. error.Unsupported if the kernel refuses the clock.
 pub const nowNs = @import("timer_heap.zig").nowNs;
 
-/// Loop-thread markers (internal; not a stable API). A Born-native loop
+/// Loop-thread marker (internal; not a stable API). A Born-native loop
 /// driver sets the marker on its loop thread at start and clears it at
 /// exit; blocking I/O calls then fail a debug assertion on that thread.
-pub const loop_thread = struct {
-    pub const mark = @import("compat").loopThreadMark;
-    pub const unmark = @import("compat").loopThreadUnmark;
-    pub const isMarked = @import("compat").isLoopThread;
-};
+pub const loop_thread = @import("loop_thread.zig");
 
 test {
     // Supplement real calls with declaration analysis for the selected backend.
